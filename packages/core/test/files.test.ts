@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import process from 'node:process';
@@ -588,6 +588,8 @@ describe('filesystem transfers', () => {
 
     const source = await fileSource(input);
     await writeFile(input, 'other-value');
+    const changedAt = new Date(Date.now() + 60_000);
+    await utimes(input, changedAt, changedAt);
     await expect(source.readChunk(0, 64 * 1024)).rejects.toMatchObject({ code: 'INTEGRITY_FAILED' });
   });
 
