@@ -43,12 +43,35 @@ jobs:
         uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Dispatch release pull request validation
+      - name: Approve release pull request validation
         if: steps.changesets.outputs.has-changesets == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_BRANCH: changeset-release/${{ github.ref_name }}
+          RELEASE_PR: ${{ steps.changesets.outputs.pr-number }}
         run: |
-          gh workflow run ci.yml --ref "$RELEASE_BRANCH"
-          gh workflow run codeql.yml --ref "$RELEASE_BRANCH"
-          gh workflow run dependency-review.yml --ref "$RELEASE_BRANCH" --field base_ref="${{ github.ref_name }}"
+          [[ "$RELEASE_PR" =~ ^[0-9]+$ ]] || { echo "Changesets did not return a pull request number" >&2; exit 1; }
+          head_sha="$(gh pr view "$RELEASE_PR" --json headRefOid --jq .headRefOid)"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Release pull request has an invalid head SHA" >&2; exit 1; }
+          expected_paths='[".github/workflows/ci.yml", ".github/workflows/codeql.yml", ".github/workflows/dependency-review.yml"]'
+          deadline=$((SECONDS + 60))
+          while (( SECONDS < deadline )); do
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?event=pull_request&head_sha=${head_sha}&per_page=100")"
+            run_count="$(jq -r --argjson paths "$expected_paths" '
+              [.workflow_runs[] | select(.path as $path | $paths | index($path)) | .path]
+              | unique
+              | length
+            ' <<<"$runs")"
+            if (( run_count >= 3 )); then
+              for run_id in $(jq -r --argjson paths "$expected_paths" '
+                .workflow_runs[]
+                | select(.conclusion == "action_required" and (.path as $path | $paths | index($path)))
+                | .id
+              ' <<<"$runs"); do
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve"
+              done
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Expected three release validation workflows for $head_sha; found $run_count" >&2
+          exit 1
