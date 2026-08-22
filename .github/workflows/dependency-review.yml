@@ -2,6 +2,17 @@ name: Dependency review
 
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base ref used for a manually dispatched comparison
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -16,5 +27,7 @@ jobs:
       - name: Review dependency changes
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
+          base-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.head.sha }}
           fail-on-severity: moderate
-          comment-summary-in-pr: on-failure
+          comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'on-failure' || 'never' }}
