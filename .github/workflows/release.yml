@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -38,6 +39,16 @@ jobs:
       - name: Inspect package contents
         run: npm pack --dry-run -w @p2prpc/core
       - name: Open or update Changesets release pull request
+        id: changesets
         uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dispatch release pull request validation
+        if: steps.changesets.outputs.has-changesets == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: changeset-release/${{ github.ref_name }}
+        run: |
+          gh workflow run ci.yml --ref "$RELEASE_BRANCH"
+          gh workflow run codeql.yml --ref "$RELEASE_BRANCH"
+          gh workflow run dependency-review.yml --ref "$RELEASE_BRANCH" --field base_ref="${{ github.ref_name }}"
