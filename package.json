@@ -1,0 +1,54 @@
+{
+  "name": "p2prpc-workspace",
+  "private": true,
+  "description": "Type-safe peer-to-peer tRPC and parallel resumable file transfer over Iroh QUIC",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arduano/p2prpc.git"
+  },
+  "homepage": "https://arduano.github.io/p2prpc/",
+  "bugs": {
+    "url": "https://github.com/arduano/p2prpc/issues"
+  },
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @p2prpc/core",
+    "typecheck": "npm run typecheck -w @p2prpc/core && npm run typecheck -w @p2prpc/cli-example",
+    "test": "npm run test -w @p2prpc/core",
+    "test:integration": "npm run test:integration -w @p2prpc/core",
+    "lint": "eslint .",
+    "check:docs": "node scripts/check-docs.mjs",
+    "docs:dev": "vitepress dev docs/wiki",
+    "docs:build": "vitepress build docs/wiki",
+    "docs:preview": "vitepress preview docs/wiki",
+    "benchmark": "tsx benchmarks/mixed-workload.ts",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "npm run build && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.1",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "eslint": "^10.8.1",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vitepress": "^1.6.4",
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "vitepress": {
+      "vite": "^6.4.3"
+    }
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "packageManager": "npm@11.16.0"
+}

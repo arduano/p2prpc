@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">p2prpc connected streams</title>
+  <desc id="desc">Two secure peers joined by three parallel streams</desc>
+  <defs>
+    <linearGradient id="g" x1="32" y1="28" x2="224" y2="228" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1769d2"/>
+      <stop offset="1" stop-color="#18a2a7"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="58" fill="url(#g)"/>
+  <g fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="70" cy="128" r="27" stroke-width="13"/>
+    <circle cx="186" cy="128" r="27" stroke-width="13"/>
+    <path d="M99 104h58M99 128h58M99 152h58" stroke-width="11"/>
+  </g>
+  <g fill="#fff">
+    <circle cx="113" cy="104" r="5.5"/>
+    <circle cx="143" cy="128" r="5.5"/>
+    <circle cx="123" cy="152" r="5.5"/>
+  </g>
+</svg>

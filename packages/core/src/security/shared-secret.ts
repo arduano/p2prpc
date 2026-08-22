@@ -1,0 +1,127 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { P2PError } from '../errors.js';
+import type {
+  AuthorizationContext,
+  AuthorizationResult,
+  CredentialRequestContext,
+  SessionPrincipal,
+  SessionSecurity
+} from './types.js';
+
+export interface SharedSecretSecurityOptions<TFileMetadata = unknown> {
+  readonly sessionTtlMs?: number;
+  readonly clockSkewMs?: number;
+  readonly authorize?: (context: AuthorizationContext<TFileMetadata>) => Promise<AuthorizationResult> | AuthorizationResult;
+}
+
+/**
+ * HMAC challenge authentication for deployments that have a securely
+ * provisioned application secret but no OIDC issuer. Each side proves the
+ * secret over its fresh handshake nonce and the two authenticated Iroh IDs.
+ */
+export function createSharedSecretSecurity<TFileMetadata = unknown>(
+  secret: Uint8Array | string,
+  options: SharedSecretSecurityOptions<TFileMetadata> = {}
+): SessionSecurity<TFileMetadata> {
+  if (options.authorize !== undefined && typeof options.authorize !== 'function') {
+    throw new P2PError('UNAUTHORIZED', 'Shared-secret authorize policy must be a function');
+  }
+  const customAuthorize = options.authorize;
+  const key = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
+  if (key.byteLength < 32) throw new P2PError('INVALID_FRAME', 'Session shared secret must contain at least 256 bits');
+  const ttl = options.sessionTtlMs === undefined ? 15 * 60_000 : options.sessionTtlMs;
+  const skew = options.clockSkewMs === undefined ? 30_000 : options.clockSkewMs;
+  validateDuration(ttl, 'Session TTL', 24 * 60 * 60_000);
+  if (!Number.isSafeInteger(skew) || skew < 0 || skew > 10 * 60_000) {
+    throw new P2PError('RESOURCE_LIMIT', 'Shared-secret clock skew must be between 0 and 10 minutes');
+  }
+
+  return {
+    getCredential(context) {
+      const timestamp = Date.now();
+      return {
+        scheme: 'P2PRPC-HMAC-SHA256',
+        value: `${timestamp}.${mac(key, context, timestamp)}`
+      };
+    },
+    authenticate(credential, context) {
+      if (credential.scheme !== 'P2PRPC-HMAC-SHA256') throw new P2PError('UNAUTHORIZED', 'Unsupported session credential');
+      const separator = credential.value.indexOf('.');
+      const timestamp = Number(credential.value.slice(0, separator));
+      const received = credential.value.slice(separator + 1);
+      if (separator < 1 || !Number.isSafeInteger(timestamp) || Math.abs(Date.now() - timestamp) > skew) {
+        throw new P2PError('UNAUTHORIZED', 'Session credential is stale');
+      }
+      const nonce = context.remotePeerId === context.initiatorPeerId ? context.initiatorNonce : context.responderNonce;
+      const expected = mac(key, {
+        localPeerId: context.remotePeerId,
+        remotePeerId: context.localPeerId,
+        direction: context.direction === 'inbound' ? 'outbound' : 'inbound',
+        protocol: context.protocol,
+        nonce,
+        signal: context.signal
+      }, timestamp);
+      if (!safeEqual(received, expected)) throw new P2PError('UNAUTHORIZED', 'Invalid session credential');
+      const principal: SessionPrincipal = {
+        id: context.remotePeerId,
+        subject: context.remotePeerId,
+        expiresAt: Date.now() + ttl,
+        scopes: new Set(['p2prpc:*']),
+        claims: Object.freeze({ authentication: 'shared-secret' })
+      };
+      return principal;
+    },
+    authorize(context) {
+      return customAuthorize === undefined ? true : customAuthorize(context);
+    }
+  };
+}
+
+/** Explicit test/development escape hatch. Never use this in production. */
+export function dangerouslyAllowInsecureSessions<TFileMetadata = unknown>(options: { sessionTtlMs?: number } = {}): SessionSecurity<TFileMetadata> {
+  const ttl = options.sessionTtlMs === undefined ? 60 * 60_000 : options.sessionTtlMs;
+  validateDuration(ttl, 'Insecure session TTL', 24 * 60 * 60_000);
+  return {
+    getCredential: () => ({ scheme: 'P2PRPC-INSECURE', value: 'explicitly-insecure' }),
+    authenticate(credential, context) {
+      if (credential.scheme !== 'P2PRPC-INSECURE' || credential.value !== 'explicitly-insecure') {
+        throw new P2PError('UNAUTHORIZED', 'Invalid insecure development credential');
+      }
+      return {
+        id: context.remotePeerId,
+        subject: context.remotePeerId,
+        expiresAt: Date.now() + ttl,
+        scopes: new Set(['p2prpc:*']),
+        claims: Object.freeze({ authentication: 'insecure-development-only' })
+      };
+    },
+    authorize: () => true
+  };
+}
+
+function validateDuration(value: number, label: string, maximum: number): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new P2PError('RESOURCE_LIMIT', `${label} must be an integer between 1 and ${maximum} milliseconds`);
+  }
+}
+
+function mac(key: Uint8Array, context: CredentialRequestContext, timestamp: number): string {
+  return createHmac('sha256', key)
+    .update('p2prpc-session-credential-v1\n')
+    .update(context.protocol)
+    .update('\n')
+    .update(context.localPeerId)
+    .update('\n')
+    .update(context.remotePeerId)
+    .update('\n')
+    .update(context.nonce)
+    .update('\n')
+    .update(String(timestamp))
+    .digest('base64url');
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.byteLength === rightBytes.byteLength && timingSafeEqual(leftBytes, rightBytes);
+}

@@ -1,0 +1,73 @@
+{
+  "name": "@p2prpc/core",
+  "version": "0.1.0",
+  "description": "Type-safe peer-to-peer tRPC and striped file transfer over Iroh QUIC",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arduano/p2prpc.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://arduano.github.io/p2prpc/",
+  "bugs": {
+    "url": "https://github.com/arduano/p2prpc/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test:integration": "vitest run test/node.integration.test.ts",
+    "test:watch": "vitest",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@momics/iroh-http-node": "0.6.1",
+    "@napi-rs/blake-hash": "^1.4.0",
+    "@trpc/client": ">=11.0.0 <12",
+    "@trpc/server": ">=11.0.0 <12",
+    "jose": "^6.2.9",
+    "msgpackr": "^2.0.5",
+    "superjson": "^2.2.6"
+  },
+  "peerDependencies": {
+    "@trpc/client": ">=11.0.0 <12",
+    "@trpc/server": ">=11.0.0 <12"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "keywords": [
+    "p2p",
+    "rpc",
+    "trpc",
+    "iroh",
+    "quic",
+    "file-transfer",
+    "typescript"
+  ]
+}

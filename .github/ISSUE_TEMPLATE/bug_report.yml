@@ -1,0 +1,49 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, endpoint keys, access tokens, capability handles, sensitive tickets, or private file content. Report vulnerabilities privately through the Security tab.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide a small repository, code sample, or precise sequence of commands.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: p2prpc version or commit
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime
+      description: Operating system, architecture, and Node.js version.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed all secrets and sensitive network or file data.
+          required: true
+        - label: This is not a privately reportable security vulnerability.
+          required: true
