@@ -134,8 +134,8 @@ export function createOidcSessionSecurity<TFileMetadata = unknown>(
       }
 
       const clientId = readClientId(claims);
-      const subject = typeof claims.sub === 'string' ? claims.sub : clientId;
-      if (!subject || claims.exp === undefined) throw new P2PError('UNAUTHORIZED', 'Access token has no subject or expiry');
+      const subject = readSubject(claims, clientId);
+      if (claims.exp === undefined) throw new P2PError('UNAUTHORIZED', 'Access token has no expiry');
       const scopes = readScopes(claims);
       for (const required of connectionScopes) {
         if (!hasScope(scopes, required)) throw new P2PError('UNAUTHORIZED', `Access token lacks required scope ${required}`);
@@ -290,16 +290,34 @@ function stablePrincipalId(issuer: string, subject: string, clientId: string | u
 function readClientId(claims: JWTPayload): string | undefined {
   const clientId = claims.client_id;
   const authorizedParty = claims.azp;
-  if (clientId !== undefined && typeof clientId !== 'string') {
-    throw new P2PError('UNAUTHORIZED', 'OAuth client_id claim must be a string');
+  if (clientId !== undefined && !validIdentityClaim(clientId)) {
+    throw new P2PError('UNAUTHORIZED', 'OAuth client_id claim must be a bounded non-empty string');
   }
-  if (authorizedParty !== undefined && typeof authorizedParty !== 'string') {
-    throw new P2PError('UNAUTHORIZED', 'OAuth azp claim must be a string');
+  if (authorizedParty !== undefined && !validIdentityClaim(authorizedParty)) {
+    throw new P2PError('UNAUTHORIZED', 'OAuth azp claim must be a bounded non-empty string');
   }
   if (clientId !== undefined && authorizedParty !== undefined && clientId !== authorizedParty) {
     throw new P2PError('UNAUTHORIZED', 'OAuth client_id and azp claims do not identify the same client');
   }
   return clientId ?? authorizedParty;
+}
+
+function readSubject(claims: JWTPayload, clientId: string | undefined): string {
+  if (claims.sub !== undefined) {
+    if (!validIdentityClaim(claims.sub)) {
+      throw new P2PError('UNAUTHORIZED', 'OAuth sub claim must be a bounded non-empty string');
+    }
+    return claims.sub;
+  }
+  if (clientId !== undefined) return clientId;
+  throw new P2PError('UNAUTHORIZED', 'Access token has no subject');
+}
+
+function validIdentityClaim(value: unknown): value is string {
+  return typeof value === 'string' &&
+    Buffer.byteLength(value) > 0 &&
+    Buffer.byteLength(value) <= 2048 &&
+    !containsUnsafeDisplayCharacters(value);
 }
 
 async function verifyPeerBinding(
@@ -308,9 +326,8 @@ async function verifyPeerBinding(
   mode: 'required' | 'optional' | 'disabled',
   directoryBinding: OidcSessionSecurityOptions['bindPrincipalToPeer']
 ): Promise<void> {
+  const jkt = readConfirmationThumbprint(claims);
   if (mode === 'disabled') return;
-  const confirmation = claims.cnf;
-  const jkt = isRecord(confirmation) && typeof confirmation.jkt === 'string' ? confirmation.jkt : undefined;
   if (jkt) {
     let expected: string;
     try {
@@ -328,6 +345,28 @@ async function verifyPeerBinding(
   }
   if (directoryBinding && await directoryBinding(Object.freeze({ ...claims }), context) === true) return;
   if (mode === 'required') throw new P2PError('UNAUTHORIZED', 'Access token is not proof-of-possession bound to this peer');
+}
+
+function readConfirmationThumbprint(claims: JWTPayload): string | undefined {
+  if (!Object.hasOwn(claims, 'cnf')) return undefined;
+  const confirmation = claims.cnf;
+  if (!isRecord(confirmation) || Object.keys(confirmation).length === 0) {
+    throw new P2PError('UNAUTHORIZED', 'OAuth cnf claim must be a non-empty object');
+  }
+  if (!Object.hasOwn(confirmation, 'jkt')) {
+    throw new P2PError('UNAUTHORIZED', 'OAuth cnf claim uses an unsupported confirmation method');
+  }
+  const jkt = confirmation.jkt;
+  if (!validJwkThumbprint(jkt)) {
+    throw new P2PError('UNAUTHORIZED', 'OAuth cnf.jkt claim must be a SHA-256 JWK thumbprint');
+  }
+  return jkt;
+}
+
+function validJwkThumbprint(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
+  const decoded = Buffer.from(value, 'base64url');
+  return decoded.byteLength === 32 && decoded.toString('base64url') === value;
 }
 
 function normalizeIssuers<TFileMetadata>(options: OidcSessionSecurityOptions<TFileMetadata>): Map<string, NormalizedIssuer> {
@@ -381,13 +420,45 @@ function normalizeAudience(value: unknown): string | string[] {
 
 function readScopes(claims: JWTPayload): ReadonlySet<string> {
   const values = new Set<string>();
-  if (typeof claims.scope === 'string') {
-    for (const scope of claims.scope.split(/\s+/u)) if (scope) values.add(scope);
+  if (claims.scope !== undefined) {
+    if (typeof claims.scope !== 'string') throw invalidScopeClaim();
+    addSpaceDelimitedScopes(values, claims.scope);
   }
-  if (Array.isArray(claims.scp)) {
-    for (const scope of claims.scp) if (typeof scope === 'string' && scope) values.add(scope);
+  if (claims.scp !== undefined) {
+    if (typeof claims.scp === 'string') {
+      addSpaceDelimitedScopes(values, claims.scp);
+    } else if (Array.isArray(claims.scp) && claims.scp.length > 0 && claims.scp.length <= 1024) {
+      for (const scope of claims.scp) {
+        if (!validScopeToken(scope)) throw invalidScopeClaim();
+        values.add(scope);
+      }
+    } else {
+      throw invalidScopeClaim();
+    }
   }
+  if (values.size > 1024) throw invalidScopeClaim();
   return Object.freeze(values) as ReadonlySet<string>;
+}
+
+function addSpaceDelimitedScopes(output: Set<string>, claim: string): void {
+  if (!/^[\x21\x23-\x5b\x5d-\x7e]+(?: [\x21\x23-\x5b\x5d-\x7e]+)*$/.test(claim)) {
+    throw invalidScopeClaim();
+  }
+  for (const scope of claim.split(' ')) {
+    if (!validScopeToken(scope)) throw invalidScopeClaim();
+    output.add(scope);
+    if (output.size > 1024) throw invalidScopeClaim();
+  }
+}
+
+function validScopeToken(value: unknown): value is string {
+  return typeof value === 'string' &&
+    Buffer.byteLength(value) <= 1024 &&
+    /^[\x21\x23-\x5b\x5d-\x7e]+$/.test(value);
+}
+
+function invalidScopeClaim(): P2PError {
+  return new P2PError('UNAUTHORIZED', 'OAuth scope and scp claims must contain bounded RFC 6749 scope tokens');
 }
 
 function hasScope(scopes: ReadonlySet<string>, required: string): boolean {

@@ -4,6 +4,7 @@ import {
   createP2PNode,
   P2PError,
   type AuthenticatedSession,
+  type ConnectOptions,
   type P2PNodeOptions,
   type SecurityAuditEvent
 } from '../src/index.js';
@@ -44,7 +45,7 @@ describe('node security boundaries', () => {
     });
 
     try {
-      await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'TIMEOUT' });
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'TIMEOUT' });
       expect(admissionSignal).toBeDefined();
       expect(admissionSignal?.aborted).toBe(true);
       expect(admissionPeerFrozen).toBe(true);
@@ -57,6 +58,169 @@ describe('node security boundaries', () => {
   it('keeps existing one-argument peer admission callbacks source compatible', () => {
     const admission: NonNullable<P2PNodeOptions<typeof router>['preAuthorizePeer']> = () => true;
     expect(admission({ id: 'remote', direction: 'inbound' }, new AbortController().signal)).toBe(true);
+  });
+
+  it('rejects an unexpected outbound endpoint before admission or credential disclosure', async () => {
+    const connection = new AdmissionConnection(true, 'attacker');
+    const endpoint = new AdmissionEndpoint(connection);
+    let admissionCalls = 0;
+    let credentialCalls = 0;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: {
+        ...unusedSecurity(),
+        getCredential: () => {
+          credentialCalls += 1;
+          throw new Error('Credential must not be requested for an unexpected endpoint');
+        }
+      },
+      preAuthorizePeer: () => {
+        admissionCalls += 1;
+        return true;
+      },
+      endpointFactory: async () => endpoint
+    });
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket, 'approved')))
+        .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(admissionCalls).toBe(0);
+      expect(credentialCalls).toBe(0);
+      expect(endpoint.expectedPeerIds).toEqual(['approved']);
+      expect(connection.closeCalls).toBe(1);
+      expect(node.peersSnapshot()).toHaveLength(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects outbound endpoint admission before requesting a credential', async () => {
+    const connection = new AdmissionConnection(true);
+    const endpoint = new AdmissionEndpoint(connection);
+    let credentialCalls = 0;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: {
+        ...unusedSecurity(),
+        getCredential: () => {
+          credentialCalls += 1;
+          throw new Error('Credential must not be requested for a rejected endpoint');
+        }
+      },
+      preAuthorizePeer: () => false,
+      endpointFactory: async () => endpoint
+    });
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket)))
+        .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(credentialCalls).toBe(0);
+      expect(connection.closeCalls).toBe(1);
+      expect(node.peersSnapshot()).toHaveLength(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects a mismatched authenticated principal before installing or exposing the peer', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    let exposedPeers = 0;
+    const events: SecurityAuditEvent[] = [];
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onPeer: () => { exposedPeers += 1; },
+      onSecurityEvent: (event) => events.push(event),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('wrong-principal', 'oauth-client-b');
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket)))
+        .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(exposedPeers).toBe(0);
+      expect(node.peersSnapshot()).toHaveLength(0);
+      expect(events.some((event) => event.type === 'session.authenticated')).toBe(false);
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(1);
+      expect(connection.closeCalls).toBe(1);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('matches shared-secret principals without OIDC fields and snapshots the target', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => sharedSecretSession('shared-secret-session', 'remote');
+    const target: ConnectOptions = {
+      ticket: endpoint.address.ticket,
+      expectedPeerId: 'remote',
+      expectedPrincipal: {
+        id: 'remote',
+        subject: 'remote',
+        issuer: null,
+        clientId: null,
+        tenantId: null
+      }
+    };
+
+    try {
+      const peer = await node.connect(target);
+      (target as unknown as { expectedPrincipal: ConnectOptions['expectedPrincipal'] }).expectedPrincipal = {
+        ...target.expectedPrincipal,
+        subject: 'mutated'
+      };
+      const saved = (peer as unknown as {
+        runtime: { outboundTarget: ConnectOptions };
+      }).runtime.outboundTarget;
+      expect(saved.expectedPrincipal.subject).toBe('remote');
+      expect(Object.isFrozen(saved)).toBe(true);
+      expect(Object.isFrozen(saved.expectedPrincipal)).toBe(true);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects incomplete or misspelled connect targets before dialing', async () => {
+    const endpoint = new AdmissionEndpoint(new AdmissionConnection(false));
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+
+    try {
+      await expect(node.connect(endpoint.address.ticket as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      await expect(node.connect({
+        ...connectTarget(endpoint.address.ticket),
+        expectedPrincipal: { subject: 'subject' }
+      } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      await expect(node.connect({
+        ...connectTarget(endpoint.address.ticket),
+        expectedPrinciple: connectTarget(endpoint.address.ticket).expectedPrincipal
+      } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      expect(endpoint.connectCalls).toBe(0);
+    } finally {
+      await node.close();
+    }
   });
 
   it('rejects malformed optional callbacks instead of silently disabling policy', async () => {
@@ -103,7 +267,7 @@ describe('node security boundaries', () => {
     security.authorize = () => true;
 
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
       const runtime = (peer as unknown as { runtime: unknown }).runtime;
       await expect(internals.authorize(runtime, session, { kind: 'file.pull', capabilityId: 'capability' }))
         .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
@@ -141,7 +305,7 @@ describe('node security boundaries', () => {
     });
 
     try {
-      await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
       expect(connection.closeCalls).toBe(1);
     } finally {
       await node.close();
@@ -177,9 +341,9 @@ describe('node security boundaries', () => {
     };
 
     try {
-      await expect(node.connect(endpoint.address.ticket)).resolves.toBeDefined();
-      await expect(node.connect(endpoint.address.ticket)).resolves.toBeDefined();
-      await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
       expect(events.filter((event) => event.type === 'session.authenticated')).toMatchObject([
         { type: 'session.authenticated', sessionId: 'session-a' }
@@ -212,7 +376,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => authenticatedSession('async-audit', 'oauth-client-a');
 
     try {
-      await expect(node.connect(endpoint.address.ticket)).resolves.toBeDefined();
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       expect(callbackCompleted).toBe(true);
     } finally {
@@ -252,7 +416,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => session;
 
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
       const runtime = (peer as unknown as { runtime: unknown }).runtime;
       await expect(internals.authorize(runtime, session, {
         kind: 'file.pull',
@@ -305,7 +469,7 @@ describe('node security boundaries', () => {
 
     let runtime: { alive: boolean; connection(): Promise<QuicConnection> } | undefined;
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
       const connectedRuntime = (peer as unknown as {
         runtime: { alive: boolean; connection(): Promise<QuicConnection> };
       }).runtime;
@@ -350,7 +514,7 @@ describe('node security boundaries', () => {
     };
 
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-a'));
       const runtime = (peer as unknown as {
         runtime: { alive: boolean; connection(): Promise<QuicConnection> };
       }).runtime;
@@ -361,6 +525,44 @@ describe('node security boundaries', () => {
       expect(authenticationCalls).toBe(1);
       expect(wrongPeerConnection.closeCalls).toBe(1);
       expect(internals.peers.has('remote-b')).toBe(false);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('retains the expected principal matcher across reconnects and rejects a changed principal', async () => {
+    const originalConnection = new AdmissionConnection(false);
+    const reconnectConnection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(originalConnection, reconnectConnection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('reconnect-session', 'oauth-client-b')
+    ];
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      peers: Map<string, unknown>;
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const runtime = (peer as unknown as {
+        runtime: { alive: boolean; connection(): Promise<QuicConnection> };
+      }).runtime;
+      runtime.alive = false;
+      internals.peers.delete('remote');
+
+      await expect(runtime.connection()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(endpoint.expectedPeerIds).toEqual(['remote', 'remote']);
+      expect(reconnectConnection.closeCalls).toBe(1);
+      expect(internals.peers.has('remote')).toBe(false);
     } finally {
       await node.close();
     }
@@ -409,7 +611,7 @@ describe('node security boundaries', () => {
     });
 
     try {
-      await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'TIMEOUT' });
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'TIMEOUT' });
       pendingConnection.resolve(late);
       await expect.poll(() => late.closeCalls).toBe(1);
     } finally {
@@ -429,14 +631,14 @@ describe('node security boundaries', () => {
       endpointFactory: async () => endpoint
     });
 
-    const connecting = node.connect(endpoint.address.ticket);
+    const connecting = node.connect(connectTarget(endpoint.address.ticket));
     const rejection = expect(connecting).rejects.toMatchObject({ code: 'DISCONNECTED' });
     await expect.poll(() => endpoint.connectCalls).toBe(1);
     await node.close();
     await rejection;
     pendingConnection.resolve(late);
     await expect.poll(() => late.closeCalls).toBe(1);
-    await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+    await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'DISCONNECTED' });
     expect(endpoint.connectCalls).toBe(1);
   });
 
@@ -459,7 +661,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => sessions.shift()!;
 
     try {
-      const peer = await node.connect<typeof router>(endpoint.address.ticket);
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket));
       expect(node.peersSnapshot()).toHaveLength(1);
 
       peer.close();
@@ -470,7 +672,7 @@ describe('node security boundaries', () => {
       await expect(peer.rpc.ping.query()).rejects.toThrow(/Peer is closed/);
       expect(endpoint.connectCalls).toBe(1);
 
-      await node.connect(endpoint.address.ticket);
+      await node.connect(connectTarget(endpoint.address.ticket));
       expect(endpoint.connectCalls).toBe(2);
       expect(node.peersSnapshot()).toHaveLength(1);
       connection.resolveClosed();
@@ -495,7 +697,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => authenticatedSession('closed-peer', 'oauth-client-a');
 
     try {
-      const peer = await node.connect<typeof router>(endpoint.address.ticket);
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket));
       const runtime = (peer as unknown as {
         runtime: { connectionController: AbortController };
       }).runtime;
@@ -534,7 +736,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => sessions.shift()!;
 
     try {
-      const firstPeer = await node.connect(endpoint.address.ticket);
+      const firstPeer = await node.connect(connectTarget(endpoint.address.ticket));
       const runtime = (firstPeer as unknown as {
         runtime: { currentFiles: { signal: AbortSignal }; fileConnection(): Promise<unknown> };
       }).runtime;
@@ -542,7 +744,7 @@ describe('node security boundaries', () => {
       expect(Object.isFrozen(firstContext)).toBe(true);
       expect(firstContext.signal.aborted).toBe(false);
 
-      await node.connect(endpoint.address.ticket);
+      await node.connect(connectTarget(endpoint.address.ticket));
       const secondContext = await runtime.fileConnection() as { signal: AbortSignal };
       expect(secondContext).not.toBe(firstContext);
       expect(firstContext.signal.aborted).toBe(true);
@@ -575,13 +777,13 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => sessions.shift()!;
 
     try {
-      const closedPeer = await node.connect(endpoint.address.ticket);
+      const closedPeer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-closed'));
       const closedSignal = ((closedPeer as unknown as { runtime: { currentFiles: { signal: AbortSignal } } }).runtime)
         .currentFiles.signal;
       closedConnection.resolveClosed();
       await expect.poll(() => closedSignal.aborted).toBe(true);
 
-      const expiringPeer = await node.connect(endpoint.address.ticket);
+      const expiringPeer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-expiring'));
       const expiringSignal = ((expiringPeer as unknown as { runtime: { currentFiles: { signal: AbortSignal } } }).runtime)
         .currentFiles.signal;
       await expect.poll(() => expiringSignal.aborted, { timeout: 1_000 }).toBe(true);
@@ -612,12 +814,12 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
 
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-a'));
       const transferLimits = ((peer as unknown as {
         runtime: { transfers: { options: { limits: { maxChunkSize: number } } } };
       }).runtime).transfers.options.limits;
       expect(transferLimits.maxChunkSize).toBe(128 * 1024);
-      await expect(node.connect(endpoint.address.ticket)).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+      await expect(node.connect(connectTarget(endpoint.address.ticket, 'remote-b'))).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
       expect(node.peersSnapshot()).toHaveLength(1);
       expect(rejected.closeCalls).toBe(1);
     } finally {
@@ -701,7 +903,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => session;
 
     try {
-      const peer = await node.connect(endpoint.address.ticket);
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
       const runtime = (peer as unknown as { runtime: unknown }).runtime;
       await expect(internals.authorize(runtime, session, { kind: 'file.pull', capabilityId: 'capability' }))
         .rejects.toThrow('secret policy backend detail');
@@ -732,7 +934,7 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
 
     try {
-      await node.connect(endpoint.address.ticket);
+      await node.connect(connectTarget(endpoint.address.ticket));
       const stream = duplexPair();
       await writeStreamKind(stream.right.send, StreamKind.TransferControl);
       await writeFrame(stream.right.send, 99, {});
@@ -761,8 +963,8 @@ describe('node security boundaries', () => {
     internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
 
     try {
-      await node.connect(endpoint.address.ticket);
-      await node.connect(endpoint.address.ticket);
+      await node.connect(connectTarget(endpoint.address.ticket, 'remote-a'));
+      await node.connect(connectTarget(endpoint.address.ticket, 'remote-b'));
 
       const stalled = duplexPair();
       await writeStreamKind(stalled.right.send, StreamKind.TransferControl);
@@ -812,18 +1014,49 @@ function authenticatedSession(id: string, clientId: string, ttlMs = 60_000): Aut
   });
 }
 
+function sharedSecretSession(id: string, peerId: string): AuthenticatedSession {
+  const expiresAt = Date.now() + 60_000;
+  return Object.freeze({
+    id,
+    establishedAt: Date.now(),
+    expiresAt,
+    principal: Object.freeze({
+      id: peerId,
+      subject: peerId,
+      expiresAt,
+      scopes: new Set(['p2prpc:*']),
+      claims: Object.freeze({ authentication: 'shared-secret' })
+    })
+  });
+}
+
+function connectTarget(ticket: string, expectedPeerId = 'remote'): ConnectOptions {
+  return {
+    ticket,
+    expectedPeerId,
+    expectedPrincipal: {
+      subject: 'subject',
+      issuer: 'https://identity.example',
+      clientId: 'oauth-client-a',
+      tenantId: 'tenant'
+    }
+  };
+}
+
 class AdmissionEndpoint implements QuicEndpoint {
   readonly id = 'local';
   readonly address = { id: this.id, ticket: 'admission-ticket' };
   connectCalls = 0;
+  readonly expectedPeerIds: string[] = [];
   private readonly connections: Array<QuicConnection | Promise<QuicConnection>>;
 
   constructor(...connections: Array<QuicConnection | Promise<QuicConnection>>) {
     this.connections = connections;
   }
 
-  async connect(): Promise<QuicConnection> {
+  async connect(_ticket: string, _alpn: Uint8Array, expectedPeerId: string): Promise<QuicConnection> {
     this.connectCalls += 1;
+    this.expectedPeerIds.push(expectedPeerId);
     const connection = this.connections.shift();
     if (!connection) throw new Error('No connection was queued');
     return await connection;

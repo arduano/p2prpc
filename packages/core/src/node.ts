@@ -33,7 +33,7 @@ import {
 } from './security/types.js';
 import { IrohEndpoint, type IrohEndpointOptions } from './transport/iroh.js';
 import type { ConnectionStats, QuicConnection, QuicEndpoint } from './transport/types.js';
-import { sanitizeBoundedDisplayText } from './text.js';
+import { containsUnsafeDisplayCharacters, sanitizeBoundedDisplayText } from './text.js';
 
 export interface PeerIdentity {
   readonly id: string;
@@ -54,6 +54,32 @@ export interface PeerContext {
 export interface ProtocolIdentity {
   readonly applicationId: string;
   readonly contractVersion: string;
+}
+
+/**
+ * Exact authenticated application identity expected from an outbound target.
+ * `null` requires an optional principal field to be absent. The field names
+ * are identity-provider neutral: custom authenticators and shared-secret
+ * deployments use the same canonical SessionPrincipal shape as OIDC.
+ */
+export interface PrincipalMatcher {
+  /** Optional additional check of the authenticator's canonical stable ID. */
+  readonly id?: string;
+  readonly subject: string;
+  readonly issuer: string | null;
+  readonly clientId: string | null;
+  readonly tenantId: string | null;
+}
+
+/** A trusted outbound target obtained independently of its locator ticket. */
+export interface ConnectOptions {
+  readonly ticket: string;
+  readonly expectedPeerId: string;
+  readonly expectedPrincipal: PrincipalMatcher;
+}
+
+interface NormalizedConnectOptions extends ConnectOptions {
+  readonly expectedPrincipal: Readonly<PrincipalMatcher>;
 }
 
 export type SecurityAuditEvent =
@@ -211,7 +237,7 @@ interface PeerRuntime<TFileMetadata> {
   alive: boolean;
   /** Permanently disables this runtime after Peer.close(); physical disconnects may still reconnect. */
   closed: boolean;
-  ticket?: string;
+  outboundTarget?: NormalizedConnectOptions;
   identity: PeerIdentity;
   session: AuthenticatedSession;
   readonly transfers: TransferManager<TFileMetadata>;
@@ -332,10 +358,11 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     return this.endpoint.address.ticket;
   }
 
-  async connect<TRemoteRouter extends AnyTRPCRouter>(ticket: string): Promise<Peer<TRemoteRouter, TFileMetadata>> {
+  async connect<TRemoteRouter extends AnyTRPCRouter>(options: ConnectOptions): Promise<Peer<TRemoteRouter, TFileMetadata>> {
     if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
-    const connection = await this.dial(ticket);
-    const runtime = await this.registerConnection(connection, 'outbound', ticket);
+    const target = normalizeConnectOptions(options);
+    const connection = await this.dial(target);
+    const runtime = await this.registerConnection(connection, 'outbound', target);
     return new Peer<TRemoteRouter, TFileMetadata>(runtime.identity, runtime);
   }
 
@@ -392,21 +419,25 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
   private async registerConnection(
     connection: QuicConnection,
     direction: PeerIdentity['direction'],
-    ticket?: string
+    outboundTarget?: NormalizedConnectOptions
   ): Promise<PeerRuntime<TFileMetadata>> {
     const identity = peerIdentity(connection.remoteId, direction);
     let installed = false;
     try {
+      if (outboundTarget && identity.id !== outboundTarget.expectedPeerId) {
+        throw new P2PError('UNAUTHORIZED', 'Connected endpoint does not match the expected peer ID');
+      }
       this.assertPeerCapacity(identity.id);
       await this.admitPeer(identity);
       this.configureConnection(connection);
       const session = await this.authenticate(connection, direction);
       if (this.closed) throw new P2PError('DISCONNECTED', 'Node closed during authentication');
+      if (outboundTarget) assertExpectedPrincipal(session.principal, outboundTarget.expectedPrincipal);
 
       const existing = this.peers.get(identity.id);
       if (existing) {
         assertSamePrincipal(existing.session.principal, session.principal);
-        if (ticket) existing.ticket = ticket;
+        if (outboundTarget) existing.outboundTarget = outboundTarget;
         if (!existing.alive || (isPreferredConnection(this.id, connection) && !isPreferredConnection(this.id, existing.current))) {
           existing.connectionController.abort(new P2PError('DISCONNECTED', 'Authenticated connection was superseded'));
           existing.current.close(0n, new TextEncoder().encode('Superseded connection'));
@@ -428,7 +459,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         connectionController,
         alive: true,
         closed: false,
-        ...(ticket ? { ticket } : {}),
+        ...(outboundTarget ? { outboundTarget } : {}),
         identity,
         session,
         reconnecting: undefined,
@@ -470,7 +501,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           const safeReason = safePeerCloseReason(reason);
           runtime.closed = true;
           runtime.alive = false;
-          delete runtime.ticket;
+          delete runtime.outboundTarget;
           if (runtime.expiryTimer) clearTimeout(runtime.expiryTimer);
           if (this.peers.get(runtime.identity.id) === runtime) this.peers.delete(runtime.identity.id);
           runtime.connectionController.abort(new P2PError('DISCONNECTED', safeReason));
@@ -515,7 +546,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     });
   }
 
-  private async dial(ticket: string): Promise<QuicConnection> {
+  private async dial(target: NormalizedConnectOptions): Promise<QuicConnection> {
     if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
     const controller = new AbortController();
     const abortFromShutdown = (): void => {
@@ -524,7 +555,11 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     if (this.shutdownController.signal.aborted) abortFromShutdown();
     else this.shutdownController.signal.addEventListener('abort', abortFromShutdown, { once: true });
 
-    const pending = Promise.resolve().then(() => this.endpoint.connect(ticket, this.alpn));
+    const pending = Promise.resolve().then(() => this.endpoint.connect(
+      target.ticket,
+      this.alpn,
+      target.expectedPeerId
+    ));
     try {
       const connection = await withDeadline(
         pending,
@@ -562,18 +597,19 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       runtime.alive = false;
       this.peers.delete(runtime.identity.id);
     }
-    if (!runtime.ticket) throw new P2PError('DISCONNECTED', `Peer ${runtime.identity.id} is disconnected`);
+    if (!runtime.outboundTarget) throw new P2PError('DISCONNECTED', `Peer ${runtime.identity.id} is disconnected`);
     if (runtime.reconnecting) return runtime.reconnecting;
     this.assertPeerCapacity(runtime.identity.id);
     const reconnecting = (async () => {
       if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
       if (runtime.closed) throw new P2PError('DISCONNECTED', 'Peer is closed');
-      const connection = await this.dial(runtime.ticket!);
+      const target = runtime.outboundTarget!;
+      const connection = await this.dial(target);
       try {
         if (this.closed) throw new P2PError('DISCONNECTED', 'Node closed during reconnection');
         if (runtime.closed) throw new P2PError('DISCONNECTED', 'Peer closed during reconnection');
-        if (connection.remoteId !== runtime.identity.id) {
-          throw new P2PError('UNAUTHORIZED', 'Reconnection endpoint identity does not match the original peer');
+        if (connection.remoteId !== target.expectedPeerId || connection.remoteId !== runtime.identity.id) {
+          throw new P2PError('UNAUTHORIZED', 'Reconnection endpoint identity does not match the expected peer');
         }
         this.configureConnection(connection);
         const identity = peerIdentity(connection.remoteId, 'outbound');
@@ -581,6 +617,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         const session = await this.authenticate(connection, 'outbound');
         if (this.closed) throw new P2PError('DISCONNECTED', 'Node closed during reauthentication');
         if (runtime.closed) throw new P2PError('DISCONNECTED', 'Peer closed during reauthentication');
+        assertExpectedPrincipal(session.principal, target.expectedPrincipal);
         assertSamePrincipal(runtime.session.principal, session.principal);
         const incumbent = this.peers.get(identity.id);
         if (incumbent && incumbent !== runtime) {
@@ -1001,6 +1038,84 @@ function safePeerCloseReason(value: unknown): string {
   return typeof value === 'string'
     ? sanitizeBoundedDisplayText(value, MAX_PEER_CLOSE_REASON_BYTES, DEFAULT_PEER_CLOSE_REASON)
     : DEFAULT_PEER_CLOSE_REASON;
+}
+
+function normalizeConnectOptions(value: ConnectOptions): NormalizedConnectOptions {
+  if (!isPlainRecord(value)) {
+    throw new P2PError('INVALID_FRAME', 'Outbound connect options must be a plain object');
+  }
+  assertOnlyKeys(value, ['ticket', 'expectedPeerId', 'expectedPrincipal'], 'Outbound connect options');
+  const ticket = boundedExpectedString(value.ticket, 64 * 1024, 'Outbound ticket');
+  const expectedPeerId = boundedExpectedString(value.expectedPeerId, 2048, 'Expected peer ID');
+  const expectedPrincipal = normalizePrincipalMatcher(value.expectedPrincipal);
+  return Object.freeze({ ticket, expectedPeerId, expectedPrincipal });
+}
+
+function normalizePrincipalMatcher(value: unknown): Readonly<PrincipalMatcher> {
+  if (!isPlainRecord(value)) {
+    throw new P2PError('INVALID_FRAME', 'Expected principal matcher must be a plain object');
+  }
+  assertOnlyKeys(value, ['id', 'subject', 'issuer', 'clientId', 'tenantId'], 'Expected principal matcher');
+  for (const field of ['subject', 'issuer', 'clientId', 'tenantId'] as const) {
+    if (!Object.hasOwn(value, field)) {
+      throw new P2PError('INVALID_FRAME', `Expected principal matcher must specify ${field}`);
+    }
+  }
+  const subject = boundedExpectedString(value.subject, 2048, 'Expected principal subject');
+  const issuer = nullableExpectedString(value.issuer, 4096, 'Expected principal issuer');
+  const clientId = nullableExpectedString(value.clientId, 2048, 'Expected principal client ID');
+  const tenantId = nullableExpectedString(value.tenantId, 2048, 'Expected principal tenant ID');
+  const id = value.id === undefined
+    ? undefined
+    : boundedExpectedString(value.id, 2048, 'Expected principal ID');
+  return Object.freeze({
+    ...(id !== undefined ? { id } : {}),
+    subject,
+    issuer,
+    clientId,
+    tenantId
+  });
+}
+
+function assertExpectedPrincipal(principal: SessionPrincipal, matcher: PrincipalMatcher): void {
+  if (
+    (matcher.id !== undefined && principal.id !== matcher.id) ||
+    principal.subject !== matcher.subject ||
+    (principal.issuer ?? null) !== matcher.issuer ||
+    (principal.clientId ?? null) !== matcher.clientId ||
+    (principal.tenantId ?? null) !== matcher.tenantId
+  ) {
+    throw new P2PError('UNAUTHORIZED', 'Authenticated principal does not match the expected target');
+  }
+}
+
+function nullableExpectedString(value: unknown, maximumBytes: number, label: string): string | null {
+  return value === null ? null : boundedExpectedString(value, maximumBytes, label);
+}
+
+function boundedExpectedString(value: unknown, maximumBytes: number, label: string): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    Buffer.byteLength(value) > maximumBytes ||
+    containsUnsafeDisplayCharacters(value)
+  ) {
+    throw new P2PError('INVALID_FRAME', `${label} must be a bounded safe string`);
+  }
+  return value;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertOnlyKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new P2PError('INVALID_FRAME', `${label} contains an unknown field`);
+  }
 }
 
 function assertSamePrincipal(current: SessionPrincipal, replacement: SessionPrincipal): void {

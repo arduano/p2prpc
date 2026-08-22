@@ -25,7 +25,7 @@ const router = t.router({
 });
 type AppRouter = typeof router;
 
-const [mode, first, second] = process.argv.slice(2);
+const [mode, first, second, third] = process.argv.slice(2);
 const sharedSecret = process.env.P2PRPC_SHARED_SECRET;
 if (!sharedSecret || Buffer.byteLength(sharedSecret) < 32) {
   throw new Error('Set P2PRPC_SHARED_SECRET to the same secret of at least 32 bytes on both peers');
@@ -57,22 +57,32 @@ if (mode === 'serve') {
   console.log(`Ticket: ${node.ticket()}`);
   console.log('Waiting for peers. Press Ctrl+C to stop.');
   await waitForShutdown();
-} else if (mode === 'connect' && first) {
-  const peer = await node.connect<AppRouter>(first);
+} else if (mode === 'connect' && first && second) {
+  const peer = await node.connect<AppRouter>({
+    expectedPeerId: first,
+    ticket: second,
+    expectedPrincipal: {
+      id: first,
+      subject: first,
+      issuer: null,
+      clientId: null,
+      tenantId: null
+    }
+  });
   console.log(await peer.rpc.hello.query({ name: 'peer' }));
   const subscription = peer.rpc.ticks.subscribe(5, {
     onData: (tick) => console.log('tick', tick),
     onError: (error) => console.error('subscription:', error.message)
   });
-  if (second) {
-    const transfer = await peer.files.sendFile(await fileSource(resolve(second)));
+  if (third) {
+    const transfer = await peer.files.sendFile(await fileSource(resolve(third)));
     console.log('transfer:', await transfer.result);
   }
   await new Promise((resolveWait) => setTimeout(resolveWait, 750));
   subscription.unsubscribe();
   await node.close();
 } else {
-  console.error('Usage:\n  npm start -w @p2prpc/cli-example -- serve [download-dir]\n  npm start -w @p2prpc/cli-example -- connect <ticket> [file]');
+  console.error('Usage:\n  npm start -w @p2prpc/cli-example -- serve [download-dir]\n  npm start -w @p2prpc/cli-example -- connect <expected-peer-id> <ticket> [file]');
   await node.close();
   process.exitCode = 1;
 }

@@ -29,6 +29,7 @@ The intended enterprise deployment uses short-lived OAuth access tokens with exa
 - Per-operation authorization for every RPC path/type, incoming file push, and capability pull.
 - Normalized, immutable, bounded request metadata separated from a frozen trusted session principal/claims and frozen library-owned `PeerContext` view. Credential, forwarding, HTTP authority/origin, and library-owned names are reserved; security-relevant display text rejects or sanitizes C0/C1 and Unicode bidirectional/zero-width formatting controls.
 - Domain-separated Ed25519-signed, expiring, size-bounded locator tickets with strict peer-key, timestamp-ordering, socket-address, relay-URL, and canonical-encoding validation. Tickets are never authorization capabilities.
+- Required outbound target binding: every `connect()` supplies a separately trusted expected endpoint ID and exact canonical principal matcher. Ticket/connection identity mismatch and endpoint admission fail before credentials are requested; principal mismatch fails before a peer runtime is installed or returned. The frozen target is retained across reconnects.
 - Bounded unauthenticated handshakes, application stream handlers, control-frame bytes/items/nesting, RPC paths/headers, file manifests, chunks, lanes, active transfers, and transfer queues. MessagePack is preflighted before decoding and rejects extensions, invalid UTF-8 map keys, duplicate keys, and `__proto__`.
 - Peer-bound, expiring, one-operation file capabilities by default; only domain-separated token hashes are stored. Capability failures are deliberately non-oracular.
 - Exact authenticated-connection binding for file control/data lanes, receiver-issued transfer attempt and lane secrets, duplicate-session rejection, and strict chunk-size validation before allocation. The built-in filesystem destination performs full-file BLAKE3 verification before publication.
@@ -41,10 +42,10 @@ The security regression suite includes a native raw-Iroh peer which has the targ
 ## Operational requirements
 
 - Persist Iroh secret keys in a secrets manager or managed device keystore. Ephemeral endpoint identities make peer binding and audit correlation unstable.
-- Bootstrap tickets and expected peer IDs through a trusted directory, device-management channel, or equivalent authenticated mechanism. Signed tickets prove which endpoint key authored their routing data; they do not say that the endpoint belongs to an approved application principal.
+- Bootstrap tickets, expected peer IDs, and expected canonical principal tuples through a trusted directory, device-management channel, or equivalent authenticated mechanism. Signed tickets prove which endpoint key authored their routing data; they do not say that the endpoint belongs to an approved application principal. For optional principal fields, a `null` matcher value explicitly requires absence.
 - Use access tokens intended for this service, preferably `typ: at+jwt`, with short expiry. Never present ID or refresh tokens. Mint a narrow token for the expected peer/audience in `getAccessToken` where the authorization server supports it.
 - Assign a distinct OAuth audience and required connection scope per application, environment, and trust domain. Do not let a broadly accepted token turn one authenticated service into a confused deputy for another.
-- Where an outbound allow-list exists, implement `preAuthorizePeer` to reject an unexpected endpoint key before credential exchange. This hook runs before the session handshake and must remain a cheap key-admission check; it does not replace credential verification or operation policy.
+- Use `preAuthorizePeer` for an organization-wide endpoint-key allow-list and inbound admission. This hook runs before the session handshake and must remain a cheap key-admission check; outbound calls also enforce their required per-call expected endpoint. It does not replace expected-principal matching, credential verification, or operation policy.
 - Keep `peerBinding: 'required'`, or implement `bindPrincipalToPeer` against an authoritative managed-key directory.
 - Rotate/revoke endpoint keys and signing keys through organizational lifecycle controls. Use short JWT/session lifetimes or introspection for urgent revocation.
 - Treat RPC headers as caller assertions even after normalization and freezing. Middleware must derive identity and membership from `ctx.auth.principal` and compare metadata such as a requested tenant against verified claims or authoritative policy.
@@ -59,11 +60,13 @@ The security regression suite includes a native raw-Iroh peer which has the targ
 - Apply application-specific rate, tenant, aggregate disk, and business-operation limits above the library defaults.
 - Export `onSecurityEvent` records to a durable sink and monitor delivery health. The callback is best-effort and in-process; it is not a durable, complete, or backpressured audit log.
 - Review the pinned native Iroh dependency, provenance, SBOM, platform builds, relay configuration, and QUIC behavior as part of the production supply-chain review.
+- Review the packaged dependency licenses and the Iroh artifact caveat recorded in [`packages/core/THIRD_PARTY_NOTICES.md`](./packages/core/THIRD_PARTY_NOTICES.md).
 
 ## Known residual risks
 
+- `@momics/iroh-http-node` is pinned to 0.6.0 because its 0.6.1 wrapper reports an internal native-binding version of 0.6.0 and fails when napi-rs strict version enforcement is enabled. CI loads the pin with `NAPI_RS_ENFORCE_VERSION_CHECK=1`. Upstream's Linux binaries require glibc 2.34 or newer; Alpine/musl and older glibc distributions are unsupported. Its npm artifacts also omit their declared MIT/Apache license texts, as detailed in the third-party notices.
 - `@momics/iroh-http-node` 0.6 does not expose custom native QUIC ALPN, stream priorities (`setPriority` is a no-op), configured stream-count limits, or configured receive-window limits through this adapter. Flow control remains native-managed. The authenticated application handshake supplies protocol isolation, while JavaScript admission limits, deadlines, and cleanup bound dispatched work. A native stream-open operation cannot currently be aborted; a stream which resolves after its caller timed out is cleaned up when it arrives.
-- During outbound bootstrap the initiator presents its credential after Iroh authenticates the ticket's endpoint key but before it authenticates the remote application principal. Trusted ticket/peer-ID provisioning, `preAuthorizePeer`, proof-of-possession binding, narrow audience, and short token lifetime limit this disclosure surface.
+- During outbound bootstrap the initiator presents its credential only after the ticket and connection match the separately trusted expected endpoint ID, but before it can authenticate and compare the remote application principal. Trusted target provisioning, `preAuthorizePeer`, proof-of-possession binding, narrow audience, and short token lifetime limit disclosure to an approved endpoint key running an unexpected application identity.
 - The handshake refresh model is reconnect-on-expiry rather than in-place token refresh. Existing work ends when the connection closes.
 - JWT revocation is not instantaneous without short lifetimes or a custom introspection-backed authenticator.
 - OIDC `authorize` is deliberately unable to override missing mandatory scopes. Custom policy can only reduce the access granted by the connection and operation scopes.
@@ -78,7 +81,7 @@ The security regression suite includes a native raw-Iroh peer which has the targ
 - Security-event callbacks can lose events on process failure or sink failure. Once policy evaluation begins, exceptions/timeouts emit a generic denied authorization event; a stale-session rejection before evaluation begins does not.
 - Cancellation is cooperative and cannot undo a mutation that has already begun.
 - RPC delivery is not exactly once. Durable, atomic application-level idempotency is required wherever replaying or losing the response to a completed mutation would be unsafe.
-- `npm audit --omit=dev` is clean. The development-only `tsup` tool currently brings an affected esbuild 0.27.x release for a low-severity Windows development-server file-read advisory; the package does not ship that dependency or run a development server at runtime. Update when `tsup` publishes a compatible esbuild release.
+- Production and maintainer dependencies are audited in CI. The maintainer toolchain overrides `tsup`'s esbuild dependency to a patched compatible release until `tsup` updates its declared range.
 
 ## Reporting vulnerabilities
 
@@ -86,6 +89,7 @@ Do not publish secrets or exploit details in a public issue. Use GitHub's [priva
 
 ## Breaking migration from 0.1
 
+- Replace `connect(ticket)` with `connect({ ticket, expectedPeerId, expectedPrincipal })`. The principal matcher requires exact `subject`, `issuer`, `clientId`, and `tenantId` expectations (`null` means absent) and accepts an optional canonical `id` check. Source expectations independently of the locator; shared-secret peers use the endpoint ID as `id`/`subject` with the optional fields set to `null`.
 - Add required `security`; replace `authorizePeer` with optional `preAuthorizePeer` only for cheap endpoint-key filtering.
 - `PeerContext` now contains `auth` and per-call `request`, including normalized `request.headers`.
 - The library-owned `PeerContext` object passed to `createContext` is now frozen. Context factories which augmented that input by mutation must return a new application context instead.

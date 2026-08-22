@@ -25,7 +25,7 @@ File capability handles may be returned by tRPC, but file bytes never enter tRPC
 
 ## Non-negotiable invariants
 
-1. A ticket, address, or Iroh peer ID is routing and transport identity, never permission to invoke work.
+1. A ticket or address alone cannot select an outbound target: callers must independently supply the exact expected Iroh peer ID and application-principal tuple, and all three are bound before the peer is exposed.
 2. No RPC or file stream is dispatched until both endpoints complete the application handshake.
 3. Every RPC, file push, and file pull is authorized again before dispatch or capability lookup.
 4. `ctx.auth.principal` is verified identity; `ctx.request.headers`, RPC input, filenames, manifests, metadata, and file content are caller-controlled.
@@ -33,11 +33,12 @@ File capability handles may be returned by tRPC, but file bytes never enter tRPC
 
 These are production invariants. The explicitly named `dangerouslyAllowInsecureSessions()` test/development escape hatch intentionally provides no real application authentication and must be prohibited in deployed configurations.
 
-## The seven concepts
+## The eight concepts
 
 | Concept | Meaning |
 |---|---|
 | Locator ticket | Signed, expiring route description. Bootstrap data, not a bearer grant; it may expose route topology and should come through a trusted channel. |
+| Outbound target | A snapshotted locator plus independently trusted expected endpoint ID and exact principal matcher; all are rechecked on reconnect. |
 | Endpoint ID | Iroh Ed25519 public-key identity proved by the encrypted transport. |
 | Principal | Verified application identity derived from OAuth/OIDC or another `SessionSecurity`. |
 | Session | Short-lived binding of both endpoint IDs, fresh nonces, protocol contract, and principals to one physical connection. |

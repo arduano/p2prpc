@@ -15,6 +15,7 @@ import {
   fileDestination,
   fileSource,
   p2pRpcContext,
+  type ConnectOptions,
   type P2PNode,
   type PeerContext,
   type SessionCredential,
@@ -106,7 +107,7 @@ describe('Iroh integration', () => {
     const receiver = await makeNode(undefined, security);
     const sender = await makeNode(undefined, security);
 
-    await sender.connect(receiver.ticket());
+    await sender.connect(nodeTarget(receiver));
 
     expect(authenticatedCredentials).toHaveLength(2);
     expect(credentialContextsFrozen).toEqual([true, true]);
@@ -120,13 +121,14 @@ describe('Iroh integration', () => {
   it('rejects a peer with the locator but the wrong application credential', { timeout: 30_000 }, async () => {
     const receiver = await makeNode(undefined, createSharedSecretSecurity('a'.repeat(32)));
     const stranger = await makeNode(undefined, createSharedSecretSecurity('b'.repeat(32)));
-    await expect(stranger.connect(receiver.ticket())).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    await expect(stranger.connect(nodeTarget(receiver))).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
     const [prefix, body, signature] = receiver.ticket().split('.');
     const locator = JSON.parse(Buffer.from(body!, 'base64url').toString('utf8')) as Record<string, unknown>;
     locator.protocol = 'tampered';
     const tampered = `${prefix}.${Buffer.from(JSON.stringify(locator)).toString('base64url')}.${signature}`;
-    await expect(stranger.connect(tampered)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    await expect(stranger.connect({ ...nodeTarget(receiver), ticket: tampered }))
+      .rejects.toMatchObject({ code: 'INVALID_FRAME' });
   });
 
   it('rejects a raw peer that knows the signed address but has no application credential', { timeout: 30_000 }, async () => {
@@ -170,7 +172,7 @@ describe('Iroh integration', () => {
   it('closes expired sessions and obtains fresh credentials on reconnect', { timeout: 30_000 }, async () => {
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
-    const peer = await sender.connect<Router>(receiver.ticket());
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
     const firstSessionId = peer.session.id;
     await expect(peer.rpc.add.query({ left: 1, right: 1 })).resolves.toMatchObject({ value: 2 });
     await new Promise((resolve) => setTimeout(resolve, 750));
@@ -192,7 +194,7 @@ describe('Iroh integration', () => {
       offer.accept(fileDestination(pushedPath));
     });
     const sender = await makeNode();
-    const peer = await sender.connect<Router>(receiver.ticket());
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
 
     await expect(peer.rpc.add.query({ left: 20, right: 22 })).resolves.toMatchObject({ value: 42, peer: sender.id });
     await expect(peer.rpc.inspectSecurity.query(undefined, {
@@ -227,3 +229,17 @@ describe('Iroh integration', () => {
     expect(await readFile(pulledPath)).toEqual(content);
   });
 });
+
+function nodeTarget(node: P2PNode<Router>): ConnectOptions {
+  return {
+    ticket: node.ticket(),
+    expectedPeerId: node.id,
+    expectedPrincipal: {
+      id: node.id,
+      subject: node.id,
+      issuer: null,
+      clientId: null,
+      tenantId: null
+    }
+  };
+}

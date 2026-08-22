@@ -539,26 +539,32 @@ function isResumeState(value: unknown): value is ResumeState {
 }
 
 async function openSecure(path: string, flags: number, label: string): Promise<FileHandle> {
-  const before = await lstat(path, { bigint: true });
-  if (before.isSymbolicLink()) throw new P2PError('REJECTED', `${label} must not be a symbolic link`);
-  if (!before.isFile()) throw new P2PError('NOT_FOUND', `${label} is not a regular file`);
-
+  // Open first and perform subsequent I/O through the descriptor. O_NOFOLLOW
+  // rejects leaf symlinks where supported; the descriptor/path identity check
+  // below preserves fail-closed behavior on platforms where it is unavailable.
   let handle: FileHandle;
   try {
     handle = await open(path, flags | NO_FOLLOW);
   } catch (cause) {
     if (errorCode(cause) === 'ELOOP') throw new P2PError('REJECTED', `${label} must not be a symbolic link`);
+    if (errorCode(cause) === 'ENOENT') throw new P2PError('NOT_FOUND', `${label} was not found`);
     throw cause;
   }
   try {
-    const [opened, after] = await Promise.all([
-      handle.stat({ bigint: true }),
-      lstat(path, { bigint: true })
-    ]);
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile()) throw new P2PError('NOT_FOUND', `${label} is not a regular file`);
+    let after: BigIntStats;
+    try {
+      after = await lstat(path, { bigint: true });
+    } catch (cause) {
+      if (errorCode(cause) === 'ENOENT') {
+        throw new P2PError('REJECTED', `${label} path changed while it was being opened`);
+      }
+      throw cause;
+    }
     if (
       after.isSymbolicLink() ||
-      before.dev !== opened.dev ||
-      before.ino !== opened.ino ||
+      !after.isFile() ||
       after.dev !== opened.dev ||
       after.ino !== opened.ino
     ) {

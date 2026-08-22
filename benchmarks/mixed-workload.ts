@@ -33,7 +33,17 @@ const sender = await createP2PNode({
 });
 
 try {
-  const peer = await sender.connect<typeof router>(receiver.ticket());
+  const peer = await sender.connect<typeof router>({
+    ticket: receiver.ticket(),
+    expectedPeerId: receiver.id,
+    expectedPrincipal: {
+      id: receiver.id,
+      subject: receiver.id,
+      issuer: null,
+      clientId: null,
+      tenantId: null
+    }
+  });
   const transfer = await peer.files.sendFile(await fileSource(sourcePath));
   const latencies: number[] = [];
   let nextCall = 0;

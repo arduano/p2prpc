@@ -8,17 +8,20 @@
 create node
   → validate and snapshot configuration
   → create Iroh endpoint and accept loop
-  → dial or accept physical connection
-  → optional endpoint-key admission
+  → outbound: validate/snapshot target, verify locator matches expected endpoint, dial
+    inbound: accept physical connection
+  → outbound: verify connected endpoint matches expectation
+  → optional endpoint-key admission (before credential retrieval)
   → mandatory application handshake
+  → outbound: verify authenticated principal matches expectation
   → install peer runtime and stream loops
   → active
   → disconnected | replaced | expired | explicitly closed
 ```
 
-Node configuration is snapshotted at creation so later mutation of the options object cannot widen security policy. `P2PNode.close()` is terminal.
+Node configuration is snapshotted at creation so later mutation of the options object cannot widen security policy. Each outbound `ConnectOptions` object and nested principal matcher is likewise validated and snapshotted before any dial. Unknown fields are rejected rather than ignored. `P2PNode.close()` is terminal.
 
-A `Peer` represents one logical remote endpoint and its current authenticated connection. `Peer.close()` permanently retires that local handle. To reconnect from that side, call `node.connect()` explicitly for a new handle; the remote endpoint may independently establish a later inbound runtime.
+A `Peer` represents one logical remote endpoint and its current authenticated connection. `Peer.close()` permanently retires that local handle. To reconnect from that side, call `node.connect({ ticket, expectedPeerId, expectedPrincipal })` explicitly for a new handle; the remote endpoint may independently establish a later inbound runtime.
 
 ## Mutual session handshake
 
@@ -49,10 +52,10 @@ The first accepted bidirectional stream must be session authentication, and RPC/
 | Valid replacement | Old session signal aborts; active RPC/file work is cancelled; new stream loops and expiry are installed. |
 | Principal change on the same endpoint runtime | Replacement is rejected. |
 | Session expiry | Connection and all session-bound work close. |
-| Outbound runtime loses its connection | The next operation may redial the retained ticket, then must reauthenticate the same endpoint and principal. |
-| `Peer.close()` | Ticket is discarded and implicit reconnect is permanently disabled for that handle. |
+| Outbound runtime loses its connection | The next operation may redial the snapshotted ticket, recheck the ticket and connected endpoint against the retained expected peer ID, rerun admission/authentication, and match both the retained expected principal and the runtime's prior principal. |
+| `Peer.close()` | The complete outbound target (ticket, expected endpoint, and principal matcher) is discarded and implicit reconnect is permanently disabled for that handle. |
 
-Reconnect never carries an authenticated session forward. It creates a new session and repeats endpoint admission and authentication. Each retried or subsequent RPC/file control request is then separately authorized; connecting by itself does not authorize an operation.
+Reconnect retains the exact immutable outbound target, but never carries an authenticated session forward. It repeats locator/endpoint binding, endpoint admission, authentication, and expected-principal checks before installing a fresh session. Each retried or subsequent RPC/file control request is then separately authorized; connecting by itself does not authorize an operation.
 
 ## RPC lifecycle
 

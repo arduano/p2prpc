@@ -292,6 +292,78 @@ describe('session security', () => {
       .rejects.toMatchObject({ code: 'UNAUTHORIZED' });
   });
 
+  it('rejects malformed identity, scope, and confirmation claims instead of treating them as absent', async () => {
+    const issuer = 'https://identity.example';
+    const { privateKey, publicKey } = await generateKeyPair('RS256');
+    const verificationJwk = { ...await exportJWK(publicKey), kid: 'strict-key', alg: 'RS256', use: 'sig' };
+    const sign = (claims: Record<string, unknown>) => new SignJWT({
+      sub: 'service-a',
+      scope: 'p2prpc:connect',
+      ...claims
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: 'strict-key', typ: 'at+jwt' })
+      .setIssuer(issuer)
+      .setAudience('urn:example:p2prpc')
+      .setIssuedAt()
+      .setExpirationTime('5m')
+      .sign(privateKey);
+    let directoryBindingAttempts = 0;
+    const security = createOidcSessionSecurity({
+      issuers: [{
+        issuer,
+        audience: 'urn:example:p2prpc',
+        algorithms: ['RS256'],
+        verificationKey: createLocalJWKSet({ keys: [verificationJwk] })
+      }],
+      getAccessToken: () => '',
+      bindPrincipalToPeer: () => {
+        directoryBindingAttempts += 1;
+        return true;
+      }
+    });
+    const context: SessionAuthenticationContext = {
+      localPeerId: 'local-peer',
+      remotePeerId: 'remote-peer',
+      direction: 'inbound',
+      protocol: 'p2prpc/2/enterprise/1',
+      initiatorPeerId: 'remote-peer',
+      responderPeerId: 'local-peer',
+      initiatorNonce: 'a',
+      responderNonce: 'b',
+      presentedAt: Date.now(),
+      signal: new AbortController().signal
+    };
+    const authenticate = async (claims: Record<string, unknown>) => security.authenticate(
+      { scheme: 'Bearer', value: await sign(claims) },
+      context
+    );
+
+    await expect(authenticate({ sub: undefined, client_id: 'workload-a' }))
+      .resolves.toMatchObject({ subject: 'workload-a', clientId: 'workload-a' });
+    expect(directoryBindingAttempts).toBe(1);
+
+    for (const sub of [null, 7, '', [], 'subject\nforged']) {
+      await expect(authenticate({ sub, client_id: 'workload-a' })).rejects.toThrow(/sub claim/);
+    }
+    for (const client_id of [null, 7, '', [], 'client\nforged', 'x'.repeat(2049)]) {
+      await expect(authenticate({ sub: undefined, client_id })).rejects.toThrow(/client_id claim/);
+    }
+    for (const malformedScope of [
+      { scope: null },
+      { scope: ['p2prpc:connect'] },
+      { scope: 'p2prpc:connect\tp2prpc:rpc' },
+      { scope: 'x'.repeat(1025) },
+      { scp: [] },
+      { scp: ['p2prpc:connect', 7] }
+    ]) {
+      await expect(authenticate(malformedScope)).rejects.toThrow(/scope and scp claims/);
+    }
+    for (const cnf of [null, [], {}, { kid: 'unsupported' }, { jkt: '' }, { jkt: 7 }, { jkt: 'x'.repeat(43) }]) {
+      await expect(authenticate({ cnf })).rejects.toThrow(/cnf/);
+    }
+    expect(directoryBindingAttempts).toBe(1);
+  });
+
   it('preserves verified OAuth client identity and rejects conflicting client claims', async () => {
     const issuer = 'https://identity.example';
     const { privateKey, publicKey } = await generateKeyPair('RS256');

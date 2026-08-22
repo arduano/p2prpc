@@ -230,8 +230,11 @@ export class IrohEndpoint implements QuicEndpoint {
     );
   }
 
-  async connect(ticket: string, alpn: Uint8Array): Promise<QuicConnection> {
+  async connect(ticket: string, alpn: Uint8Array, expectedPeerId: string): Promise<QuicConnection> {
     const parsed = await decodeTicket(ticket, this.allowDirectAddress, this.allowRelayUrl);
+    if (parsed.peerId !== expectedPeerId) {
+      throw new P2PError('UNAUTHORIZED', 'Ticket endpoint does not match the expected peer ID');
+    }
     const protocol = Buffer.from(alpn).toString('base64url');
     if (parsed.protocol !== protocol || parsed.protocol !== this.protocol) {
       throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Peer ticket uses a different application contract');

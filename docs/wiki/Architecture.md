@@ -12,16 +12,18 @@
 └──────────────────────────────┬────────────────────────────────────────┘
                                │
 ┌──────────────────────── p2prpc core ─────────────────────────────────┐
-│ P2PNode                                                            │
-│ ├─ peer runtimes: connection + authenticated session                │
-│ ├─ RPC link/server: framing, metadata, dispatch, cancellation       │
-│ ├─ transfer managers: control, lanes, retries, integrity            │
-│ ├─ share registry: hashed capabilities and operation state          │
-│ └─ SessionSecurity: credentials, authentication, authorization      │
+│ P2PNode                                                              │
+│ ├─ outbound target: locator + expected endpoint + principal          │
+│ ├─ peer runtimes: connection + authenticated session                 │
+│ ├─ RPC link/server: framing, metadata, dispatch, cancellation        │
+│ ├─ transfer managers: control, lanes, retries, integrity             │
+│ ├─ share registry: hashed capabilities and operation state           │
+│ └─ SessionSecurity: credentials, authentication, authorization       │
 └──────────────────────────────┬────────────────────────────────────────┘
                                │
 ┌────────────────────── transport and network ────────────────────────┐
-│ signed locator → Iroh endpoint → encrypted multiplexed QUIC         │
+│ signed locator + independent target expectations                    │
+│        → Iroh endpoint → encrypted multiplexed QUIC                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -43,6 +45,7 @@ Streams share QUIC encryption, congestion control, and connection flow control b
 | Layer | Establishes | Deliberately does not establish |
 |---|---|---|
 | Signed ticket | Self-authenticated attestation by the named endpoint key over its ID, routes, protocol hint, and issue/expiry times | Enterprise ownership, confidentiality, or permission |
+| Outbound target expectations | Exact endpoint and application-principal tuple the caller intended, sourced independently of the locator | Proof that the endpoint or principal is authentic; later transport and handshake checks provide that proof |
 | Iroh transport | Confidential channel and possession of the endpoint Ed25519 key | OAuth identity or business authorization |
 | Application handshake | Mutual principals, transcript-bound session ID, contract match, and session expiry | Permission for an individual operation |
 | Operation policy | RPC path/type or file push/pull permission | Trust in inputs, metadata, paths, names, or content |
@@ -52,7 +55,7 @@ Streams share QUIC encryption, congestion control, and connection flow control b
 
 tRPC supplies compile-time procedure paths and input/output inference. At runtime:
 
-- `connect<RemoteRouter>()` is a caller-side TypeScript assertion; it does not negotiate or verify the remote router schema.
+- `connect<RemoteRouter>({ ticket, expectedPeerId, expectedPrincipal })` enforces the target fields at runtime, but the `RemoteRouter` generic itself remains a caller-side TypeScript assertion; it does not negotiate or verify the remote router schema.
 - `contractVersion` is an application-managed compatibility label, not schema negotiation. Peers only compare the configured string.
 - MessagePack envelopes are size-, item-, and depth-bounded before decode.
 - RPC values use SuperJSON inside the validated envelope.

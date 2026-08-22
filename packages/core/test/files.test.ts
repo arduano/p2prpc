@@ -1,6 +1,7 @@
 import { lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import process from 'node:process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { chunkDigest, createManifest, fileDestination, fileSource } from '../src/files/fs.js';
 import { TransferManager, type FileTransferConnectionContext } from '../src/files/manager.js';
@@ -601,7 +602,9 @@ describe('filesystem transfers', () => {
     const manifest = await createManifest(source, { chunkSize: 64 * 1024 });
     const destination = fileDestination(output);
     await destination.prepare(manifest);
-    expect((await stat(`${output}.p2prpc.part`)).mode & 0o777).toBe(0o600);
+    if (process.platform !== 'win32') {
+      expect((await stat(`${output}.p2prpc.part`)).mode & 0o777).toBe(0o600);
+    }
     await destination.writeChunk(manifest, 0, bytes);
     await writeFile(output, 'winner');
     await expect(destination.finalize(manifest)).rejects.toMatchObject({ code: 'REJECTED' });
@@ -909,13 +912,20 @@ describe('filesystem transfers', () => {
       digest: chunkDigest(byte)
     };
     const writeStarted = deferred<void>();
+    const writeAborted = deferred<void>();
     const releaseWrite = deferred<void>();
     const events: string[] = [];
     const destination: FileDestination = {
       prepare: async () => new Set(),
-      writeChunk: async () => {
+      writeChunk: async (_manifest, _index, _data, signal) => {
         events.push('write-started');
         writeStarted.resolve();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) resolve();
+          else signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        events.push('write-aborted');
+        writeAborted.resolve();
         await releaseWrite.promise;
         events.push('write-finished');
       },
@@ -958,17 +968,15 @@ describe('filesystem transfers', () => {
       transferId: 'different-transfer',
       attemptId: accepted.value.attemptId
     });
-    for (let turn = 0; turn < 20 && lane.stopCalls === 0; turn += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    await writeAborted.promise;
     expect(lane.stopCalls).toBeGreaterThan(0);
     expect(receivingSettled).toBe(false);
-    expect(events).toEqual(['write-started']);
+    expect(events).toEqual(['write-started', 'write-aborted']);
 
     releaseWrite.resolve();
     await handlingLane;
     expect(await observed).toMatchObject({ code: 'INVALID_FRAME' });
-    expect(events).toEqual(['write-started', 'write-finished', 'abort']);
+    expect(events).toEqual(['write-started', 'write-aborted', 'write-finished', 'abort']);
   });
 
   it('waits for an aborted finalizer to settle and never publishes after timeout', async () => {

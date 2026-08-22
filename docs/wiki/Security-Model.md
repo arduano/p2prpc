@@ -11,21 +11,60 @@ The model assumes the network, routes, remote endpoint, RPC metadata/input, mani
 ## Decision pipeline
 
 ```text
-outbound: signed route + egress checks
+outbound: validate + snapshot independently trusted target expectations
+  → verify signed locator and require locator peer ID == expected peer ID
+  → egress checks, then native dial
   → encrypted endpoint-key-authenticated QUIC
-  → optional endpoint allow-list (`preAuthorizePeer`)
+  → require connected endpoint ID == expected peer ID
+  → optional endpoint admission (`preAuthorizePeer`)
   → mutual application credential verification
+  → require authenticated principal == expected principal
   → active short-lived session
   → strict operation parse
   → configured `SessionSecurity.authorize` policy
   → tRPC dispatch, file offer, or capability lookup
 ```
 
-Inbound connections enter at the QUIC step; they do not present a locator ticket.
+Inbound connections enter at the QUIC step; they do not present a locator ticket or caller-supplied outbound target expectations. For an outbound connection, locator/connected-endpoint mismatches and endpoint-admission rejection occur before `SessionSecurity.getCredential` is called. The principal check occurs immediately after mutual authentication and before the peer runtime is installed, returned, or exposed through `onPeer`.
 
 Failure at any step is fail-closed. In particular, file pull authorization receives only a non-secret capability hash and runs before registry lookup, reducing capability-oracle behavior.
 
 `SessionSecurity` defines the operation policy. The OIDC helper first requires the operation's OAuth scope and then invokes its optional custom policy; that policy can narrow but cannot restore a missing scope. Shared-secret and custom implementations may apply different rules, so an audit must inspect the configured implementation.
+
+## Outbound target binding
+
+Outbound callers must supply a locator and two expectations obtained from a trusted source independently of that locator:
+
+```ts
+await node.connect<RemoteRouter>({
+  ticket,
+  expectedPeerId,
+  expectedPrincipal: {
+    subject,
+    issuer,
+    clientId,
+    tenantId,
+    // Optional additional exact match of SessionPrincipal.id:
+    id
+  }
+});
+```
+
+`subject`, `issuer`, `clientId`, and `tenantId` are all mandatory matcher fields. For the optional principal fields, `null` means the authenticated field must be absent; it is not a wildcard. `id`, when present, adds an exact check of the authenticator's canonical principal ID. Unknown fields and malformed or missing values are rejected before dialing, and the complete target is defensively copied and frozen for reconnects.
+
+For shared-secret security, the authenticated subject and ID are the endpoint ID and the optional OIDC-shaped fields are absent, so the exact matcher is:
+
+```ts
+const expectedPrincipal = {
+  id: expectedPeerId,
+  subject: expectedPeerId,
+  issuer: null,
+  clientId: null,
+  tenantId: null
+};
+```
+
+The locator remains untrusted routing material for target-selection purposes. Supplying expectations copied only from an attacker-supplied locator defeats the independent binding; production callers should resolve the expected endpoint/principal tuple from an authenticated directory, enrollment record, or similarly trusted bootstrap channel.
 
 ## OAuth/OIDC without HTTP
 
@@ -41,9 +80,9 @@ Default operation scopes are `p2prpc:rpc`, `p2prpc:rpc:<path>`, `p2prpc:file:pus
 
 ### Bootstrap caveat
 
-The initiator sends its token after Iroh proves the ticket's endpoint key but before the remote application principal is known. Therefore tickets and expected peer IDs must come from a trusted bootstrap channel. Use short-lived peer/audience-specific tokens and `preAuthorizePeer` when an endpoint-key directory is available.
+The initiator sends its credential only after the signed locator and connected transport endpoint match `expectedPeerId`, and after `preAuthorizePeer` accepts the endpoint. However, the remote application principal cannot be known until that credential exchange completes. An `expectedPrincipal` mismatch therefore rejects the connection before peer installation but may occur after the initiator has disclosed its credential to the expected endpoint key.
 
-`preAuthorizePeer` runs after transport endpoint authentication and before application credentials are presented; it can prevent credential disclosure to an unapproved key. Direct-address and relay callbacks are the pre-dial egress controls.
+This ordering is an unavoidable bootstrap limit, not principal preauthentication. Use short-lived, audience-specific and preferably endpoint-key-bound tokens; obtain the complete endpoint/principal expectation from a trusted directory; and use `preAuthorizePeer` when an endpoint-key allow-list is available. Direct-address and relay callbacks remain the pre-dial egress controls.
 
 ## Other `SessionSecurity` modes
 

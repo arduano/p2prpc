@@ -4,7 +4,7 @@
 [![CodeQL](https://github.com/arduano/p2prpc/actions/workflows/codeql.yml/badge.svg)](https://github.com/arduano/p2prpc/actions/workflows/codeql.yml)
 [![Docs](https://github.com/arduano/p2prpc/actions/workflows/pages.yml/badge.svg)](https://arduano.github.io/p2prpc/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.3-339933?logo=node.js&logoColor=white)](./package.json)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20.3-339933?logo=node.js&logoColor=white)](./packages/core/package.json)
 
 Type-safe peer-to-peer RPC, subscriptions, and parallel resumable file transfer over one Iroh QUIC connection, with mandatory application authentication.
 
@@ -17,8 +17,8 @@ Read the [published architecture wiki](https://arduano.github.io/p2prpc/) for th
 
 ## Requirements
 
-- Node.js 20.3 or newer
-- An `@momics/iroh-http-node` native target: Linux x64/arm64, macOS x64/arm64, or Windows x64
+- Node.js 20.3 or newer and an ES module application; CommonJS `require()` is not supported
+- An `@momics/iroh-http-node` native target: glibc 2.34+ Linux x64/arm64, macOS x64/arm64, or Windows x64
 - Matching application ID and contract version
 - A `SessionSecurity` implementation on every node
 
@@ -72,8 +72,19 @@ const node = await createP2PNode({
   createContext: (requestContext) => requestContext
 });
 
-// Exchange the signed locator out of band. It is not an authorization secret.
-const peer = await node.connect<AppRouter>(remoteTicket);
+// Obtain the locator and expected identity through a trusted bootstrap channel.
+// The ticket is not itself an authorization secret or target-selection policy.
+const peer = await node.connect<AppRouter>({
+  ticket: remoteTicket,
+  expectedPeerId: remotePeerId,
+  expectedPrincipal: {
+    id: remotePeerId,
+    subject: remotePeerId,
+    issuer: null,
+    clientId: null,
+    tenantId: null
+  }
+});
 const result = await peer.rpc.hello.query(
   { name: 'Ada' },
   { context: p2pRpcContext({ 'x-tenant-id': 'tenant-a', traceparent }) }
@@ -85,6 +96,8 @@ Header names are normalized to lowercase and the resulting record is frozen. The
 Metadata is still asserted by the caller. It is appropriate for trace IDs, locale, requested tenant, and similar routing hints, but it must not be treated as identity or proof of membership. tRPC middleware should compare it with `ctx.auth.principal` or other verified policy data. `getRequestHeaders` can supply per-peer defaults; per-call values supplied with `p2pRpcContext()` override those defaults after both sets are validated.
 
 The library-owned `PeerContext` view passed into `createContext` is frozen, as are its authenticated session, principal, request, headers, and connection facade. If `createContext` returns a different application context, preserve that separation between verified identity and caller assertions rather than copying either into mutable or user-controlled fields.
+
+Outbound `connect()` always requires the locator plus a separately trusted endpoint ID and exact application-principal matcher. `subject`, `issuer`, `clientId`, and `tenantId` are provider-neutral canonical identity fields; use `null` to require an optional field to be absent. `id` is an optional additional check of the authenticator's stable principal ID. Shared-secret principals use the endpoint ID for both `id` and `subject` and have no issuer, client, or tenant, as shown above. OIDC callers should instead provide the expected issuer/subject/client/tenant tuple. The target is validated and snapshotted before dialing, retained for reconnects, and cannot be weakened by later object mutation.
 
 Node configuration is snapshotted at construction. In particular, the security methods and their original receiver are captured, and Iroh key and relay lists are defensively copied; mutating the original options object later cannot widen authorization. Application callback closures and any services they reference remain application-owned and must apply their own concurrency and lifecycle controls.
 
@@ -114,7 +127,7 @@ const security = createOidcSessionSecurity({
 });
 ```
 
-The initiator sends its access token before authenticating the remote *application* principal. Iroh has already proved possession of the endpoint key named by the ticket, so the token goes only to that key holder, but an untrusted or maliciously supplied ticket can still cause credential disclosure. Obtain tickets and peer IDs through a trusted bootstrap channel, mint short-lived peer/audience-specific tokens in `getAccessToken`, and use `preAuthorizePeer` when the local node has an endpoint-key allow-list:
+The required `expectedPeerId` is compared with the signed ticket before the native dial and with the connected transport identity before `getAccessToken` is called. The initiator must still present its access token before it can authenticate the remote *application* principal. `expectedPrincipal` is therefore checked immediately after mutual authentication and before the peer is installed or returned, but it cannot prevent disclosure to the already approved endpoint key. Obtain the ticket, expected peer ID, and expected principal through a trusted bootstrap channel; mint short-lived peer/audience-specific tokens; and use `preAuthorizePeer` for an organization-wide endpoint-key allow-list or inbound admission policy:
 
 ```ts
 const approvedPeerIds = new Set(configuredPeerIds);
@@ -125,7 +138,7 @@ const node = await createP2PNode({
 });
 ```
 
-`preAuthorizePeer` runs before either side exchanges application credentials. It is a cheap endpoint-key admission gate, not a substitute for `SessionSecurity` authentication or per-operation authorization.
+`preAuthorizePeer` runs before either side exchanges application credentials. For outbound connections it is cumulative with the required per-call expected peer; for inbound connections it remains the available endpoint-key admission gate. It is not a substitute for expected-principal matching, `SessionSecurity` authentication, or per-operation authorization.
 
 Locator dialing uses only the ticket's signed direct/relay candidates; implicit native DNS and mDNS route discovery is disabled. For restricted egress, configure `iroh.allowDirectAddress` and explicit `iroh.relayUrls` with `iroh.allowRelayUrl`. A relay allow-policy cannot be combined with unknown default relays, because the policy must run before native networking begins.
 
@@ -251,14 +264,16 @@ npm run typecheck
 npm test
 npm run test:integration
 npm run build
+npm run test:minimum-runtime
 npm run docs:build
+npm audit --audit-level=low
 ```
 
 Run the example with the same separately exchanged secret in two terminals:
 
 ```bash
 P2PRPC_SHARED_SECRET='replace-with-at-least-32-random-bytes' npm start -w @p2prpc/cli-example -- serve ./downloads
-P2PRPC_SHARED_SECRET='replace-with-at-least-32-random-bytes' npm start -w @p2prpc/cli-example -- connect '<ticket>' ./large-file.bin
+P2PRPC_SHARED_SECRET='replace-with-at-least-32-random-bytes' npm start -w @p2prpc/cli-example -- connect '<expected-peer-id>' '<ticket>' ./large-file.bin
 ```
 
 `npm run benchmark` runs 1,000 RPCs while transferring a 256 MiB file.
@@ -276,4 +291,4 @@ Control envelopes use length-bounded MessagePack frames with configurable pre-de
 
 ## Community and license
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) before proposing a change, use [SUPPORT.md](./SUPPORT.md) to choose the right public or private channel, and follow the [Code of Conduct](./CODE_OF_CONDUCT.md). p2prpc is available under the [MIT License](./LICENSE).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) before proposing a change, use [SUPPORT.md](./SUPPORT.md) to choose the right public or private channel, and follow the [Code of Conduct](./CODE_OF_CONDUCT.md). p2prpc is available under the [MIT License](./LICENSE); runtime dependency licensing and the current Iroh packaging caveat are recorded in the [third-party notices](./packages/core/THIRD_PARTY_NOTICES.md).

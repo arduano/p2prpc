@@ -33,8 +33,8 @@ jobs:
         run: npm ci
       - name: Validate release candidate
         run: npm run typecheck && npm run lint && npm test && npm run build
-      - name: Audit production dependencies
-        run: npm audit --omit=dev
+      - name: Audit dependencies
+        run: npm audit --audit-level=low
       - name: Inspect package contents
         run: npm pack --dry-run -w @p2prpc/core
       - name: Open or update Changesets release pull request

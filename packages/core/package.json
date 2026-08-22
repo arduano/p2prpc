@@ -18,20 +18,22 @@
     "provenance": true
   },
   "sideEffects": false,
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": null
     }
   },
   "files": [
     "dist",
+    "LICENSE",
     "README.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "tsup",
@@ -42,8 +44,8 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@momics/iroh-http-node": "0.6.1",
-    "@napi-rs/blake-hash": "^1.4.0",
+    "@momics/iroh-http-node": "0.6.0",
+    "@napi-rs/blake-hash": "1.3.6",
     "@trpc/client": ">=11.0.0 <12",
     "@trpc/server": ">=11.0.0 <12",
     "jose": "^6.2.9",

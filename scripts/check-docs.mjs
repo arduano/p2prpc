@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import process from 'node:process';
 
 const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '*.md'], {
   encoding: 'utf8'
@@ -19,8 +20,8 @@ for (const file of files) {
 }
 
 if (failures.length > 0) {
-  console.error(failures.join('\n'));
+  process.stderr.write(`${failures.join('\n')}\n`);
   process.exitCode = 1;
 } else {
-  console.log(`Checked ${files.length} Markdown files; local links resolve and code fences balance.`);
+  process.stdout.write(`Checked ${files.length} Markdown files; local links resolve and code fences balance.\n`);
 }

@@ -1,10 +1,12 @@
 export { createP2PNode, P2PNode, Peer } from './node.js';
 export type {
+  ConnectOptions,
   P2PNodeLimits,
   P2PNodeOptions,
   PeerContext,
   PeerFiles,
   PeerIdentity,
+  PrincipalMatcher,
   ProtocolIdentity,
   SecurityAuditEvent
 } from './node.js';

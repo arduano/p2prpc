@@ -43,7 +43,7 @@ export interface EndpointAddress {
 export interface QuicEndpoint {
   readonly id: string;
   readonly address: EndpointAddress;
-  connect(ticket: string, alpn: Uint8Array): Promise<QuicConnection>;
+  connect(ticket: string, alpn: Uint8Array, expectedPeerId: string): Promise<QuicConnection>;
   accept(): Promise<QuicConnection | null>;
   close(): Promise<void>;
 }

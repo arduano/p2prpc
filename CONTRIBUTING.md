@@ -20,8 +20,10 @@ npm run check:docs
 npm test
 npm run test:integration
 npm run build
+npm run test:minimum-runtime
 npm run docs:build
 npm pack --dry-run -w @p2prpc/core
+npm audit --audit-level=low
 ```
 
 Native integration tests exercise real Iroh endpoints and can take longer than unit tests.

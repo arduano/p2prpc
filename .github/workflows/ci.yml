@@ -45,7 +45,7 @@ jobs:
       - name: Inspect package contents
         run: npm pack --dry-run -w @p2prpc/core
       - name: Audit dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=low
 
   native:
     name: Native / ${{ matrix.os }} / Node ${{ matrix.node }}
@@ -53,11 +53,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             node: 20
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             node: 22
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             node: 24
           - os: macos-14
             node: 24
@@ -65,6 +65,8 @@ jobs:
             node: 24
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    env:
+      NAPI_RS_ENFORCE_VERSION_CHECK: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,3 +83,28 @@ jobs:
         run: npm test
       - name: Run native Iroh integration tests
         run: npm run test:integration
+
+  minimum-runtime:
+    name: Minimum runtime / Node 20.3.1
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up maintainer Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build package
+        run: npm run build
+      - name: Set up minimum supported Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20.3.1
+      - name: Exercise the published runtime boundary
+        run: npm run test:minimum-runtime

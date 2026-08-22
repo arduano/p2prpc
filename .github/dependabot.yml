@@ -13,6 +13,13 @@ updates:
         dependency-type: development
       runtime-dependencies:
         dependency-type: production
+    ignore:
+      # Keep compiler/runtime type majors deliberate. In particular,
+      # typescript-eslint must declare support before TypeScript majors move.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

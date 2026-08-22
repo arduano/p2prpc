@@ -11,6 +11,7 @@ P2PNode
 ├─ peerRuntime[endpointId]
 │  ├─ current physicalConnection
 │  ├─ authenticatedSession ──> remote SessionPrincipal
+│  ├─ outboundTarget? { ticket, expectedPeerId, expectedPrincipal }
 │  ├─ many independent RPC streams
 │  └─ many bounded transfer attempts
 └─ shareRegistry[SHA-256(capability token)]
@@ -40,6 +41,8 @@ When reusing or replacing one peer runtime, the endpoint ID and canonical princi
 | Record | Important fields | Interpretation |
 |---|---|---|
 | Locator ticket | `version`, `peerId`, direct socket addresses, relay URL, protocol, `issuedAt`, `expiresAt`, signature | Self-signed route bootstrap. It may disclose network topology and is neither enterprise identity nor authorization. |
+| `ConnectOptions` | `ticket`, `expectedPeerId`, `expectedPrincipal` | Strict outbound target. It is validated and snapshotted before dialing; its expectations must come from a trusted source independently of the locator. |
+| `PrincipalMatcher` | optional `id`; required `subject`, `issuer`, `clientId`, `tenantId` | Exact identity-provider-neutral match against the authenticated `SessionPrincipal`. `null` requires an optional field to be absent; optional `id` adds canonical-ID equality. There are no omitted-field wildcards. |
 | `SessionPrincipal` | `id`, `subject`, optional `issuer`/`clientId`/`tenantId`, `expiresAt`, `scopes`, `claims` | Frozen output of the configured authenticator. The OIDC helper derives `id` from `[issuer, subject, clientId ?? null]`; tenant, scopes, claims, and expiry are not part of that ID. |
 | `AuthenticatedSession` | `id`, `establishedAt`, `expiresAt`, `principal` | Local view of the remote party on the current connection. |
 | `PeerContext` | `peer`, `auth`, `request`, `connection` | Frozen context seed for tRPC. Trusted identity and untrusted request data remain separate. |
@@ -57,6 +60,7 @@ Outbound metadata flows from validated `getRequestHeaders` defaults plus validat
 | Data | Confidentiality | Trusted after validation? | May authorize work? |
 |---|:---:|:---:|:---:|
 | Locator ticket | May expose route topology; not an authorization secret | Only as a self-signed route assertion | No |
+| Expected endpoint/principal tuple | Deployment-dependent; normally directory data | Only if obtained independently from a trusted bootstrap source | Selects the intended outbound target; does not grant operation permission |
 | Endpoint ID | Public key | As transport key identity, not enterprise ownership | No |
 | Session credential / OAuth token | Secret | Untrusted until the configured authenticator verifies it; confined to the encrypted handshake | Establishes a principal, never sent as RPC metadata |
 | `SessionPrincipal` | May contain sensitive verified identity/claims; no token material | Yes; immutable verified view | Policy input |
@@ -70,7 +74,7 @@ Outbound metadata flows from validated `getRequestHeaders` defaults plus validat
 
 ## Immutability and snapshots
 
-Verified principals and claims, sessions, RPC request/header views, manifests, and library context facades are frozen or defensively copied. This prevents application callbacks from changing a value after authorization. Immutability proves consistency, not truth: a frozen remote header is still a remote assertion.
+Verified principals and claims, sessions, outbound targets and nested principal matchers, RPC request/header views, manifests, and library context facades are frozen or defensively copied. This prevents application callbacks from changing a value after validation or authorization. Immutability proves consistency, not truth: a frozen remote header is still a remote assertion, and target expectations copied from an untrusted locator are still untrusted.
 
 ## Persistent versus transient state
 

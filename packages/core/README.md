@@ -6,6 +6,8 @@ Type-safe tRPC calls, subscriptions, and resumable parallel file transfer over m
 npm install @p2prpc/core @trpc/client @trpc/server
 ```
 
+Requires Node.js 20.3 or newer and an ES module application. Native Iroh targets are glibc 2.34+ Linux x64/arm64, macOS x64/arm64, and Windows x64; Alpine/musl and older glibc distributions are not currently supported.
+
 ```ts
 import { initTRPC } from '@trpc/server';
 import {
@@ -32,15 +34,25 @@ const node = await createP2PNode({
   createContext: (context) => context
 });
 
-const peer = await node.connect<Router>(remoteTicket);
+const peer = await node.connect<Router>({
+  ticket: remoteTicket,
+  expectedPeerId: remotePeerId,
+  expectedPrincipal: {
+    id: remotePeerId,
+    subject: remotePeerId,
+    issuer: null,
+    clientId: null,
+    tenantId: null
+  }
+});
 console.log(await peer.rpc.ping.query(undefined, {
   context: p2pRpcContext({ traceparent: '00-...' })
 }));
 ```
 
-`security` is required. An address, signed ticket, or Iroh peer ID authenticates only the transport endpoint and never grants application work. Production OAuth deployments can use `createOidcSessionSecurity`, including strict issuer/audience/JWKS verification, mandatory operation scopes, a one-hour default/24-hour maximum token age, and default `cnf.jkt` binding to the Iroh endpoint key. Custom OIDC `authorize` policy can narrow those scopes but cannot grant a missing one.
+`security` is required. An address, signed ticket, or Iroh peer ID authenticates only the transport endpoint and never grants application work. Outbound `connect()` additionally requires a separately trusted endpoint ID and exact principal matcher. The matcher always specifies `subject`, `issuer`, `clientId`, and `tenantId`; `null` requires an optional field to be absent, and optional `id` adds the authenticator's canonical stable ID. These fields are not OIDC-specific: the shared-secret helper uses the remote endpoint ID for `id`/`subject` and leaves the other fields absent. Production OAuth deployments can use `createOidcSessionSecurity`, including strict issuer/audience/JWKS verification, mandatory operation scopes, a one-hour default/24-hour maximum token age, and default `cnf.jkt` binding to the Iroh endpoint key. Custom OIDC `authorize` policy can narrow those scopes but cannot grant a missing one.
 
-The outbound initiator presents its application credential to the ticket-authenticated endpoint before it has verified that endpoint's application principal. Provision tickets through a trusted channel, use short-lived peer/audience-specific tokens, and configure `preAuthorizePeer` when an endpoint-key allow-list is available.
+The expected endpoint is checked against the signed ticket before native dialing and against the connected transport before credentials are requested. The initiator then presents its application credential before it can verify the endpoint's application principal; the required matcher is checked before the peer is installed or returned. Provision tickets and both expectations through a trusted channel, use short-lived peer/audience-specific tokens, and configure `preAuthorizePeer` when a broader endpoint-key allow-list or inbound admission rule is needed. The frozen target is retained across automatic reconnects.
 
 RPC headers are normalized, frozen, and bounded, but remain caller-controlled. Credential, cookie, forwarding, origin/authority, proxy, and `p2prpc-*` namespaces are reserved. tRPC middleware should compare requested tenant or routing metadata with the verified `ctx.auth.principal`, never treat metadata itself as identity.
 

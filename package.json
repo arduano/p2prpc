@@ -21,6 +21,7 @@
     "typecheck": "npm run typecheck -w @p2prpc/core && npm run typecheck -w @p2prpc/cli-example",
     "test": "npm run test -w @p2prpc/core",
     "test:integration": "npm run test:integration -w @p2prpc/core",
+    "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
     "lint": "eslint .",
     "check:docs": "node scripts/check-docs.mjs",
     "docs:dev": "vitepress dev docs/wiki",
@@ -43,12 +44,20 @@
     "vitest": "^4.1.11"
   },
   "overrides": {
+    "tsup": {
+      "esbuild": "^0.28.2"
+    },
     "vitepress": {
       "vite": "^6.4.3"
     }
   },
   "engines": {
-    "node": ">=20.3.0"
+    "node": ">=24.0.0"
   },
-  "packageManager": "npm@11.16.0"
+  "packageManager": "npm@11.16.0",
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "esbuild@0.25.12": true,
+    "msgpackr-extract@3.0.4": true
+  }
 }
