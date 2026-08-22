@@ -20,6 +20,16 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
+      # 0.6.1's wrapper expects native binding 0.6.0 and fails strict loading.
+      # Re-evaluate a later Iroh release through the native matrix.
+      - dependency-name: "@momics/iroh-http-node"
+        versions: ["0.6.1"]
+      # 1.4 raises its engine floor to Node 22; keep Node 20-compatible patch
+      # updates visible while the package supports Node 20.3.
+      - dependency-name: "@napi-rs/blake-hash"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
   - package-ecosystem: github-actions
     directory: /
     schedule:
