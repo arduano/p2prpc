@@ -1,17 +1,17 @@
 # Data model
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md)
+[Home](Home.md) · [Architecture](Architecture.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md) · [Validation](Production-Validation.md)
 
 ## Object graph
 
 ```text
 P2PNode
-├─ endpoint { endpointId, signed locator ticket }
+├─ endpoint { endpointId, ticket snapshot, DNS/mDNS configuration }
 ├─ router + SessionSecurity + resource limits
 ├─ peerRuntime[endpointId]
 │  ├─ current physicalConnection
 │  ├─ authenticatedSession ──> remote SessionPrincipal
-│  ├─ outboundTarget? { ticket, expectedPeerId, expectedPrincipal }
+│  ├─ outboundTarget? { locator, expectedPeerId, expectedPrincipal }
 │  ├─ many independent RPC streams
 │  └─ many bounded transfer attempts
 └─ shareRegistry[SHA-256(capability token)]
@@ -40,8 +40,9 @@ When reusing or replacing one peer runtime, the endpoint ID and canonical princi
 
 | Record | Important fields | Interpretation |
 |---|---|---|
+| `PeerLocator` | ticket `{ ticket }`, DNS `{ kind }`, or mDNS `{ kind, serviceName? }` | Initial route strategy. DNS/PKARR and mDNS results are untrusted route data for the separately named endpoint; node-enabled DNS may also act as endpoint-wide fallback. |
 | Locator ticket | `version`, `peerId`, direct socket addresses, relay URL, protocol, `issuedAt`, `expiresAt`, signature | Self-signed route bootstrap. It may disclose network topology and is neither enterprise identity nor authorization. |
-| `ConnectOptions` | `ticket`, `expectedPeerId`, `expectedPrincipal` | Strict outbound target. It is validated and snapshotted before dialing; its expectations must come from a trusted source independently of the locator. |
+| `ConnectOptions` | `locator`, `expectedPeerId`, `expectedPrincipal` | Strict outbound target. It is validated and snapshotted before dialing; its expectations must come from a trusted source independently of route discovery. |
 | `PrincipalMatcher` | optional `id`; required `subject`, `issuer`, `clientId`, `tenantId` | Exact identity-provider-neutral match against the authenticated `SessionPrincipal`. `null` requires an optional field to be absent; optional `id` adds canonical-ID equality. There are no omitted-field wildcards. |
 | `SessionPrincipal` | `id`, `subject`, optional `issuer`/`clientId`/`tenantId`, `expiresAt`, `scopes`, `claims` | Frozen output of the configured authenticator. The OIDC helper derives `id` from `[issuer, subject, clientId ?? null]`; tenant, scopes, claims, and expiry are not part of that ID. |
 | `AuthenticatedSession` | `id`, `establishedAt`, `expiresAt`, `principal` | Local view of the remote party on the current connection. |
@@ -59,7 +60,7 @@ Outbound metadata flows from validated `getRequestHeaders` defaults plus validat
 
 | Data | Confidentiality | Trusted after validation? | May authorize work? |
 |---|:---:|:---:|:---:|
-| Locator ticket | May expose route topology; not an authorization secret | Only as a self-signed route assertion | No |
+| Locator/route result | Tickets may expose topology; discovery results are network assertions | A ticket is trusted only as its endpoint key's signed route assertion; DNS/mDNS routes remain untrusted | No |
 | Expected endpoint/principal tuple | Deployment-dependent; normally directory data | Only if obtained independently from a trusted bootstrap source | Selects the intended outbound target; does not grant operation permission |
 | Endpoint ID | Public key | As transport key identity, not enterprise ownership | No |
 | Session credential / OAuth token | Secret | Untrusted until the configured authenticator verifies it; confined to the encrypted handshake | Establishes a principal, never sent as RPC metadata |

@@ -12,8 +12,10 @@ Type-safe peer-to-peer RPC, subscriptions, and parallel resumable file transfer 
 
 Read the [published architecture wiki](https://arduano.github.io/p2prpc/) for the concise system model, or browse its [Markdown source](./docs/wiki/Home.md) in the repository.
 
+Production readiness requires the tiered [validation matrix](./docs/wiki/Production-Validation.md), including a 10,000-file stream-lifecycle gate over one authenticated QUIC connection. A local lifecycle run has passed but remains explicitly ineligible for that production gate because the pinned Iroh HTTP wrapper provides only loopback when relays are disabled. See the documented support boundary before designing a relay-free deployment.
+
 > [!NOTE]
-> p2prpc is pre-1.0. The `@p2prpc/core` package metadata is release-ready, but the package has not yet been published to npm. The install command below applies after the first registry release; contributors can use the workspace directly with `npm ci`.
+> p2prpc is pre-1.0. The `@p2prpc/core` package is configured for public publishing, but it has not yet been published to npm or qualified by the controlled production-validation lab. The install command below applies after the first registry release; contributors can use the workspace directly with `npm ci`.
 
 ## Requirements
 
@@ -24,6 +26,38 @@ Read the [published architecture wiki](https://arduano.github.io/p2prpc/) for th
 
 Browser and React Native runtimes need separate transports and are not part of this release.
 
+Route bootstrap and trust are separate. `connect()` accepts a signed-ticket locator, Iroh DNS/PKARR lookup, or LAN mDNS lookup, but always also requires an independently trusted endpoint ID and complete expected principal:
+
+```ts
+// The remote endpoint should generate tickets when sharing them so current
+// direct addresses and its current home relay are captured.
+const ticket = await remoteNode.createTicket();
+
+const locator = { kind: 'ticket', ticket } as const;
+// Or use dynamic discovery. DNS must be enabled on the dialing node; mDNS
+// requires the remote endpoint to advertise the same service name.
+// const locator = { kind: 'dns' } as const;
+// const locator = { kind: 'mdns', serviceName: 'my-app-lan' } as const;
+```
+
+Node-level Iroh configuration independently selects relay and discovery behavior. Relay defaults to Iroh's public network; custom relay URLs are HTTPS-only and relay-assisted connections may still upgrade to direct paths. DNS/PKARR is an endpoint-wide Iroh lookup: when enabled, the native dialer may use it as fallback even if a signed ticket or mDNS supplied the initial route hints.
+
+```ts
+const connectivityOptions = {
+  iroh: {
+    relay: { mode: 'custom', urls: ['https://relay.example.com'] },
+    discovery: {
+      dns: true, // or { serverUrl: 'https://dns.example.com' }
+      mdns: { serviceName: 'my-app-lan', advertise: true }
+    }
+  }
+} as const;
+```
+
+The mixed discovery configuration above intentionally permits DNS fallback for every dial. Use a separate DNS-disabled endpoint when route-source isolation or candidate filtering is required. `relay: { mode: 'disabled' }` is the relay-less setting, but the pinned `@momics/iroh-http-node` 0.6.0 currently maps it to loopback-only networking. This release therefore does not claim production relay-less/LAN-direct support until a fixed upstream version passes the documented validation matrix. DNS/PKARR resolution fails closed when `allowDirectAddress` or `allowRelayUrl` is configured because this wrapper cannot expose resolved candidates before dialing. By default, mDNS accepts only private, link-local, or loopback direct addresses and no default-network relay hint; callbacks may explicitly broaden that policy. Custom relay mode accepts ticket/mDNS relay hints only from its configured canonical origins, and disabled mode rejects all relay hints.
+
+The exact-pinned `@momics/iroh-http-shared` 0.6.1 session sink also needs a narrow writer-cleanup compatibility seam: if native `sendChunk` rejects, p2prpc invokes `finishBody` once on the opaque handle and preserves the original error. Startup fails closed if the node wrapper resolves a different shared-package instance. The [production validation guide](docs/wiki/Production-Validation.md#native-writer-compatibility-boundary) explains this upstream boundary and the native-handle gate.
+
 ## Install
 
 ```bash
@@ -32,7 +66,7 @@ npm install @p2prpc/core @trpc/client @trpc/server
 
 ## Typed RPC and request metadata
 
-The smallest secure setup uses a separately provisioned 256-bit application secret. OAuth/OIDC is described below.
+The smallest secure setup uses at least 32 bytes of cryptographically random, separately provisioned application secret material. The helper can check byte length, not entropy; a repeated or human-memorable 32-character string is not equivalent to a 256-bit secret. The secret authenticates group membership, while the explicit `authorize` callback grants operations; omitting that callback denies every RPC and file action. OAuth/OIDC is described below.
 
 ```ts
 import { initTRPC, TRPCError } from '@trpc/server';
@@ -47,7 +81,8 @@ import {
 const t = initTRPC.context<PeerContext>().create();
 const tenantProcedure = t.procedure.use(({ ctx, next }) => {
   // Headers are bounded but caller-controlled. The principal is verified.
-  // A group secret grants membership in this example's single tenant.
+  // The explicit allow-all policy below grants each authenticated secret holder
+  // membership in this example's single tenant.
   if (ctx.request.headers['x-tenant-id'] !== 'tenant-a') {
     throw new TRPCError({ code: 'FORBIDDEN' });
   }
@@ -68,14 +103,18 @@ export type AppRouter = typeof appRouter;
 const node = await createP2PNode({
   router: appRouter,
   protocol: { applicationId: 'my-app', contractVersion: '1' },
-  security: createSharedSecretSecurity(process.env.P2PRPC_SHARED_SECRET!),
+  security: createSharedSecretSecurity(process.env.P2PRPC_SHARED_SECRET!, {
+    // Coarse MVP policy: every holder may perform every operation. Replace
+    // this with path/file/tenant-aware policy for production.
+    authorize: () => true
+  }),
   createContext: (requestContext) => requestContext
 });
 
-// Obtain the locator and expected identity through a trusted bootstrap channel.
-// The ticket is not itself an authorization secret or target-selection policy.
+// Obtain the expected identity independently of untrusted route discovery.
+// A signed ticket locates this peer; it does not authorize it.
 const peer = await node.connect<AppRouter>({
-  ticket: remoteTicket,
+  locator: { kind: 'ticket', ticket: remoteTicket },
   expectedPeerId: remotePeerId,
   expectedPrincipal: {
     id: remotePeerId,
@@ -127,7 +166,7 @@ const security = createOidcSessionSecurity({
 });
 ```
 
-The required `expectedPeerId` is compared with the signed ticket before the native dial and with the connected transport identity before `getAccessToken` is called. The initiator must still present its access token before it can authenticate the remote *application* principal. `expectedPrincipal` is therefore checked immediately after mutual authentication and before the peer is installed or returned, but it cannot prevent disclosure to the already approved endpoint key. Obtain the ticket, expected peer ID, and expected principal through a trusted bootstrap channel; mint short-lived peer/audience-specific tokens; and use `preAuthorizePeer` for an organization-wide endpoint-key allow-list or inbound admission policy:
+The required `expectedPeerId` is bound to the selected route (including a ticket's signed peer ID when that locator is used) and checked again against the connected transport identity before `getAccessToken` is called. The initiator must still present its access token before it can authenticate the remote *application* principal. `expectedPrincipal` is therefore checked immediately after mutual authentication and before the peer is installed or returned, but it cannot prevent disclosure to the already approved endpoint key. Obtain the locator and the expected peer/principal tuple through appropriately trusted bootstrap channels, with the expectations independent of route discovery; mint short-lived peer/audience-specific tokens; and use `preAuthorizePeer` for an organization-wide endpoint-key allow-list or inbound admission policy:
 
 ```ts
 const approvedPeerIds = new Set(configuredPeerIds);
@@ -140,7 +179,7 @@ const node = await createP2PNode({
 
 `preAuthorizePeer` runs before either side exchanges application credentials. For outbound connections it is cumulative with the required per-call expected peer; for inbound connections it remains the available endpoint-key admission gate. It is not a substitute for expected-principal matching, `SessionSecurity` authentication, or per-operation authorization.
 
-Locator dialing uses only the ticket's signed direct/relay candidates; implicit native DNS and mDNS route discovery is disabled. For restricted egress, configure `iroh.allowDirectAddress` and explicit `iroh.relayUrls` with `iroh.allowRelayUrl`. A relay allow-policy cannot be combined with unknown default relays, because the policy must run before native networking begins.
+The locator explicitly selects the initial route strategy: `{ kind: 'dns' }` requests node-enabled DNS/PKARR lookup, while `{ kind: 'mdns' }` actively browses its named/default LAN service. Node-level mDNS configuration selects the default service and optional automatic advertisement; it is not an implicit dial path. Node-level DNS is different: it installs an endpoint-wide native lookup that may be consulted after ticket or mDNS hints fail. Route results never supply `expectedPeerId` or `expectedPrincipal`. For restricted egress or route-source isolation, use a DNS-disabled endpoint and apply `allowDirectAddress`/`allowRelayUrl` to candidates. Enabling DNS plus either callback is rejected rather than dialing candidates the application could not inspect. Custom relay mode independently restricts remote relay hints to configured origins; an explicit callback can narrow but cannot override that set.
 
 With OIDC, compare the requested tenant to the verified claim instead: `ctx.request.headers['x-tenant-id'] === ctx.auth.principal.tenantId`. The header selects a tenant; it never proves membership in one.
 
@@ -272,8 +311,10 @@ npm audit --audit-level=low
 Run the example with the same separately exchanged secret in two terminals:
 
 ```bash
-P2PRPC_SHARED_SECRET='replace-with-at-least-32-random-bytes' npm start -w @p2prpc/cli-example -- serve ./downloads
-P2PRPC_SHARED_SECRET='replace-with-at-least-32-random-bytes' npm start -w @p2prpc/cli-example -- connect '<expected-peer-id>' '<ticket>' ./large-file.bin
+# Generate once, then copy the output into both terminal environments.
+openssl rand -base64 32
+P2PRPC_SHARED_SECRET='<same-generated-secret>' npm start -w @p2prpc/cli-example -- serve ./downloads
+P2PRPC_SHARED_SECRET='<same-generated-secret>' npm start -w @p2prpc/cli-example -- connect '<expected-peer-id>' '<ticket>' ./large-file.bin
 ```
 
 `npm run benchmark` runs 1,000 RPCs while transferring a 256 MiB file.

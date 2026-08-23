@@ -1,7 +1,11 @@
 import { createTRPCProxyClient, type CreateTRPCClient } from '@trpc/client';
 import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
 import { P2PError, asP2PError } from './errors.js';
-import { TransferManager, type FileTransferConnectionContext } from './files/manager.js';
+import {
+  TransferManager,
+  type FileTransferConnectionContext,
+  type FileTransferDiagnostics
+} from './files/manager.js';
 import { ShareRegistry } from './files/share.js';
 import type { Transfer } from './files/transfer.js';
 import type {
@@ -32,7 +36,16 @@ import {
   type SessionSecurity
 } from './security/types.js';
 import { IrohEndpoint, type IrohEndpointOptions } from './transport/iroh.js';
-import type { ConnectionStats, QuicConnection, QuicEndpoint } from './transport/types.js';
+import type {
+  ConnectionPath,
+  ConnectionStats,
+  EndpointDiagnostics,
+  EndpointDiscoveryEvent,
+  EndpointDiscoveryOptions,
+  EndpointLocator,
+  QuicConnection,
+  QuicEndpoint
+} from './transport/types.js';
 import { containsUnsafeDisplayCharacters, sanitizeBoundedDisplayText } from './text.js';
 
 export interface PeerIdentity {
@@ -71,14 +84,31 @@ export interface PrincipalMatcher {
   readonly tenantId: string | null;
 }
 
-/** A trusted outbound target obtained independently of its locator ticket. */
-export interface ConnectOptions {
-  readonly ticket: string;
+export type PeerLocator = EndpointLocator;
+
+interface ConnectExpectations {
   readonly expectedPeerId: string;
   readonly expectedPrincipal: PrincipalMatcher;
 }
 
-interface NormalizedConnectOptions extends ConnectOptions {
+/**
+ * An outbound route plus independently trusted transport and application
+ * identity expectations. Discovery information never supplies expectations.
+ */
+export type ConnectOptions = ConnectExpectations & (
+  | {
+      readonly locator: PeerLocator;
+      readonly ticket?: never;
+    }
+  | {
+      /** @deprecated Use `locator: { kind: 'ticket', ticket }`. */
+      readonly ticket: string;
+      readonly locator?: never;
+    }
+);
+
+interface NormalizedConnectOptions extends ConnectExpectations {
+  readonly locator: PeerLocator;
   readonly expectedPrincipal: Readonly<PrincipalMatcher>;
 }
 
@@ -185,6 +215,12 @@ export interface PeerFiles<TFileMetadata = unknown> {
   ): Promise<Transfer<TFileMetadata>>;
 }
 
+export interface PeerDiagnostics {
+  readonly sessionId: string;
+  readonly connection: ConnectionStats;
+  readonly files: FileTransferDiagnostics;
+}
+
 const DEFAULT_PEER_CLOSE_REASON = 'Peer closed';
 const MAX_PEER_CLOSE_REASON_BYTES = 256;
 
@@ -222,6 +258,23 @@ export class Peer<TRemoteRouter extends AnyTRPCRouter, TFileMetadata = unknown> 
 
   stats(): Promise<ConnectionStats> {
     return this.runtime.current.stats();
+  }
+
+  /** Observe path migration for the current physical connection. */
+  async *pathChanges(signal?: AbortSignal): AsyncIterable<ConnectionPath> {
+    const connection = await this.runtime.connection();
+    if (!connection.pathChanges) {
+      throw new P2PError('REJECTED', 'Transport does not expose connection path changes');
+    }
+    yield* connection.pathChanges(signal);
+  }
+
+  async diagnostics(): Promise<PeerDiagnostics> {
+    return Object.freeze({
+      sessionId: this.runtime.session.id,
+      connection: await this.runtime.current.stats(),
+      files: this.runtime.transfers.diagnostics()
+    });
   }
 
   /** Permanently closes this peer; the display-safe reason is capped at 256 UTF-8 bytes. */
@@ -356,6 +409,35 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
 
   ticket(): string {
     return this.endpoint.address.ticket;
+  }
+
+  /** Create a signed ticket from the endpoint's current addresses and home relay. */
+  createTicket(): Promise<string> {
+    if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
+    return this.endpoint.createTicket
+      ? this.endpoint.createTicket()
+      : Promise.resolve(this.endpoint.address.ticket);
+  }
+
+  /** Native endpoint resource gauges for health checks and leak validation. */
+  diagnostics(): Promise<EndpointDiagnostics> {
+    if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
+    if (!this.endpoint.diagnostics) throw new P2PError('REJECTED', 'Endpoint does not expose diagnostics');
+    return this.endpoint.diagnostics();
+  }
+
+  /** Advertise this endpoint over LAN mDNS until the optional signal aborts. */
+  advertise(options?: EndpointDiscoveryOptions): Promise<void> {
+    if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
+    if (!this.endpoint.advertise) throw new P2PError('REJECTED', 'Endpoint does not support mDNS advertisement');
+    return this.endpoint.advertise(options);
+  }
+
+  /** Browse untrusted LAN mDNS route announcements. */
+  browse(options?: EndpointDiscoveryOptions): AsyncIterable<EndpointDiscoveryEvent> {
+    if (this.closed) throw new P2PError('DISCONNECTED', 'Node is closed');
+    if (!this.endpoint.browse) throw new P2PError('REJECTED', 'Endpoint does not support mDNS browsing');
+    return this.endpoint.browse(options);
   }
 
   async connect<TRemoteRouter extends AnyTRPCRouter>(options: ConnectOptions): Promise<Peer<TRemoteRouter, TFileMetadata>> {
@@ -504,7 +586,9 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           delete runtime.outboundTarget;
           if (runtime.expiryTimer) clearTimeout(runtime.expiryTimer);
           if (this.peers.get(runtime.identity.id) === runtime) this.peers.delete(runtime.identity.id);
-          runtime.connectionController.abort(new P2PError('DISCONNECTED', safeReason));
+          const error = new P2PError('DISCONNECTED', safeReason);
+          runtime.transfers.close(error);
+          runtime.connectionController.abort(error);
           runtime.current.close(0n, new TextEncoder().encode(safeReason));
         }
       };
@@ -555,11 +639,20 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     if (this.shutdownController.signal.aborted) abortFromShutdown();
     else this.shutdownController.signal.addEventListener('abort', abortFromShutdown, { once: true });
 
-    const pending = Promise.resolve().then(() => this.endpoint.connect(
-      target.ticket,
-      this.alpn,
-      target.expectedPeerId
-    ));
+    const pending = Promise.resolve().then(() => {
+      if (this.endpoint.connectLocator) {
+        return this.endpoint.connectLocator(
+          target.locator,
+          this.alpn,
+          target.expectedPeerId,
+          controller.signal
+        );
+      }
+      if (target.locator.kind !== 'ticket') {
+        throw new P2PError('REJECTED', 'Endpoint supports signed-ticket locators only');
+      }
+      return this.endpoint.connect(target.locator.ticket, this.alpn, target.expectedPeerId);
+    });
     try {
       const connection = await withDeadline(
         pending,
@@ -781,6 +874,9 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           runtime.alive = false;
           if (this.peers.get(runtime.identity.id) === runtime) this.peers.delete(runtime.identity.id);
           if (runtime.expiryTimer) clearTimeout(runtime.expiryTimer);
+          if (!runtime.outboundTarget) {
+            runtime.transfers.close(new P2PError('DISCONNECTED', 'Inbound peer connection closed'));
+          }
         }
       },
       (cause) => {
@@ -789,6 +885,9 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           runtime.alive = false;
           if (this.peers.get(runtime.identity.id) === runtime) this.peers.delete(runtime.identity.id);
           if (runtime.expiryTimer) clearTimeout(runtime.expiryTimer);
+          if (!runtime.outboundTarget) {
+            runtime.transfers.close(new P2PError('DISCONNECTED', 'Inbound peer connection failed', { cause }));
+          }
         }
       }
     );
@@ -1044,11 +1143,41 @@ function normalizeConnectOptions(value: ConnectOptions): NormalizedConnectOption
   if (!isPlainRecord(value)) {
     throw new P2PError('INVALID_FRAME', 'Outbound connect options must be a plain object');
   }
-  assertOnlyKeys(value, ['ticket', 'expectedPeerId', 'expectedPrincipal'], 'Outbound connect options');
-  const ticket = boundedExpectedString(value.ticket, 64 * 1024, 'Outbound ticket');
+  assertOnlyKeys(value, ['locator', 'ticket', 'expectedPeerId', 'expectedPrincipal'], 'Outbound connect options');
+  if (value.ticket !== undefined && value.locator !== undefined) {
+    throw new P2PError('INVALID_FRAME', 'Configure either outbound locator or legacy ticket, not both');
+  }
+  const locator = value.locator === undefined
+    ? Object.freeze({ kind: 'ticket', ticket: boundedExpectedString(value.ticket, 64 * 1024, 'Outbound ticket') })
+    : normalizeLocator(value.locator);
   const expectedPeerId = boundedExpectedString(value.expectedPeerId, 2048, 'Expected peer ID');
   const expectedPrincipal = normalizePrincipalMatcher(value.expectedPrincipal);
-  return Object.freeze({ ticket, expectedPeerId, expectedPrincipal });
+  return Object.freeze({ locator, expectedPeerId, expectedPrincipal });
+}
+
+function normalizeLocator(value: unknown): PeerLocator {
+  if (!isPlainRecord(value)) throw new P2PError('INVALID_FRAME', 'Outbound locator must be a plain object');
+  if (value.kind === 'ticket') {
+    assertOnlyKeys(value, ['kind', 'ticket'], 'Ticket locator');
+    return Object.freeze({
+      kind: 'ticket',
+      ticket: boundedExpectedString(value.ticket, 64 * 1024, 'Outbound ticket')
+    });
+  }
+  if (value.kind === 'dns') {
+    assertOnlyKeys(value, ['kind'], 'DNS locator');
+    return Object.freeze({ kind: 'dns' });
+  }
+  if (value.kind === 'mdns') {
+    assertOnlyKeys(value, ['kind', 'serviceName'], 'mDNS locator');
+    if (value.serviceName === undefined) return Object.freeze({ kind: 'mdns' });
+    const serviceName = boundedExpectedString(value.serviceName, 63, 'mDNS service name');
+    if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,62}$/.test(serviceName)) {
+      throw new P2PError('INVALID_FRAME', 'mDNS service name is invalid');
+    }
+    return Object.freeze({ kind: 'mdns', serviceName });
+  }
+  throw new P2PError('INVALID_FRAME', 'Outbound locator kind is invalid');
 }
 
 function normalizePrincipalMatcher(value: unknown): Readonly<PrincipalMatcher> {
@@ -1220,10 +1349,29 @@ function validateLimits(limits: P2PNodeLimits): P2PNodeLimits {
 function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>(
   options: P2PNodeOptions<TRouter, TFileMetadata>
 ): void {
+  if (!isPlainRecord(options)) {
+    throw new P2PError('INVALID_FRAME', 'P2P node options must be a plain object');
+  }
+  assertOnlyKeys(options, [
+    'router',
+    'protocol',
+    'createContext',
+    'security',
+    'preAuthorizePeer',
+    'getRequestHeaders',
+    'onIncomingFile',
+    'onPeer',
+    'onError',
+    'onTransferProgress',
+    'onSecurityEvent',
+    'iroh',
+    'limits',
+    'endpointFactory'
+  ], 'P2P node options');
   if (typeof options.createContext !== 'function') {
     throw new P2PError('INVALID_FRAME', 'P2P node context factory must be a function');
   }
-  const configured = options as unknown as Record<string, unknown>;
+  const configured = options;
   for (const name of [
     'preAuthorizePeer',
     'getRequestHeaders',
@@ -1238,11 +1386,18 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
       throw new P2PError('INVALID_FRAME', `P2P node ${name} option must be a function`);
     }
   }
-  for (const name of ['limits', 'iroh'] as const) {
-    const value = configured[name];
-    if (value !== undefined && (typeof value !== 'object' || value === null || Array.isArray(value))) {
-      throw new P2PError('INVALID_FRAME', `P2P node ${name} option must be an object`);
+  if (!isPlainRecord(configured.protocol)) {
+    throw new P2PError('INVALID_FRAME', 'P2P node protocol must be a plain object');
+  }
+  assertOnlyKeys(configured.protocol, ['applicationId', 'contractVersion'], 'P2P node protocol');
+  if (configured.limits !== undefined) {
+    if (!isPlainRecord(configured.limits)) {
+      throw new P2PError('INVALID_FRAME', 'P2P node limits must be a plain object');
     }
+    assertOnlyKeys(configured.limits, Object.keys(DEFAULT_LIMITS), 'P2P node limits');
+  }
+  if (configured.iroh !== undefined && !isPlainRecord(configured.iroh)) {
+    throw new P2PError('INVALID_FRAME', 'P2P node iroh options must be a plain object');
   }
 }
 
@@ -1266,6 +1421,33 @@ function snapshotNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata>(
         ...options.iroh,
         ...(options.iroh.secretKey !== undefined
           ? { secretKey: Uint8Array.from(options.iroh.secretKey) }
+          : {}),
+        ...(options.iroh.bindAddress !== undefined
+          ? {
+              bindAddress: typeof options.iroh.bindAddress === 'string'
+                ? options.iroh.bindAddress
+                : Object.freeze([...options.iroh.bindAddress])
+            }
+          : {}),
+        ...(options.iroh.relay !== undefined
+          ? {
+              relay: Object.freeze(options.iroh.relay.mode === 'custom'
+                ? { mode: 'custom' as const, urls: Object.freeze([...options.iroh.relay.urls]) }
+                : { mode: options.iroh.relay.mode })
+            }
+          : {}),
+        ...(options.iroh.discovery !== undefined
+          ? {
+              discovery: Object.freeze({
+                ...options.iroh.discovery,
+                ...(typeof options.iroh.discovery.dns === 'object'
+                  ? { dns: Object.freeze({ ...options.iroh.discovery.dns }) }
+                  : {}),
+                ...(typeof options.iroh.discovery.mdns === 'object'
+                  ? { mdns: Object.freeze({ ...options.iroh.discovery.mdns }) }
+                  : {})
+              })
+            }
           : {}),
         ...(options.iroh.relayUrls !== undefined
           ? { relayUrls: Object.freeze([...options.iroh.relayUrls]) }

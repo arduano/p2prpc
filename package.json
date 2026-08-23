@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "build": "npm run build -w @p2prpc/core",
-    "typecheck": "npm run typecheck -w @p2prpc/core && npm run typecheck -w @p2prpc/cli-example",
+    "typecheck": "npm run typecheck -w @p2prpc/core && npm run typecheck -w @p2prpc/cli-example && npm run typecheck:benchmarks",
+    "typecheck:benchmarks": "tsc --noEmit -p benchmarks/tsconfig.json",
     "test": "npm run test -w @p2prpc/core",
     "test:integration": "npm run test:integration -w @p2prpc/core",
     "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
@@ -28,6 +29,8 @@
     "docs:build": "vitepress build docs/wiki",
     "docs:preview": "vitepress preview docs/wiki",
     "benchmark": "tsx benchmarks/mixed-workload.ts",
+    "stress:files": "node --expose-gc --import tsx benchmarks/file-stream-lifecycle.ts",
+    "stress:files:help": "node --import tsx benchmarks/file-stream-lifecycle.ts --help",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "npm run build && changeset publish"

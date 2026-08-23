@@ -25,7 +25,7 @@ File capability handles may be returned by tRPC, but file bytes never enter tRPC
 
 ## Non-negotiable invariants
 
-1. A ticket or address alone cannot select an outbound target: callers must independently supply the exact expected Iroh peer ID and application-principal tuple, and all three are bound before the peer is exposed.
+1. A signed ticket, DNS/PKARR result, mDNS announcement, or address alone cannot select an outbound target: callers must independently supply the exact expected Iroh peer ID and application-principal tuple, and all are bound before the peer is exposed.
 2. No RPC or file stream is dispatched until both endpoints complete the application handshake.
 3. Every RPC, file push, and file pull is authorized again before dispatch or capability lookup.
 4. `ctx.auth.principal` is verified identity; `ctx.request.headers`, RPC input, filenames, manifests, metadata, and file content are caller-controlled.
@@ -37,7 +37,7 @@ These are production invariants. The explicitly named `dangerouslyAllowInsecureS
 
 | Concept | Meaning |
 |---|---|
-| Locator ticket | Signed, expiring route description. Bootstrap data, not a bearer grant; it may expose route topology and should come through a trusted channel. |
+| Locator | Initial route strategy: signed expiring ticket, Iroh DNS/PKARR lookup, or LAN mDNS browse. Route data is never a bearer grant or identity expectation; node-enabled DNS may be an endpoint-wide fallback. |
 | Outbound target | A snapshotted locator plus independently trusted expected endpoint ID and exact principal matcher; all are rechecked on reconnect. |
 | Endpoint ID | Iroh Ed25519 public-key identity proved by the encrypted transport. |
 | Principal | Verified application identity derived from OAuth/OIDC or another `SessionSecurity`. |
@@ -54,6 +54,7 @@ These are production invariants. The explicitly named `dangerouslyAllowInsecureS
 - [Security model](Security-Model.md): threat model, OAuth/OIDC compromise, and authorization layers.
 - [File transfers](File-Transfers.md): capability pull, push, lanes, integrity, resume, and publication.
 - [Audit guide](Audit-Guide.md): source map, control evidence, deployment checklist, and non-guarantees.
+- [Production validation](Production-Validation.md): discovery/relay lab matrix, resource gates, and the 10,000-file single-connection test.
 
 The repository [security policy](../../SECURITY.md) is the detailed threat model and residual-risk register. Source and tests remain authoritative if documentation and behavior ever diverge.
 

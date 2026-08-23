@@ -27,6 +27,9 @@ class BufferedRecv implements QuicRecvStream {
     if (this.waitAtEof) return new Promise(() => undefined);
     throw new Error('EOF');
   }
+  async expectEnd(): Promise<void> {
+    if (this.bytes.length !== 0) throw new Error('Trailing bytes');
+  }
   async stop(): Promise<void> { this.stopCalls += 1; }
 }
 
@@ -53,6 +56,7 @@ class StalledFinishSend extends RecordingSend {
 class StalledRecv implements QuicRecvStream {
   stopCalls = 0;
   async readExact(): Promise<Uint8Array> { return new Promise(() => undefined); }
+  async expectEnd(): Promise<void> { return new Promise(() => undefined); }
   async stop(): Promise<void> { this.stopCalls += 1; }
 }
 
@@ -83,6 +87,10 @@ class AsyncByteRecv implements QuicRecvStream {
     if (!pending || this.bytes.length < pending.size) return;
     this.pending = undefined;
     pending.resolve(Uint8Array.from(this.bytes.splice(0, pending.size)));
+  }
+
+  async expectEnd(): Promise<void> {
+    if (this.bytes.length !== 0 || this.pending) throw new Error('Trailing or pending bytes');
   }
 
   async stop(): Promise<void> {

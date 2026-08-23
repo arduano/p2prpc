@@ -1,0 +1,318 @@
+name: Production validation
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Validation suite
+        required: true
+        default: all
+        type: choice
+        options: [all, topology, files-10000, mixed-load, release]
+      locator:
+        description: Locator for a manually selected topology
+        required: true
+        default: ticket
+        type: choice
+        options: [ticket, dns, mdns]
+      relay:
+        description: Relay policy for a manually selected topology
+        required: true
+        default: custom
+        type: choice
+        options: [default, custom, disabled]
+      confirm:
+        description: Run heavy validation on the private lab
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: production-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LAB_RELAY_URLS: ${{ vars.P2PRPC_LAB_RELAY_URLS }}
+  LAB_DNS_SERVER_URL: ${{ vars.P2PRPC_LAB_DNS_SERVER_URL }}
+  LAB_BIND_ADDRESSES: ${{ vars.P2PRPC_LAB_BIND_ADDRESSES }}
+  LAB_DRIVER_MANIFEST: ${{ vars.P2PRPC_LAB_DRIVER_MANIFEST }}
+
+jobs:
+  topology:
+    name: Topology / ${{ matrix.name }}
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'schedule' && vars.P2PRPC_LAB_ENABLED == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.confirm &&
+      (inputs.suite == 'all' || inputs.suite == 'topology' || inputs.suite == 'release')))
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - name: ticket-default
+            locator: ticket
+            relay: default
+          - name: ticket-custom
+            locator: ticket
+            relay: custom
+          - name: dns-default
+            locator: dns
+            relay: default
+          - name: dns-custom
+            locator: dns
+            relay: custom
+          - name: mdns-default
+            locator: mdns
+            relay: default
+          - name: mdns-custom
+            locator: mdns
+            relay: custom
+          - name: manual-selection
+            locator: ${{ inputs.locator || 'ticket' }}
+            relay: ${{ inputs.relay || 'custom' }}
+    runs-on: [self-hosted, linux, x64, p2prpc-lab]
+    timeout-minutes: 90
+    env:
+      LOCATOR: ${{ matrix.locator }}
+      RELAY: ${{ matrix.relay }}
+      MATRIX_NAME: ${{ matrix.name }}
+    steps:
+      - name: Select scheduled or manual scenarios
+        id: selection
+        shell: bash
+        run: |
+          selected=true
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$MATRIX_NAME" == "manual-selection" ]]; then selected=false; fi
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.suite }}" == "topology" && "$MATRIX_NAME" != "manual-selection" ]]; then selected=false; fi
+            if [[ "${{ inputs.suite }}" != "topology" && "$MATRIX_NAME" == "manual-selection" ]]; then selected=false; fi
+          fi
+          echo "selected=$selected" >> "$GITHUB_OUTPUT"
+      - name: Check out repository
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies
+        if: steps.selection.outputs.selected == 'true'
+        run: npm ci
+      - name: Validate lab inputs
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          bash scripts/validate-lab-driver.sh check p2prpc-lab-canary "$LAB_DRIVER_MANIFEST"
+          bash scripts/validate-lab-driver.sh check p2prpc-lab-topology-suite "$LAB_DRIVER_MANIFEST"
+          relay_count=0
+          if [[ "$RELAY" == "custom" ]]; then
+            canonical_relays=$(node scripts/validate-relay-urls.mjs 2 <<< "$LAB_RELAY_URLS")
+            relay_count=$(jq -er 'length' <<< "$canonical_relays")
+            echo "LAB_RELAY_URLS=$canonical_relays" >> "$GITHUB_ENV"
+          fi
+          echo "EXPECTED_CUSTOM_RELAY_COUNT=$relay_count" >> "$GITHUB_ENV"
+          if [[ "$LOCATOR" == "dns" ]]; then
+            [[ -n "$LAB_DNS_SERVER_URL" ]]
+            node --input-type=module -e '
+              const url = new URL(process.env.LAB_DNS_SERVER_URL);
+              if (url.protocol !== "https:" || url.username || url.password || url.hash) process.exit(1);
+            '
+          fi
+          if [[ -n "$LAB_BIND_ADDRESSES" ]]; then
+            jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' <<< "$LAB_BIND_ADDRESSES" >/dev/null
+          fi
+          mkdir -p benchmark-results
+      - name: Run raw-Iroh canary
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          args=(--locator "$LOCATOR" --relay "$RELAY" --output "benchmark-results/raw-iroh-${MATRIX_NAME}.json")
+          if [[ "$RELAY" == "custom" ]]; then
+            while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          fi
+          if [[ "$LOCATOR" == "dns" && -n "$LAB_DNS_SERVER_URL" ]]; then args+=(--dns-server-url "$LAB_DNS_SERVER_URL"); fi
+          if [[ "$LOCATOR" == "mdns" ]]; then args+=(--mdns-service-name "p2prpc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"); fi
+          if [[ -n "$LAB_BIND_ADDRESSES" ]]; then
+            while IFS= read -r value; do args+=(--bind-address "$value"); done < <(jq -r '.[]' <<< "$LAB_BIND_ADDRESSES")
+          fi
+          p2prpc-lab-canary "${args[@]}"
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-canary "benchmark-results/raw-iroh-${MATRIX_NAME}.json" "$LAB_DRIVER_MANIFEST"
+      - name: Run controlled topology and fault matrix
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          args=(--locator "$LOCATOR" --relay "$RELAY" --output "benchmark-results/topology-${MATRIX_NAME}.json")
+          if [[ "$RELAY" == "custom" ]]; then
+            while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          fi
+          if [[ "$LOCATOR" == "dns" && -n "$LAB_DNS_SERVER_URL" ]]; then args+=(--dns-server-url "$LAB_DNS_SERVER_URL"); fi
+          if [[ "$LOCATOR" == "mdns" ]]; then args+=(--mdns-service-name "p2prpc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"); fi
+          if [[ -n "$LAB_BIND_ADDRESSES" ]]; then
+            while IFS= read -r value; do args+=(--bind-address "$value"); done < <(jq -r '.[]' <<< "$LAB_BIND_ADDRESSES")
+          fi
+          p2prpc-lab-topology-suite "${args[@]}"
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-topology-suite "benchmark-results/topology-${MATRIX_NAME}.json" "$LAB_DRIVER_MANIFEST"
+      - name: Run p2prpc topology smoke
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          args=(--execute --overwrite --files 40 --batch-size 10 --error-cases 2 --locator "$LOCATOR" --relay "$RELAY" --output "benchmark-results/p2prpc-${MATRIX_NAME}.json")
+          if [[ "$RELAY" == "custom" ]]; then
+            while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          fi
+          if [[ "$LOCATOR" == "dns" && -n "$LAB_DNS_SERVER_URL" ]]; then args+=(--dns-server-url "$LAB_DNS_SERVER_URL"); fi
+          if [[ "$LOCATOR" == "mdns" ]]; then args+=(--mdns-service-name "p2prpc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"); fi
+          if [[ -n "$LAB_BIND_ADDRESSES" ]]; then
+            while IFS= read -r value; do args+=(--bind-address "$value"); done < <(jq -r '.[]' <<< "$LAB_BIND_ADDRESSES")
+          fi
+          npm run stress:files -- "${args[@]}"
+          jq -e '.status == "passed"' "benchmark-results/p2prpc-${MATRIX_NAME}.json" >/dev/null
+      - name: Upload topology evidence
+        if: always() && steps.selection.outputs.selected == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: topology-${{ matrix.name }}-${{ github.run_attempt }}
+          path: benchmark-results/
+          if-no-files-found: error
+          retention-days: 30
+
+  files-10000:
+    name: 10,000 files / one connection
+    needs: topology
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'schedule' && vars.P2PRPC_LAB_ENABLED == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.confirm &&
+      (inputs.suite == 'all' || inputs.suite == 'files-10000' || inputs.suite == 'release'))) &&
+      (needs.topology.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite == 'files-10000'))
+    runs-on: [self-hosted, linux, x64, p2prpc-lab]
+    timeout-minutes: 360
+    env:
+      LOCATOR: ticket
+      RELAY: custom
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Validate lab inputs
+        shell: bash
+        run: |
+          bash scripts/validate-lab-driver.sh check p2prpc-lab-canary "$LAB_DRIVER_MANIFEST"
+          canonical_relays=$(node scripts/validate-relay-urls.mjs 1 <<< "$LAB_RELAY_URLS")
+          echo "LAB_RELAY_URLS=$canonical_relays" >> "$GITHUB_ENV"
+          echo "EXPECTED_CUSTOM_RELAY_COUNT=$(jq -er 'length' <<< "$canonical_relays")" >> "$GITHUB_ENV"
+          mkdir -p benchmark-results
+      - name: Run raw-Iroh canary
+        shell: bash
+        run: |
+          args=(--locator ticket --relay custom --output benchmark-results/raw-iroh-files-10000.json)
+          while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          p2prpc-lab-canary "${args[@]}"
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-canary benchmark-results/raw-iroh-files-10000.json "$LAB_DRIVER_MANIFEST"
+      - name: Run the authoritative file lifecycle gate
+        shell: bash
+        run: |
+          args=(--execute --overwrite --output benchmark-results/files-10000.json --locator ticket --relay custom)
+          while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          npm run stress:files -- "${args[@]}"
+          jq -e '
+            .status == "passed" and
+            .qualification.productionGateEligible == true and
+            .totals.successfulFiles == 10000
+          ' benchmark-results/files-10000.json >/dev/null
+      - name: Upload file lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: files-10000-${{ github.run_attempt }}
+          path: benchmark-results/
+          if-no-files-found: error
+          retention-days: 90
+
+  mixed-load:
+    name: 100-peer mixed load
+    needs: files-10000
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'schedule' && vars.P2PRPC_LAB_ENABLED == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.confirm &&
+      (inputs.suite == 'all' || inputs.suite == 'mixed-load' || inputs.suite == 'release'))) &&
+      (needs.files-10000.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite == 'mixed-load'))
+    runs-on: [self-hosted, linux, x64, p2prpc-lab]
+    timeout-minutes: 330
+    env:
+      RELEASE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'release' }}
+      LOCATOR: ticket
+      RELAY: custom
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate lab driver
+        shell: bash
+        run: |
+          bash scripts/validate-lab-driver.sh check p2prpc-lab-canary "$LAB_DRIVER_MANIFEST"
+          bash scripts/validate-lab-driver.sh check p2prpc-lab-mixed-suite "$LAB_DRIVER_MANIFEST"
+          if [[ "$RELEASE_RUN" == "true" ]]; then
+            bash scripts/validate-lab-driver.sh check p2prpc-lab-release-suite "$LAB_DRIVER_MANIFEST"
+          fi
+          required_relays=1
+          if [[ "$RELEASE_RUN" == "true" ]]; then required_relays=2; fi
+          canonical_relays=$(node scripts/validate-relay-urls.mjs "$required_relays" <<< "$LAB_RELAY_URLS")
+          echo "LAB_RELAY_URLS=$canonical_relays" >> "$GITHUB_ENV"
+          echo "EXPECTED_CUSTOM_RELAY_COUNT=$(jq -er 'length' <<< "$canonical_relays")" >> "$GITHUB_ENV"
+          mkdir -p benchmark-results
+      - name: Run raw-Iroh canary
+        shell: bash
+        run: |
+          args=(--locator ticket --relay custom --output benchmark-results/raw-iroh-mixed-load.json)
+          while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          p2prpc-lab-canary "${args[@]}"
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-canary benchmark-results/raw-iroh-mixed-load.json "$LAB_DRIVER_MANIFEST"
+      - name: Run balanced workload
+        shell: bash
+        run: |
+          duration=1800
+          if [[ "$RELEASE_RUN" == "true" ]]; then duration=14400; fi
+          p2prpc-lab-mixed-suite --peers 100 --rpc-streams 1000 --file-transfers 16 --duration-seconds "$duration" --output benchmark-results/mixed-load.json
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-mixed-suite benchmark-results/mixed-load.json "$LAB_DRIVER_MANIFEST"
+          if [[ "$RELEASE_RUN" == "true" ]]; then
+            bash scripts/validate-lab-driver.sh evidence p2prpc-lab-mixed-suite benchmark-results/mixed-load.json release
+          fi
+      - name: Run release-only storage and identity campaign
+        if: env.RELEASE_RUN == 'true'
+        shell: bash
+        run: |
+          args=(--file-bytes 17179869184 --output benchmark-results/release-suite.json)
+          while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          p2prpc-lab-release-suite "${args[@]}"
+          bash scripts/validate-lab-driver.sh output p2prpc-lab-release-suite benchmark-results/release-suite.json "$LAB_DRIVER_MANIFEST"
+      - name: Upload mixed-load evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mixed-load-${{ github.run_attempt }}
+          path: benchmark-results/
+          if-no-files-found: error
+          retention-days: 90

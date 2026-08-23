@@ -30,12 +30,26 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Validate GitHub Actions workflows
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          destination="$RUNNER_TEMP/actionlint"
+          mkdir -p "$destination"
+          curl --fail --silent --show-error --location \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" | sha256sum --check
+          tar --extract --gzip --file "$archive" --directory "$destination" actionlint
+          "$destination/actionlint"
       - name: Lint
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck
       - name: Check documentation links
         run: npm run check:docs
+      - name: Test production evidence contract
+        run: bash scripts/test-lab-driver-validation.sh
       - name: Run unit and security tests
         run: npm test
       - name: Build package

@@ -5,6 +5,7 @@
 | Direct runtime dependency | Declared license | Source |
 |---|---|---|
 | `@momics/iroh-http-node` | MIT OR Apache-2.0 | [momics/iroh-http](https://github.com/momics/iroh-http) |
+| `@momics/iroh-http-shared` | MIT OR Apache-2.0 | [momics/iroh-http](https://github.com/momics/iroh-http) |
 | `@napi-rs/blake-hash` | MIT | [Brooooooklyn/blake-hash](https://github.com/Brooooooklyn/blake-hash) |
 | `@trpc/client`, `@trpc/server` | MIT | [trpc/trpc](https://github.com/trpc/trpc) |
 | `jose` | MIT | [panva/jose](https://github.com/panva/jose) |

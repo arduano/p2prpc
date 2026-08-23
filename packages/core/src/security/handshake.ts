@@ -9,7 +9,7 @@ import {
   writeStreamKind,
   type FrameLimits
 } from '../protocol.js';
-import type { QuicConnection } from '../transport/types.js';
+import type { QuicConnection, QuicRecvStream } from '../transport/types.js';
 import {
   freezePrincipal,
   type AuthenticatedSession,
@@ -52,15 +52,20 @@ export interface SessionHandshakeOptions<TFileMetadata = unknown> {
   readonly frameLimits: FrameLimits;
 }
 
+interface HandshakeCleanupState {
+  current?: Promise<void>;
+}
+
 export async function authenticateConnection<TFileMetadata>(
   connection: QuicConnection,
   direction: 'inbound' | 'outbound',
   options: SessionHandshakeOptions<TFileMetadata>
 ): Promise<AuthenticatedSession> {
   const controller = new AbortController();
+  const cleanup: HandshakeCleanupState = {};
   const task = connection.side === 'client'
-    ? authenticateInitiator(connection, direction, options, controller.signal)
-    : authenticateResponder(connection, direction, options, controller.signal);
+    ? authenticateInitiator(connection, direction, options, controller.signal, cleanup)
+    : authenticateResponder(connection, direction, options, controller.signal, cleanup);
   return withTimeout(task, options.timeoutMs, 'Session authentication timed out', controller);
 }
 
@@ -68,7 +73,8 @@ async function authenticateInitiator<TFileMetadata>(
   connection: QuicConnection,
   direction: 'inbound' | 'outbound',
   options: SessionHandshakeOptions<TFileMetadata>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  cleanup: HandshakeCleanupState
 ): Promise<AuthenticatedSession> {
   const startedAt = Date.now();
   const initiatorNonce = nonce();
@@ -82,141 +88,186 @@ async function authenticateInitiator<TFileMetadata>(
   })));
   signal.throwIfAborted();
   const stream = await connection.openBi();
-  signal.throwIfAborted();
-  await stream.send.setPriority(1_000);
-  signal.throwIfAborted();
-  await writeStreamKind(stream.send, StreamKind.SessionAuth);
-  signal.throwIfAborted();
-  await writeFrame(stream.send, SessionFrameKind.ClientHello, {
-    version: 2,
-    protocol: options.protocol,
-    nonce: initiatorNonce,
-    presentedAt: Date.now(),
-    credential
-  } satisfies ClientHello, options.frameLimits);
-  signal.throwIfAborted();
+  const abortStream = async (): Promise<void> => {
+    cleanup.current ??= abortHandshakeStream(stream);
+    await cleanup.current;
+  };
+  const onAbort = (): void => { void abortStream(); };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    signal.throwIfAborted();
+    await stream.send.setPriority(1_000);
+    signal.throwIfAborted();
+    await writeStreamKind(stream.send, StreamKind.SessionAuth);
+    signal.throwIfAborted();
+    await writeFrame(stream.send, SessionFrameKind.ClientHello, {
+      version: 2,
+      protocol: options.protocol,
+      nonce: initiatorNonce,
+      presentedAt: Date.now(),
+      credential
+    } satisfies ClientHello, options.frameLimits);
+    signal.throwIfAborted();
 
-  const frame = await readFrame<ServerHello>(stream.recv, options.frameLimits);
-  signal.throwIfAborted();
-  if (frame.kind !== SessionFrameKind.ServerHello) throw new P2PError('UNAUTHORIZED', 'Expected session server hello');
-  const hello = validateServerHello(frame.value, initiatorNonce, options);
-  const authenticationContext = transcriptContext(
-    options,
-    connection,
-    direction,
-    options.localPeerId,
-    connection.remoteId,
-    initiatorNonce,
-    hello.nonce,
-    hello.presentedAt,
-    signal
-  );
-  const principal = freezePrincipal(await options.security.authenticate(hello.credential, authenticationContext));
-  signal.throwIfAborted();
-  validatePrincipalExpiry(principal.expiresAt);
-  const id = sessionId(authenticationContext);
-  const credentialExpiresAt = Math.min(principal.expiresAt, hello.grantExpiresAt);
-  await writeFrame(stream.send, SessionFrameKind.ClientAck, {
-    echo: hello.nonce,
-    sessionId: id,
-    grantExpiresAt: principal.expiresAt
-  } satisfies ClientAck, options.frameLimits);
-  signal.throwIfAborted();
-  const readyFrame = await readFrame<ServerReady>(stream.recv, options.frameLimits);
-  signal.throwIfAborted();
-  if (readyFrame.kind !== SessionFrameKind.ServerReady) throw new P2PError('UNAUTHORIZED', 'Expected session ready frame');
-  const ready = readyFrame.value;
-  if (
-    !isRecord(ready) ||
-    ready.sessionId !== id ||
-    typeof ready.expiresAt !== 'number' ||
-    !Number.isSafeInteger(ready.expiresAt) ||
-    ready.expiresAt <= Date.now() ||
-    ready.expiresAt > credentialExpiresAt ||
-    ready.expiresAt > Date.now() + options.maxSessionTtlMs + options.clockSkewMs
-  ) {
-    throw new P2PError('UNAUTHORIZED', 'Session confirmation did not match the authenticated transcript');
+    const frame = await readFrame<ServerHello>(stream.recv, options.frameLimits);
+    signal.throwIfAborted();
+    if (frame.kind !== SessionFrameKind.ServerHello) throw new P2PError('UNAUTHORIZED', 'Expected session server hello');
+    const hello = validateServerHello(frame.value, initiatorNonce, options);
+    const authenticationContext = transcriptContext(
+      options,
+      connection,
+      direction,
+      options.localPeerId,
+      connection.remoteId,
+      initiatorNonce,
+      hello.nonce,
+      hello.presentedAt,
+      signal
+    );
+    const principal = freezePrincipal(await options.security.authenticate(hello.credential, authenticationContext));
+    signal.throwIfAborted();
+    validatePrincipalExpiry(principal.expiresAt);
+    const id = sessionId(authenticationContext);
+    const credentialExpiresAt = Math.min(principal.expiresAt, hello.grantExpiresAt);
+    await writeFrame(stream.send, SessionFrameKind.ClientAck, {
+      echo: hello.nonce,
+      sessionId: id,
+      grantExpiresAt: principal.expiresAt
+    } satisfies ClientAck, options.frameLimits);
+    signal.throwIfAborted();
+    // ClientAck is the initiator's final message. Its FIN allows the responder
+    // to reject trailing handshake bytes before granting the session.
+    await stream.send.finish();
+    signal.throwIfAborted();
+    const readyFrame = await readFrame<ServerReady>(stream.recv, options.frameLimits);
+    signal.throwIfAborted();
+    if (readyFrame.kind !== SessionFrameKind.ServerReady) throw new P2PError('UNAUTHORIZED', 'Expected session ready frame');
+    const ready = readyFrame.value;
+    if (
+      !isRecord(ready) ||
+      ready.sessionId !== id ||
+      typeof ready.expiresAt !== 'number' ||
+      !Number.isSafeInteger(ready.expiresAt) ||
+      ready.expiresAt <= Date.now() ||
+      ready.expiresAt > credentialExpiresAt ||
+      ready.expiresAt > Date.now() + options.maxSessionTtlMs + options.clockSkewMs
+    ) {
+      throw new P2PError('UNAUTHORIZED', 'Session confirmation did not match the authenticated transcript');
+    }
+    await expectRecvEnd(stream.recv);
+    signal.throwIfAborted();
+    return Object.freeze({ id, establishedAt: startedAt, expiresAt: ready.expiresAt, principal });
+  } catch (cause) {
+    // The node closes the physical connection after rejection. Do not let a
+    // wedged native reset/stop extend the externally visible deadline.
+    void abortStream();
+    throw cause;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
   }
-  await stream.send.finish();
-  return Object.freeze({ id, establishedAt: startedAt, expiresAt: ready.expiresAt, principal });
 }
 
 async function authenticateResponder<TFileMetadata>(
   connection: QuicConnection,
   direction: 'inbound' | 'outbound',
   options: SessionHandshakeOptions<TFileMetadata>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  cleanup: HandshakeCleanupState
 ): Promise<AuthenticatedSession> {
   const startedAt = Date.now();
   const stream = await connection.acceptBi();
-  signal.throwIfAborted();
-  if ((await readStreamKind(stream.recv)) !== StreamKind.SessionAuth) {
-    throw new P2PError('UNAUTHORIZED', 'Application authentication is required before opening streams');
+  const abortStream = async (): Promise<void> => {
+    cleanup.current ??= abortHandshakeStream(stream);
+    await cleanup.current;
+  };
+  const onAbort = (): void => { void abortStream(); };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    signal.throwIfAborted();
+    if ((await readStreamKind(stream.recv)) !== StreamKind.SessionAuth) {
+      throw new P2PError('UNAUTHORIZED', 'Application authentication is required before opening streams');
+    }
+    signal.throwIfAborted();
+    const frame = await readFrame<ClientHello>(stream.recv, options.frameLimits);
+    signal.throwIfAborted();
+    if (frame.kind !== SessionFrameKind.ClientHello) throw new P2PError('UNAUTHORIZED', 'Expected session client hello');
+    const hello = validateClientHello(frame.value, options);
+    const responderNonce = nonce();
+    const authenticationContext = transcriptContext(
+      options,
+      connection,
+      direction,
+      connection.remoteId,
+      options.localPeerId,
+      hello.nonce,
+      responderNonce,
+      hello.presentedAt,
+      signal
+    );
+    const principal = freezePrincipal(await options.security.authenticate(hello.credential, authenticationContext));
+    signal.throwIfAborted();
+    validatePrincipalExpiry(principal.expiresAt);
+    const credential = canonicalCredential(await options.security.getCredential(Object.freeze({
+      localPeerId: options.localPeerId,
+      remotePeerId: connection.remoteId,
+      direction,
+      protocol: options.protocol,
+      nonce: responderNonce,
+      signal
+    })));
+    signal.throwIfAborted();
+    await stream.send.setPriority(1_000);
+    signal.throwIfAborted();
+    await writeFrame(stream.send, SessionFrameKind.ServerHello, {
+      version: 2,
+      protocol: options.protocol,
+      nonce: responderNonce,
+      echo: hello.nonce,
+      presentedAt: Date.now(),
+      credential,
+      grantExpiresAt: principal.expiresAt
+    } satisfies ServerHello, options.frameLimits);
+    signal.throwIfAborted();
+    const ackFrame = await readFrame<ClientAck>(stream.recv, options.frameLimits);
+    signal.throwIfAborted();
+    if (ackFrame.kind !== SessionFrameKind.ClientAck) throw new P2PError('UNAUTHORIZED', 'Expected session acknowledgement');
+    const ack = ackFrame.value;
+    const id = sessionId(authenticationContext);
+    if (
+      !isRecord(ack) ||
+      ack.echo !== responderNonce ||
+      ack.sessionId !== id ||
+      !Number.isSafeInteger(ack.grantExpiresAt)
+    ) {
+      throw new P2PError('UNAUTHORIZED', 'Invalid session acknowledgement');
+    }
+    await expectRecvEnd(stream.recv);
+    signal.throwIfAborted();
+    const expiresAt = capExpiry(Math.min(principal.expiresAt, ack.grantExpiresAt), options.maxSessionTtlMs);
+    await writeFrame(
+      stream.send,
+      SessionFrameKind.ServerReady,
+      { sessionId: id, expiresAt } satisfies ServerReady,
+      options.frameLimits
+    );
+    signal.throwIfAborted();
+    await stream.send.finish();
+    return Object.freeze({ id, establishedAt: startedAt, expiresAt, principal });
+  } catch (cause) {
+    // The node closes the physical connection after rejection. Do not let a
+    // wedged native reset/stop extend the externally visible deadline.
+    void abortStream();
+    throw cause;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
   }
-  signal.throwIfAborted();
-  const frame = await readFrame<ClientHello>(stream.recv, options.frameLimits);
-  signal.throwIfAborted();
-  if (frame.kind !== SessionFrameKind.ClientHello) throw new P2PError('UNAUTHORIZED', 'Expected session client hello');
-  const hello = validateClientHello(frame.value, options);
-  const responderNonce = nonce();
-  const authenticationContext = transcriptContext(
-    options,
-    connection,
-    direction,
-    connection.remoteId,
-    options.localPeerId,
-    hello.nonce,
-    responderNonce,
-    hello.presentedAt,
-    signal
-  );
-  const principal = freezePrincipal(await options.security.authenticate(hello.credential, authenticationContext));
-  signal.throwIfAborted();
-  validatePrincipalExpiry(principal.expiresAt);
-  const credential = canonicalCredential(await options.security.getCredential(Object.freeze({
-    localPeerId: options.localPeerId,
-    remotePeerId: connection.remoteId,
-    direction,
-    protocol: options.protocol,
-    nonce: responderNonce,
-    signal
-  })));
-  signal.throwIfAborted();
-  await stream.send.setPriority(1_000);
-  signal.throwIfAborted();
-  await writeFrame(stream.send, SessionFrameKind.ServerHello, {
-    version: 2,
-    protocol: options.protocol,
-    nonce: responderNonce,
-    echo: hello.nonce,
-    presentedAt: Date.now(),
-    credential,
-    grantExpiresAt: principal.expiresAt
-  } satisfies ServerHello, options.frameLimits);
-  signal.throwIfAborted();
-  const ackFrame = await readFrame<ClientAck>(stream.recv, options.frameLimits);
-  signal.throwIfAborted();
-  if (ackFrame.kind !== SessionFrameKind.ClientAck) throw new P2PError('UNAUTHORIZED', 'Expected session acknowledgement');
-  const ack = ackFrame.value;
-  const id = sessionId(authenticationContext);
-  if (
-    !isRecord(ack) ||
-    ack.echo !== responderNonce ||
-    ack.sessionId !== id ||
-    !Number.isSafeInteger(ack.grantExpiresAt)
-  ) {
-    throw new P2PError('UNAUTHORIZED', 'Invalid session acknowledgement');
-  }
-  const expiresAt = capExpiry(Math.min(principal.expiresAt, ack.grantExpiresAt), options.maxSessionTtlMs);
-  await writeFrame(
-    stream.send,
-    SessionFrameKind.ServerReady,
-    { sessionId: id, expiresAt } satisfies ServerReady,
-    options.frameLimits
-  );
-  signal.throwIfAborted();
-  await stream.send.finish();
-  return Object.freeze({ id, establishedAt: startedAt, expiresAt, principal });
+}
+
+async function abortHandshakeStream(stream: Awaited<ReturnType<QuicConnection['openBi']>>): Promise<void> {
+  await Promise.allSettled([
+    Promise.resolve().then(() => stream.send.reset(2n)),
+    Promise.resolve().then(() => stream.recv.stop(2n))
+  ]);
 }
 
 function validateClientHello<TFileMetadata>(value: unknown, options: SessionHandshakeOptions<TFileMetadata>): ClientHello {
@@ -344,6 +395,10 @@ function validNonce(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function expectRecvEnd(recv: QuicRecvStream): Promise<void> {
+  return recv.expectEnd();
 }
 
 async function withTimeout<T>(

@@ -9,12 +9,17 @@ on:
         default: latest
         type: choice
         options: [latest, next]
+      production_validation_run_id:
+        description: Successful release-suite run ID for this exact commit
+        required: true
+        type: string
 
 concurrency:
   group: npm-publish
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: write
   id-token: write
 
@@ -30,6 +35,162 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify production validation evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRODUCTION_RUN_ID: ${{ inputs.production_validation_run_id }}
+        run: |
+          bash scripts/test-lab-driver-validation.sh
+          [[ "$PRODUCTION_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Production validation run ID must be a positive integer" >&2
+            exit 1
+          }
+          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_RUN_ID}")"
+          jq -e --arg sha "$GITHUB_SHA" '
+            .status == "completed" and
+            .conclusion == "success" and
+            .event == "workflow_dispatch" and
+            .path == ".github/workflows/production-validation.yml" and
+            .head_branch == "main" and
+            .head_sha == $sha
+          ' <<< "$run" >/dev/null || {
+            echo "Production validation must be a successful manual run for this exact main-branch commit" >&2
+            exit 1
+          }
+          attempt="$(jq -er '.run_attempt' <<< "$run")"
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts')"
+          expected=(
+            "topology-ticket-default-${attempt}"
+            "topology-ticket-custom-${attempt}"
+            "topology-dns-default-${attempt}"
+            "topology-dns-custom-${attempt}"
+            "topology-mdns-default-${attempt}"
+            "topology-mdns-custom-${attempt}"
+            "files-10000-${attempt}"
+            "mixed-load-${attempt}"
+          )
+          for name in "${expected[@]}"; do
+            jq -e --arg name "$name" '
+              any(.[]; .name == $name and .expired == false)
+            ' <<< "$artifacts" >/dev/null || {
+              echo "Production validation artifact is missing or expired: $name" >&2
+              exit 1
+            }
+          done
+          mkdir -p release-evidence/topology release-evidence/files release-evidence/mixed
+          relay_fingerprint_count() {
+            jq -er '
+              .configuration.relayUrlFingerprints |
+              if
+                type == "array" and
+                all(.[]; type == "string" and test("^[0-9a-f]{16}$")) and
+                length == (unique | length)
+              then length
+              else error("relay fingerprints must be a unique array of canonical fingerprints")
+              end
+            ' "$1"
+          }
+          for locator in ticket dns mdns; do
+            for relay in default custom; do
+              scenario="${locator}-${relay}"
+              evidence_dir="release-evidence/topology/${scenario}"
+              gh run download "$PRODUCTION_RUN_ID" \
+                --name "topology-${scenario}-${attempt}" \
+                --dir "$evidence_dir"
+              relay_count="$(relay_fingerprint_count "$evidence_dir/p2prpc-${scenario}.json")"
+              if [[ "$relay" == "custom" ]]; then
+                (( relay_count >= 2 && relay_count <= 32 )) || {
+                  echo "Custom topology evidence must contain 2-32 relay fingerprints: $scenario" >&2
+                  exit 1
+                }
+              elif (( relay_count != 0 )); then
+                echo "Default topology evidence must not contain custom relay fingerprints: $scenario" >&2
+                exit 1
+              fi
+              EXPECTED_CUSTOM_RELAY_COUNT="$relay_count" LOCATOR="$locator" RELAY="$relay" \
+                bash scripts/validate-lab-driver.sh evidence \
+                p2prpc-lab-canary "$evidence_dir/raw-iroh-${scenario}.json"
+              EXPECTED_CUSTOM_RELAY_COUNT="$relay_count" LOCATOR="$locator" RELAY="$relay" \
+                bash scripts/validate-lab-driver.sh evidence \
+                p2prpc-lab-topology-suite "$evidence_dir/topology-${scenario}.json"
+              jq -e --arg locator "$locator" --arg relay "$relay" --argjson relayCount "$relay_count" '
+                .status == "passed" and
+                .configuration.fileCount == 40 and
+                .configuration.errorCasesPerClass == 2 and
+                .configuration.locator == $locator and
+                .configuration.relay == $relay and
+                (.configuration.relayUrlFingerprints | type == "array" and length == $relayCount) and
+                .totals.successfulFiles == 40 and
+                .totals.authenticationEventsPerEndpoint == 1 and
+                .negativeCases.rpcCanaries == 100 and
+                ([
+                  .negativeCases.controlAttempts.rejectedPushes,
+                  .negativeCases.controlAttempts.revokedPulls,
+                  .negativeCases.controlAttempts.senderCancellations,
+                  .negativeCases.controlAttempts.destinationFailures
+                ] | all(.[];
+                  .logicalCases == 2 and
+                  .senderOpenedBi == 2 and
+                  .receiverAcceptedBi == 2 and
+                  .exact == true
+                )) and
+                (.negativeCases.destinationFailureAttemptsByIndex | length == 2 and all(.[]; . == 1))
+              ' "$evidence_dir/p2prpc-${scenario}.json" >/dev/null
+            done
+          done
+          gh run download "$PRODUCTION_RUN_ID" --name "files-10000-${attempt}" --dir release-evidence/files
+          gh run download "$PRODUCTION_RUN_ID" --name "mixed-load-${attempt}" --dir release-evidence/mixed
+          file_relay_count="$(relay_fingerprint_count release-evidence/files/files-10000.json)"
+          (( file_relay_count >= 1 && file_relay_count <= 32 )) || {
+            echo "File lifecycle evidence must contain 1-32 custom relay fingerprints" >&2
+            exit 1
+          }
+          release_relay_count="$(jq -er '
+            .campaign.parameters.customRelayCount |
+            if type == "number" and floor == . then . else error("custom relay count must be an integer") end
+          ' release-evidence/mixed/release-suite.json)"
+          (( release_relay_count >= 2 && release_relay_count <= 32 )) || {
+            echo "Release evidence must report 2-32 custom relays" >&2
+            exit 1
+          }
+          EXPECTED_CUSTOM_RELAY_COUNT="$file_relay_count" LOCATOR=ticket RELAY=custom \
+            bash scripts/validate-lab-driver.sh evidence \
+            p2prpc-lab-canary release-evidence/files/raw-iroh-files-10000.json
+          EXPECTED_CUSTOM_RELAY_COUNT="$release_relay_count" LOCATOR=ticket RELAY=custom \
+            bash scripts/validate-lab-driver.sh evidence \
+            p2prpc-lab-canary release-evidence/mixed/raw-iroh-mixed-load.json
+          jq -e --argjson relayCount "$file_relay_count" '
+            .status == "passed" and
+            .qualification.productionGateEligible == true and
+            .configuration.fileCount == 10000 and
+            .configuration.pushes == 5000 and
+            .configuration.pulls == 5000 and
+            .configuration.errorCasesPerClass == 50 and
+            .configuration.locator == "ticket" and
+            .configuration.relay == "custom" and
+            (.configuration.relayUrlFingerprints | type == "array" and length == $relayCount) and
+            .totals.successfulFiles == 10000 and
+            .totals.authenticationEventsPerEndpoint == 1 and
+            .negativeCases.rpcCanaries == 100 and
+            ([
+              .negativeCases.controlAttempts.rejectedPushes,
+              .negativeCases.controlAttempts.revokedPulls,
+              .negativeCases.controlAttempts.senderCancellations,
+              .negativeCases.controlAttempts.destinationFailures
+            ] | all(.[];
+              .logicalCases == 50 and
+              .senderOpenedBi == 50 and
+              .receiverAcceptedBi == 50 and
+              .exact == true
+            )) and
+            (.negativeCases.destinationFailureAttemptsByIndex | length == 50 and all(.[]; . == 1))
+          ' release-evidence/files/files-10000.json >/dev/null
+          bash scripts/validate-lab-driver.sh evidence p2prpc-lab-mixed-suite release-evidence/mixed/mixed-load.json release
+          EXPECTED_CUSTOM_RELAY_COUNT="$release_relay_count" \
+            bash scripts/validate-lab-driver.sh evidence p2prpc-lab-release-suite \
+              release-evidence/mixed/release-suite.json
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

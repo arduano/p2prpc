@@ -38,7 +38,11 @@ await mkdir(downloadDirectory, { recursive: true });
 const node = await createP2PNode({
   router,
   protocol: { applicationId: 'p2prpc-example', contractVersion: '1' },
-  security: createSharedSecretSecurity(sharedSecret),
+  security: createSharedSecretSecurity(sharedSecret, {
+    // Example-only coarse policy. Production applications should inspect the
+    // verified principal and requested RPC/file action.
+    authorize: () => true
+  }),
   createContext: (context) => context,
   onIncomingFile: (offer) => {
     const output = resolve(downloadDirectory, basename(offer.manifest.name));
@@ -60,7 +64,7 @@ if (mode === 'serve') {
 } else if (mode === 'connect' && first && second) {
   const peer = await node.connect<AppRouter>({
     expectedPeerId: first,
-    ticket: second,
+    locator: { kind: 'ticket', ticket: second },
     expectedPrincipal: {
       id: first,
       subject: first,

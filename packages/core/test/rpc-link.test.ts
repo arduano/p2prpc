@@ -215,6 +215,27 @@ describe('RPC link flow-control boundaries', () => {
     expect(stream.send.writeCalls).toBe(3);
     expect(stream.send.finishCalls).toBe(1);
     expect(stream.send.resetCalls).toBe(0);
+    expect(stream.recv.expectEndCalls).toBe(1);
+    expect(stream.recv.stopCalls).toBe(1);
+  });
+
+  it('rejects trailing bytes after an RPC completion frame', async () => {
+    const stream = testStream();
+    stream.send.afterWrite = async (index, bytes) => {
+      if (index !== 3) return;
+      const requestFrame = await readFrame<RpcRequest>(new BufferedRecv(bytes.slice(1)));
+      await writeFrame(stream.recv, RpcFrameKind.Data, {
+        id: requestFrame.value.id,
+        data: serializeValue('pong')
+      });
+      await writeFrame(stream.recv, RpcFrameKind.Complete, { id: requestFrame.value.id });
+      await stream.recv.writeAll(Uint8Array.of(0xff));
+    };
+    const client = testClient({ connection: async () => testConnection(async () => stream) });
+
+    await expect(client.ping.query()).rejects.toThrow('Trailing bytes');
+    expect(stream.send.resetCalls).toBe(1);
+    expect(stream.recv.expectEndCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
   });
 
@@ -373,6 +394,7 @@ class RecordingSend implements QuicSendStream {
 
 class BufferedRecv implements QuicRecvStream, QuicSendStream {
   stopCalls = 0;
+  expectEndCalls = 0;
   private readonly bytes: number[];
   private readonly waiters: Array<{
     readonly size: number;
@@ -397,6 +419,11 @@ class BufferedRecv implements QuicRecvStream, QuicSendStream {
   async stop(): Promise<void> {
     this.stopCalls += 1;
     for (const waiter of this.waiters.splice(0)) waiter.reject(new Error('Stopped'));
+  }
+
+  async expectEnd(): Promise<void> {
+    this.expectEndCalls += 1;
+    if (this.bytes.length !== 0) throw new Error('Trailing bytes');
   }
 
   async finish(): Promise<void> {}

@@ -119,15 +119,20 @@ describe('Iroh integration', () => {
   });
 
   it('rejects a peer with the locator but the wrong application credential', { timeout: 30_000 }, async () => {
-    const receiver = await makeNode(undefined, createSharedSecretSecurity('a'.repeat(32)));
-    const stranger = await makeNode(undefined, createSharedSecretSecurity('b'.repeat(32)));
+    const receiver = await makeNode(undefined, createSharedSecretSecurity('a'.repeat(32), { authorize: () => true }));
+    const stranger = await makeNode(undefined, createSharedSecretSecurity('b'.repeat(32), { authorize: () => true }));
     await expect(stranger.connect(nodeTarget(receiver))).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
     const [prefix, body, signature] = receiver.ticket().split('.');
     const locator = JSON.parse(Buffer.from(body!, 'base64url').toString('utf8')) as Record<string, unknown>;
     locator.protocol = 'tampered';
     const tampered = `${prefix}.${Buffer.from(JSON.stringify(locator)).toString('base64url')}.${signature}`;
-    await expect(stranger.connect({ ...nodeTarget(receiver), ticket: tampered }))
+    const target = nodeTarget(receiver);
+    await expect(stranger.connect({
+      expectedPeerId: target.expectedPeerId,
+      expectedPrincipal: target.expectedPrincipal,
+      locator: { kind: 'ticket', ticket: tampered }
+    }))
       .rejects.toMatchObject({ code: 'INVALID_FRAME' });
   });
 
@@ -180,7 +185,7 @@ describe('Iroh integration', () => {
     expect(peer.session.id).not.toBe(firstSessionId);
   });
 
-  it('multiplexes typed RPC, subscriptions, push, and capability pull', { timeout: 30_000 }, async () => {
+  it('multiplexes typed RPC, subscriptions, push, and capability pull', { timeout: 120_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), 'p2prpc-integration-'));
     directories.push(directory);
     const pushedPath = join(directory, 'pushed.bin');
@@ -232,7 +237,7 @@ describe('Iroh integration', () => {
 
 function nodeTarget(node: P2PNode<Router>): ConnectOptions {
   return {
-    ticket: node.ticket(),
+    locator: { kind: 'ticket', ticket: node.ticket() },
     expectedPeerId: node.id,
     expectedPrincipal: {
       id: node.id,

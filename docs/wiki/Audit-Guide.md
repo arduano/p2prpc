@@ -1,10 +1,10 @@
 # Architecture and security audit guide
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md)
+[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Validation](Production-Validation.md)
 
 ## Fast audit path
 
-1. Confirm how the deployment obtains each trusted expected endpoint/principal tuple independently of locator tickets.
+1. Confirm how the deployment obtains each trusted expected endpoint/principal tuple independently of signed tickets, DNS/PKARR, or mDNS route discovery.
 2. Trace an outbound connection through pre-dial locator binding, post-connect endpoint binding, endpoint admission, authentication, principal binding, and peer installation.
 3. Trace one RPC from frame parsing through `SessionSecurity.authorize` into tRPC middleware.
 4. Trace one capability pull from authorized tRPC issuance through lane attachment and atomic publication.
@@ -27,14 +27,15 @@
 | Are capabilities replay-bounded? | `src/files/share.ts` | share/reconnect/revocation tests in `test/files.test.ts` |
 | Does built-in `fileDestination()` verify before publication? | `src/files/fs.ts` | filesystem, resume, race, and integrity tests in `test/files.test.ts` |
 | Are errors and audit text safe? | `src/rpc/server.ts`, `src/text.ts`, `src/node.ts` | RPC and node security tests |
-| Are dial routes constrained? | `src/transport/iroh.ts` | ticket and egress tests in `test/node-security.test.ts` |
+| Are dial routes constrained? | `src/transport/iroh.ts` | ticket/discovery/egress tests in `test/node-security.test.ts` and native integration tests |
 
 Paths above are relative to `packages/core/`.
 
 ## Deployment questions
 
 - Are Iroh private keys persistent, non-exportable where possible, rotated, and mapped to managed workloads?
-- Are expected endpoint IDs and complete expected principal tuples distributed by an authenticated directory or enrollment system independently of user-supplied tickets?
+- Are expected endpoint IDs and complete expected principal tuples distributed by an authenticated directory or enrollment system independently of user-supplied tickets and network discovery?
+- Which explicit locator modes and relay modes are enabled, and does DNS/PKARR fail closed where address-level egress callbacks are required?
 - Does every outbound call provide all principal matcher fields intentionally, using `null` only to require absence and optional `id` only when the authenticator's canonical ID is stable and trusted?
 - Is it understood that an expected-principal mismatch is detected after credential exchange, so credentials are short-lived, audience-limited, preferably endpoint-bound, and protected by pre-credential endpoint admission?
 - Does each environment/trust domain have a distinct OAuth audience and required connection scope?
@@ -83,7 +84,7 @@ The native integration suite is security-relevant: it regression-tests that a ra
 A useful approval should state:
 
 - which endpoint and application identities are trusted;
-- how tickets, tokens, scopes, and key bindings are provisioned;
+- how locators, expected identities, tokens, scopes, and key bindings are provisioned;
 - which operation and storage policies were reviewed;
 - which residual risks were accepted or mitigated externally;
 - which limits and revocation/idempotency expectations apply in production.

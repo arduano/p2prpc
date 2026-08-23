@@ -135,9 +135,18 @@ export interface FileTransferConnectionContext {
   readonly signal: AbortSignal;
 }
 
+export interface FileTransferDiagnostics {
+  readonly activeTransfers: number;
+  readonly queuedTransfers: number;
+  readonly incomingSessions: number;
+  readonly reservedSessions: number;
+  readonly activeLanes: number;
+}
+
 export class TransferManager<TMetadata = unknown> {
   private readonly sessions = new Map<string, IncomingSession<TMetadata>>();
   private readonly reservedSessionIds = new Set<string>();
+  private readonly lifetimeController = new AbortController();
   private readonly limits: FileTransferLimits;
   private readonly idleTimeoutMs: number;
   private activeTransfers = 0;
@@ -151,8 +160,28 @@ export class TransferManager<TMetadata = unknown> {
     }
   }
 
+  diagnostics(): FileTransferDiagnostics {
+    let activeLanes = 0;
+    for (const session of this.sessions.values()) activeLanes += session.receivers.size;
+    return Object.freeze({
+      activeTransfers: this.activeTransfers,
+      queuedTransfers: this.transferWaiters.length,
+      incomingSessions: this.sessions.size,
+      reservedSessions: this.reservedSessionIds.size,
+      activeLanes
+    });
+  }
+
+  /** Permanently abort active, queued, and retrying work for this peer runtime. */
+  close(reason: unknown = new P2PError('DISCONNECTED', 'Peer file manager closed')): void {
+    if (!this.lifetimeController.signal.aborted) this.lifetimeController.abort(reason);
+  }
+
   async sendFile(source: FileSource<TMetadata>, options: SendFileOptions = {}): Promise<Transfer<TMetadata>> {
-    const linked = linkedController(options.signal);
+    const linked = combinedController([
+      this.lifetimeController.signal,
+      ...(options.signal ? [options.signal] : [])
+    ]);
     const controller = linked.controller;
     let release: (() => void) | undefined;
     let chunkSize: number;
@@ -195,7 +224,10 @@ export class TransferManager<TMetadata = unknown> {
     destination: FileDestination<TMetadata>,
     options: DownloadFileOptions = {}
   ): Promise<Transfer<TMetadata>> {
-    const linked = linkedController(options.signal);
+    const linked = combinedController([
+      this.lifetimeController.signal,
+      ...(options.signal ? [options.signal] : [])
+    ]);
     const controller = linked.controller;
     let release: (() => void) | undefined;
     const requestId = randomTransferId();
@@ -255,7 +287,7 @@ export class TransferManager<TMetadata = unknown> {
   }
 
   async handleControl(stream: QuicBiStream, context: FileTransferConnectionContext): Promise<void> {
-    const attempt = childController(context.signal);
+    const attempt = combinedController([this.lifetimeController.signal, context.signal]);
     let release: (() => void) | undefined;
     let reservation: ShareReservation<TMetadata> | undefined;
     let reservationAttempt: ReturnType<typeof combinedController> | undefined;
@@ -433,11 +465,17 @@ export class TransferManager<TMetadata = unknown> {
         }
         this.emitProgress(session.manifest, session.manifest.chunkCount - session.missing.size, 'receive', undefined);
       }
-      if (session.missing.size === 0) session.resolve();
+      await this.expectRecvEnd(recv, session.signal);
     } catch (cause) {
-      if (claimed) session?.reject(cause);
-      const drained = await this.abortRecvStream(recv);
       const error = asP2PError(cause);
+      if (claimed && session) {
+        // This handler owns cleanup for its receive half. Remove it before
+        // aborting the attempt so the control-flow cleanup cannot stop the
+        // same lane concurrently.
+        session.receivers.delete(recv);
+        session.reject(error);
+      }
+      const drained = await this.abortRecvStream(recv);
       if (!drained) throw cleanupFailed(error);
       throw error;
     } finally {
@@ -509,6 +547,16 @@ export class TransferManager<TMetadata = unknown> {
       const assignments = Array.from({ length: lanes }, () => [] as number[]);
       missing.forEach((index, position) => assignments[position % lanes]?.push(index));
       let sentChunks = manifest.chunkCount - missing.length;
+      // The receiver may reject an accepted transfer later (for example, a
+      // destination write can fail). Listen while lanes are active so its
+      // explicit terminal frame wins over secondary STOP_SENDING write errors.
+      // A transfer may legitimately run much longer than one idle interval.
+      // Keep the control read cancellable, but start an idle deadline only if
+      // a failed lane makes us wait for the receiver's terminal decision.
+      const terminalOutcome = this.readControlFrameUntilCancelled(stream.recv, attempt.controller.signal).then(
+        (frame) => ({ kind: 'frame' as const, frame }),
+        (error: unknown) => ({ kind: 'error' as const, error })
+      );
 
       for (const [laneId, indexes] of assignments.entries()) {
         if (indexes.length === 0) continue;
@@ -552,16 +600,59 @@ export class TransferManager<TMetadata = unknown> {
           }
         })());
       }
-      await Promise.all(laneTasks);
+      const lanesOutcome = Promise.all(laneTasks).then(
+        () => ({ kind: 'lanes' as const }),
+        (error: unknown) => ({ kind: 'lane-error' as const, error })
+      );
+      const firstFinished = await Promise.race([lanesOutcome, terminalOutcome]);
+      if (firstFinished.kind === 'frame') {
+        if (firstFinished.frame.kind === TransferFrameKind.Reject) {
+          throw new P2PError('REJECTED', readReason(firstFinished.frame.value));
+        }
+        throw new P2PError('INVALID_FRAME', 'Receiver completed before all file lanes settled');
+      }
+      if (firstFinished.kind === 'error') throw firstFinished.error;
+      if (firstFinished.kind === 'lane-error') {
+        // The receiver writes and finishes Reject before stopping its lane
+        // readers, but QUIC streams are independently scheduled. Apply the
+        // configured idle deadline now and wait for the authoritative control
+        // outcome instead of guessing after a shorter grace period and
+        // accidentally retrying side-effecting destination work.
+        const peerTerminal = await withDeadline(
+          terminalOutcome,
+          this.idleTimeoutMs,
+          'Peer transfer terminal frame timed out'
+        ).catch(() => undefined);
+        if (peerTerminal?.kind === 'frame' && peerTerminal.frame.kind === TransferFrameKind.Reject) {
+          throw new P2PError('REJECTED', readReason(peerTerminal.frame.value));
+        }
+        if (peerTerminal?.kind === 'frame') {
+          throw new P2PError('INVALID_FRAME', 'Receiver completed after a failed file lane');
+        }
+        throw firstFinished.error;
+      }
 
       const completion: CompletionFrame = { transferId: manifest.transferId, attemptId: accept.attemptId };
       await this.writeControlFrame(stream.send, TransferFrameKind.Complete, completion, attempt.controller.signal);
-      const complete = await this.readControlFrame(stream.recv, attempt.controller.signal);
+      // This is the sender's final control message. Half-close before waiting
+      // for the receiver's acknowledgement so the receiver can prove that the
+      // request contains no trailing frames.
+      await this.finishSendStream(stream.send, attempt.controller.signal);
+      const terminal = await withDeadline(
+        terminalOutcome,
+        this.idleTimeoutMs,
+        'Peer transfer acknowledgement timed out'
+      );
+      if (terminal.kind === 'error') throw terminal.error;
+      const complete = terminal.frame;
+      if (complete.kind === TransferFrameKind.Reject) {
+        throw new P2PError('REJECTED', readReason(complete.value));
+      }
       if (complete.kind !== TransferFrameKind.Complete || !matchesCompletion(complete.value, completion)) {
         throw new P2PError('INTEGRITY_FAILED', 'Receiver did not verify this transfer attempt');
       }
+      await this.expectRecvEnd(stream.recv, attempt.controller.signal);
       onAcknowledged?.();
-      await this.finishSendStream(stream.send, attempt.controller.signal);
       return { manifest, resumed: missing.length < manifest.chunkCount, durationMs: Date.now() - startedAt };
     } catch (cause) {
       attempt.controller.abort(cause);
@@ -649,11 +740,16 @@ export class TransferManager<TMetadata = unknown> {
       if (completion.kind !== TransferFrameKind.Complete || !matchesCompletion(completion.value, acceptance)) {
         throw new P2PError('INVALID_FRAME', 'Sender completed a different transfer attempt');
       }
+      await this.expectRecvEnd(stream.recv, session.signal);
       // QUIC does not order independent data lanes against this control stream,
       // so a valid completion frame may arrive while previously written lane
       // bytes are still in flight. Bound that wait instead of rejecting it.
       await this.localOperation(() => session!.done, session.signal, 'File data lanes timed out');
       if (session.missing.size !== 0) throw new P2PError('INVALID_FRAME', 'Sender completed before all chunks arrived');
+      // A lane is complete only after its final chunk and clean FIN have both
+      // been consumed. Do not finalize durable state or acknowledge the
+      // transfer while a lane handler still owns a receive stream.
+      await this.localOperation(() => session!.lanesDrained(), session.signal, 'File data lanes timed out');
       await this.localOperation(
         (operationSignal) => destination.finalize(manifest, operationSignal),
         session.signal,
@@ -670,10 +766,14 @@ export class TransferManager<TMetadata = unknown> {
       const error = asP2PError(cause);
       if (ownsReservation) this.reservedSessionIds.delete(manifest.transferId);
       if (session && this.sessions.get(manifest.transferId) === session) this.sessions.delete(manifest.transferId);
+      // Tell the sender why this attempt is terminal while the control send
+      // half is still usable. Stopping data lanes first can make their writers
+      // fail with DISCONNECTED, which looks retryable and can eventually poison
+      // an otherwise healthy long-lived session.
+      const controlDrained = await this.rejectControlStream(stream, error);
       session?.controller.abort(error);
       session?.reject(error);
       const receiversDrained = session ? await this.abortRecvStreams(session.receivers) : true;
-      const controlDrained = await this.abortBiStream(stream);
       // writeChunk() is a side-effecting custom-adapter callback. It may still
       // be cooperatively settling after its lane stream is stopped, so wait for
       // every claimed lane handler before invoking destination.abort() or
@@ -691,7 +791,7 @@ export class TransferManager<TMetadata = unknown> {
         ).catch(() => undefined);
       }
       if (!receiversDrained || !controlDrained) throw cleanupFailed(error);
-      throw cause;
+      throw drainedTransferError(error);
     } finally {
       if (ownsReservation) this.reservedSessionIds.delete(manifest.transferId);
       if (session && this.sessions.get(manifest.transferId) === session) this.sessions.delete(manifest.transferId);
@@ -832,6 +932,17 @@ export class TransferManager<TMetadata = unknown> {
     );
   }
 
+  private readControlFrameUntilCancelled<T = unknown>(
+    recv: QuicRecvStream,
+    signal?: AbortSignal
+  ): Promise<Frame<T>> {
+    return cancellableOperation(
+      () => readFrame<T>(recv, this.frameLimits()),
+      signal,
+      'DISCONNECTED'
+    );
+  }
+
   private async getConnection(signal: AbortSignal): Promise<FileTransferConnectionContext> {
     const context = await this.networkOperation(this.options.connection, signal, 'File connection timed out');
     if (
@@ -886,6 +997,10 @@ export class TransferManager<TMetadata = unknown> {
 
   private finishSendStream(send: QuicSendStream, signal?: AbortSignal): Promise<void> {
     return this.networkOperation(() => send.finish(), signal, 'Finishing file stream timed out');
+  }
+
+  private expectRecvEnd(recv: QuicRecvStream, signal?: AbortSignal): Promise<void> {
+    return this.networkOperation(() => recv.expectEnd(), signal, 'Finishing file stream timed out');
   }
 
   private async writeChunkBody(send: QuicSendStream, data: Uint8Array, signal: AbortSignal): Promise<void> {
@@ -963,7 +1078,8 @@ export class TransferManager<TMetadata = unknown> {
     });
     const recvStopped = await this.abortRecvStream(stream.recv);
     if (writeSettled && wrote) return recvStopped;
-    return this.abortBiStream(stream);
+    const sendReset = await this.abortSendStream(stream.send);
+    return sendReset && recvStopped;
   }
 
   private async cleanupOperation(operation: () => Promise<unknown>): Promise<boolean> {
@@ -1067,6 +1183,7 @@ function createSession<TMetadata>(
         released = true;
         activeLanes -= 1;
         if (activeLanes === 0) {
+          if (missing.size === 0) this.resolve();
           for (const resolve of laneDrainWaiters) resolve();
           laneDrainWaiters.clear();
         }
@@ -1369,6 +1486,26 @@ async function boundedOperation<T>(
     return await Promise.race([task, timeout, aborted]);
   } finally {
     if (timer) clearTimeout(timer);
+    detachAbort();
+  }
+}
+
+async function cancellableOperation<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  fallback: 'DISCONNECTED' | 'INTERNAL'
+): Promise<T> {
+  throwIfCancelled(signal);
+  let detachAbort = (): void => undefined;
+  const task = Promise.resolve().then(operation).catch((cause: unknown) => {
+    throw asP2PError(cause, fallback);
+  });
+  const aborted = new Promise<never>((_, reject) => {
+    detachAbort = onAbort(signal, () => reject(signal ? signalError(signal) : cancelledError()));
+  });
+  try {
+    return await Promise.race([task, aborted]);
+  } finally {
     detachAbort();
   }
 }
