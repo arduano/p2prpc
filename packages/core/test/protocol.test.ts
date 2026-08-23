@@ -10,6 +10,9 @@ class BufferPipe implements QuicSendStream, QuicRecvStream {
     return Uint8Array.from(this.bytes.splice(0, size));
   }
   async finish(): Promise<void> {}
+  async expectEnd(): Promise<void> {
+    if (this.bytes.length !== 0) throw new Error('Trailing bytes');
+  }
   async reset(): Promise<void> {}
   async setPriority(): Promise<void> {}
   async stop(): Promise<void> {}

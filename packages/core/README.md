@@ -30,12 +30,15 @@ type Router = typeof router;
 const node = await createP2PNode({
   router,
   protocol: { applicationId: 'my-app', contractVersion: '1' },
-  security: createSharedSecretSecurity(process.env.P2PRPC_SHARED_SECRET!),
+  security: createSharedSecretSecurity(process.env.P2PRPC_SHARED_SECRET!, {
+    // Coarse MVP policy; replace with application-specific authorization.
+    authorize: () => true
+  }),
   createContext: (context) => context
 });
 
 const peer = await node.connect<Router>({
-  ticket: remoteTicket,
+  locator: { kind: 'ticket', ticket: remoteTicket },
   expectedPeerId: remotePeerId,
   expectedPrincipal: {
     id: remotePeerId,
@@ -50,9 +53,15 @@ console.log(await peer.rpc.ping.query(undefined, {
 }));
 ```
 
-`security` is required. An address, signed ticket, or Iroh peer ID authenticates only the transport endpoint and never grants application work. Outbound `connect()` additionally requires a separately trusted endpoint ID and exact principal matcher. The matcher always specifies `subject`, `issuer`, `clientId`, and `tenantId`; `null` requires an optional field to be absent, and optional `id` adds the authenticator's canonical stable ID. These fields are not OIDC-specific: the shared-secret helper uses the remote endpoint ID for `id`/`subject` and leaves the other fields absent. Production OAuth deployments can use `createOidcSessionSecurity`, including strict issuer/audience/JWKS verification, mandatory operation scopes, a one-hour default/24-hour maximum token age, and default `cnf.jkt` binding to the Iroh endpoint key. Custom OIDC `authorize` policy can narrow those scopes but cannot grant a missing one.
+`security` is required. A route, signed ticket, or Iroh peer ID authenticates only the transport endpoint and never grants application work. Outbound `connect()` accepts `{ kind: 'ticket', ticket }`, `{ kind: 'dns' }`, or `{ kind: 'mdns', serviceName? }`, and additionally requires a separately trusted endpoint ID and exact principal matcher. The matcher always specifies `subject`, `issuer`, `clientId`, and `tenantId`; `null` requires an optional field to be absent, and optional `id` adds the authenticator's canonical stable ID. These fields are not OIDC-specific: the shared-secret helper uses the remote endpoint ID for `id`/`subject` and leaves the other fields absent. Production OAuth deployments can use `createOidcSessionSecurity`, including strict issuer/audience/JWKS verification, mandatory operation scopes, a one-hour default/24-hour maximum token age, and default `cnf.jkt` binding to the Iroh endpoint key. Custom OIDC `authorize` policy can narrow those scopes but cannot grant a missing one.
 
-The expected endpoint is checked against the signed ticket before native dialing and against the connected transport before credentials are requested. The initiator then presents its application credential before it can verify the endpoint's application principal; the required matcher is checked before the peer is installed or returned. Provision tickets and both expectations through a trusted channel, use short-lived peer/audience-specific tokens, and configure `preAuthorizePeer` when a broader endpoint-key allow-list or inbound admission rule is needed. The frozen target is retained across automatic reconnects.
+Shared-secret authentication and operation authorization are separate: omitting the helper's `authorize` callback denies every RPC and file action. The example's `authorize: () => true` deliberately gives every authenticated secret holder the complete application surface; production policies should inspect the verified principal and requested action.
+
+The signed ticket, DNS/PKARR result, or mDNS result supplies routes only; `expectedPeerId` independently selects the endpoint and is checked against the connected transport before credentials are requested. The initiator then presents its application credential before it can verify the endpoint's application principal; the required matcher is checked before the peer is installed or returned. Provision expectations independently of discovery, use short-lived peer/audience-specific tokens, and configure `preAuthorizePeer` when a broader endpoint-key allow-list or inbound admission rule is needed. The frozen target is retained across automatic reconnects: tickets are reused, while DNS and mDNS are resolved again. Use `await node.createTicket()` when sharing a ticket so its direct addresses and home relay are freshly sampled; legacy `ticket()` does not refresh route information.
+
+Configure connectivity with `iroh.relay` (`default`, `custom` HTTPS URLs, or `disabled`). Enable `iroh.discovery.dns` before using the DNS locator; this is an endpoint-wide native lookup and may also be used after ticket or mDNS hints fail. `iroh.discovery.mdns` chooses a default service and automatic advertisement, while the mDNS locator itself explicitly starts browsing. Custom relays are relay-assisted and may upgrade to direct. For route-source isolation or filtered egress, use a separate DNS-disabled endpoint: signed-ticket and mDNS candidates can then pass through egress callbacks. Enabling DNS with `allowDirectAddress` or `allowRelayUrl` fails closed because the pinned wrapper cannot expose DNS-resolved candidates before dial. mDNS direct hints default to private/link-local/loopback ranges, default-network mDNS relay hints need an explicit callback, custom mode restricts relay hints to configured origins, and disabled mode rejects them. In exact-pinned `@momics/iroh-http-node` 0.6.0, disabled relays imply loopback-only networking, so this version makes no production relay-less support claim.
+
+The exact-pinned `@momics/iroh-http-shared` 0.6.1 session sink needs a narrow native-writer compatibility seam. When `sendChunk` rejects, p2prpc invokes `finishBody` once on the opaque handle and preserves the original error; startup fails closed if the node wrapper resolves a different shared-package instance. Native-handle lifecycle assertions are part of the repository's 10,000-file production-validation gate.
 
 RPC headers are normalized, frozen, and bounded, but remain caller-controlled. Credential, cookie, forwarding, origin/authority, proxy, and `p2prpc-*` namespaces are reserved. tRPC middleware should compare requested tenant or routing metadata with the verified `ctx.auth.principal`, never treat metadata itself as identity.
 
@@ -66,4 +75,4 @@ Files use a separately authorized control stream and bounded parallel data lanes
 
 OIDC principal IDs are hashed from the verified issuer/subject/client tuple. Deployments upgrading from readable/delimiter IDs must migrate ACLs, database keys, cached grants, and audit correlation. Long-lived subscriptions also need application heartbeat/data within the default 30-second per-read timeout.
 
-See the repository README and `SECURITY.md` for the complete API, OIDC setup, file-transfer pattern, wire model, limits, threat model, and migration notes.
+See the [repository README](https://github.com/arduano/p2prpc#readme), [security policy](./SECURITY.md), and [architecture wiki](https://arduano.github.io/p2prpc/) for the complete API, OIDC setup, file-transfer pattern, wire model, limits, threat model, validation contract, and migration notes.

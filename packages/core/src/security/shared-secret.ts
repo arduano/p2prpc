@@ -23,12 +23,13 @@ export function createSharedSecretSecurity<TFileMetadata = unknown>(
   secret: Uint8Array | string,
   options: SharedSecretSecurityOptions<TFileMetadata> = {}
 ): SessionSecurity<TFileMetadata> {
+  validateOptions(options, ['sessionTtlMs', 'clockSkewMs', 'authorize'], 'Shared-secret security options');
   if (options.authorize !== undefined && typeof options.authorize !== 'function') {
     throw new P2PError('UNAUTHORIZED', 'Shared-secret authorize policy must be a function');
   }
   const customAuthorize = options.authorize;
   const key = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
-  if (key.byteLength < 32) throw new P2PError('INVALID_FRAME', 'Session shared secret must contain at least 256 bits');
+  if (key.byteLength < 32) throw new P2PError('INVALID_FRAME', 'Session shared secret must contain at least 32 bytes');
   const ttl = options.sessionTtlMs === undefined ? 15 * 60_000 : options.sessionTtlMs;
   const skew = options.clockSkewMs === undefined ? 30_000 : options.clockSkewMs;
   validateDuration(ttl, 'Session TTL', 24 * 60 * 60_000);
@@ -72,13 +73,16 @@ export function createSharedSecretSecurity<TFileMetadata = unknown>(
       return principal;
     },
     authorize(context) {
-      return customAuthorize === undefined ? true : customAuthorize(context);
+      // Authentication and authorization are intentionally separate. A
+      // shared secret proves membership only; policy must grant each action.
+      return customAuthorize === undefined ? false : customAuthorize(context);
     }
   };
 }
 
 /** Explicit test/development escape hatch. Never use this in production. */
 export function dangerouslyAllowInsecureSessions<TFileMetadata = unknown>(options: { sessionTtlMs?: number } = {}): SessionSecurity<TFileMetadata> {
+  validateOptions(options, ['sessionTtlMs'], 'Insecure session options');
   const ttl = options.sessionTtlMs === undefined ? 60 * 60_000 : options.sessionTtlMs;
   validateDuration(ttl, 'Insecure session TTL', 24 * 60 * 60_000);
   return {
@@ -97,6 +101,20 @@ export function dangerouslyAllowInsecureSessions<TFileMetadata = unknown>(option
     },
     authorize: () => true
   };
+}
+
+function validateOptions(value: unknown, allowed: readonly string[], label: string): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new P2PError('INVALID_FRAME', `${label} must be a plain object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new P2PError('INVALID_FRAME', `${label} must be a plain object`);
+  }
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new P2PError('INVALID_FRAME', `${label} contains an unknown field`);
+  }
 }
 
 function validateDuration(value: number, label: string, maximum: number): void {

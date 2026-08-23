@@ -17,6 +17,7 @@ npm ci
 npm run lint
 npm run typecheck
 npm run check:docs
+bash scripts/test-lab-driver-validation.sh
 npm test
 npm run test:integration
 npm run build
@@ -27,6 +28,8 @@ npm audit --audit-level=low
 ```
 
 Native integration tests exercise real Iroh endpoints and can take longer than unit tests.
+
+The controlled network and stress suites are intentionally absent from pull-request runners. Maintainers run them through the `Production validation` workflow on dedicated hosts; its runner contract, scenarios, and pass criteria are documented in the [production-validation guide](./docs/wiki/Production-Validation.md). Do not weaken resource or correctness thresholds to accommodate an unexplained failure.
 
 ## Pull requests
 

@@ -63,6 +63,7 @@ export default defineConfig({
       { text: 'System model', link: '/Home' },
       { text: 'Security', link: '/Security-Model' },
       { text: 'Audit guide', link: '/Audit-Guide' },
+      { text: 'Validation', link: '/Production-Validation' },
       { text: 'Repository', link: repositoryUrl }
     ],
     sidebar: [
@@ -80,7 +81,8 @@ export default defineConfig({
         items: [
           { text: 'Security model', link: '/Security-Model' },
           { text: 'File transfers', link: '/File-Transfers' },
-          { text: 'Audit guide', link: '/Audit-Guide' }
+          { text: 'Audit guide', link: '/Audit-Guide' },
+          { text: 'Production validation', link: '/Production-Validation' }
         ]
       }
     ],

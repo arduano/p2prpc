@@ -1,0 +1,10 @@
+self-hosted-runner:
+  labels:
+    - p2prpc-lab
+
+config-variables:
+  - P2PRPC_LAB_BIND_ADDRESSES
+  - P2PRPC_LAB_DNS_SERVER_URL
+  - P2PRPC_LAB_DRIVER_MANIFEST
+  - P2PRPC_LAB_ENABLED
+  - P2PRPC_LAB_RELAY_URLS

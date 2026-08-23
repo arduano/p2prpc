@@ -9,7 +9,13 @@ import { ShareRegistry } from '../src/files/share.js';
 import { Transfer } from '../src/files/transfer.js';
 import type { FileDestination, FileManifest } from '../src/files/types.js';
 import { TransferFrameKind, readFrame, writeFrame } from '../src/protocol.js';
-import type { QuicBiStream, QuicConnection, QuicRecvStream, QuicSendStream } from '../src/transport/types.js';
+import type {
+  ConnectionStats,
+  QuicBiStream,
+  QuicConnection,
+  QuicRecvStream,
+  QuicSendStream
+} from '../src/transport/types.js';
 import { DEFAULT_FILE_TRANSFER_LIMITS, validateManifest } from '../src/files/validation.js';
 import { P2PError } from '../src/errors.js';
 
@@ -188,7 +194,8 @@ describe('filesystem transfers', () => {
       { allowBearer: true, allowedPrincipals: null },
       { allowBearer: true, allowedSubjects: null },
       { allowBearer: true, expiresAt: null },
-      { allowBearer: true, maxDownloads: null }
+      { allowBearer: true, maxDownloads: null },
+      { allowBearer: true, allowedPrinciple: [{ id: 'principal', subject: 'subject' }] }
     ]) {
       expect(() => registry.share(source, policy as never)).toThrow();
     }
@@ -199,10 +206,33 @@ describe('filesystem transfers', () => {
       { reconnectLeaseMs: null },
       { maxReconnects: null },
       { maxEntries: null },
-      { now: null }
+      { now: null },
+      { defaultTTLms: 1_000 }
     ]) {
       expect(() => new ShareRegistry(options as never)).toThrow();
     }
+  });
+
+  it('aborts active retries and releases transfer slots when the peer file manager closes', async () => {
+    let connectionAttempts = 0;
+    const manager = new TransferManager({
+      peerId: 'peer-a',
+      connection: async () => {
+        connectionAttempts += 1;
+        throw new P2PError('DISCONNECTED', 'Peer is offline');
+      },
+      shares: new ShareRegistry(),
+      authorize: () => undefined
+    });
+    const source = { name: 'empty.bin', size: 0, readChunk: async () => new Uint8Array() };
+    const transfer = await manager.sendFile(source, { transferId: 'peer-close-transfer' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    manager.close(new P2PError('DISCONNECTED', 'Peer permanently closed'));
+
+    await expect(transfer.result).rejects.toMatchObject({ code: 'DISCONNECTED' });
+    expect(connectionAttempts).toBe(1);
+    expect(manager.diagnostics()).toMatchObject({ activeTransfers: 0, queuedTransfers: 0 });
   });
 
   it('bounds reconnects with a non-sliding lease and an attempt cap', () => {
@@ -266,7 +296,7 @@ describe('filesystem transfers', () => {
     expect(active.signal.reason).toMatchObject({ code: 'UNAUTHORIZED' });
   });
 
-  it('terminalizes an acknowledged pull before a fallible stream finish', async () => {
+  it('keeps a capability retryable when the final control half-close fails', async () => {
     const source = { name: 'empty.bin', size: 0, readChunk: async () => new Uint8Array() };
     const shares = new ShareRegistry();
     const handle = shares.shareForPeer(source, 'peer-a');
@@ -284,6 +314,11 @@ describe('filesystem transfers', () => {
     const handling = manager.handleControl(failingStream, testContext(testConnection(failingStream, new AsyncPipe())));
     await acknowledgeEmptyPull(first.right, handle.token, 'request-a');
     await expect(handling).rejects.toMatchObject({ code: 'DISCONNECTED' });
+
+    const retry = duplexPair();
+    const retryHandling = manager.handleControl(retry.left, testContext(testConnection(retry.left, new AsyncPipe())));
+    await acknowledgeEmptyPull(retry.right, handle.token, 'request-a');
+    await retryHandling;
 
     const replay = duplexPair();
     await writePull(replay.right.send, handle.token, 'request-a');
@@ -325,6 +360,45 @@ describe('filesystem transfers', () => {
     const replayHandling = manager.handleControl(replay.left, testContext(testConnection(replay.left, new AsyncPipe())));
     expect((await readFrame(replay.right.recv)).kind).toBe(TransferFrameKind.Reject);
     await expect(replayHandling).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+  });
+
+  it('prefers a delayed receiver rejection over a racing lane write error without retrying', async () => {
+    const control = duplexPair();
+    const lane = new RejectingSendStream();
+    let connectionRequests = 0;
+    const context = testContext(testConnection(control.left, lane));
+    const manager = new TransferManager({
+      peerId: 'peer-a',
+      connection: async () => {
+        connectionRequests += 1;
+        return context;
+      },
+      shares: new ShareRegistry(),
+      authorize: () => undefined
+    });
+    const transfer = await manager.sendFile({
+      name: 'destination-failure.bin',
+      size: 1,
+      readChunk: async () => Uint8Array.of(1)
+    }, { lanes: 1, chunkSize: 64 * 1024 });
+
+    await control.right.recv.readExact(1);
+    const offer = await readFrame<FileManifest>(control.right.recv);
+    await acceptAllChunks(control.right.send, offer.value);
+    await lane.writeAttempted;
+    // Independent QUIC streams are unordered. This intentionally exceeds the
+    // former one-second heuristic so a delayed control Reject remains the
+    // terminal decision and cannot cause a duplicate transfer attempt.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+    await writeFrame(control.right.send, TransferFrameKind.Reject, {
+      code: 'INTERNAL',
+      reason: 'Transfer rejected'
+    });
+    await control.right.send.finish();
+
+    await expect(transfer.result).rejects.toMatchObject({ code: 'REJECTED' });
+    expect(connectionRequests).toBe(1);
+    expect(lane.resetCalls).toBeGreaterThan(0);
   });
 
   it('does no source or network work for pre-aborted transfers', async () => {
@@ -455,7 +529,7 @@ describe('filesystem transfers', () => {
     await expect(receiving).rejects.toMatchObject({ code: 'CANCELLED' });
     await expect(handlingLane).rejects.toMatchObject({ code: 'CANCELLED' });
     expect(lane.stopCalls).toBeGreaterThan(0);
-    expect((control.left.send as AsyncPipe).resetCalls).toBeGreaterThan(0);
+    expect((control.left.send as AsyncPipe).finishCalls).toBe(1);
     expect((control.left.recv as AsyncPipe).stopCalls).toBeGreaterThan(0);
     expect(destinationAborted).toBe(true);
   });
@@ -573,7 +647,7 @@ describe('filesystem transfers', () => {
     await expect(receiving).rejects.toMatchObject({ code: 'TIMEOUT' });
     await expect(handlingLane).rejects.toMatchObject({ code: 'TIMEOUT' });
     expect(lane.stopCalls).toBeGreaterThan(0);
-    expect((control.left.send as AsyncPipe).resetCalls).toBeGreaterThan(0);
+    expect((control.left.send as AsyncPipe).finishCalls).toBe(1);
     expect((control.left.recv as AsyncPipe).stopCalls).toBeGreaterThan(0);
   });
 
@@ -804,14 +878,138 @@ describe('filesystem transfers', () => {
       digest: chunkDigest(byte)
     });
     await lane.writeAll(byte);
+    await lane.finish();
     await manager.handleData(lane, context);
     await writeFrame(control.right.send, TransferFrameKind.Complete, {
       transferId: manifest.transferId,
       attemptId: accepted.value.attemptId
     });
+    await control.right.send.finish();
     await receiving;
     expect(writes).toEqual([byte]);
     expect(finalized).toBe(true);
+    expect(lane.expectEndCalls).toBe(1);
+    expect((control.left.recv as AsyncPipe).expectEndCalls).toBe(1);
+  });
+
+  it('waits for every data-lane FIN before finalizing and acknowledging a transfer', async () => {
+    const manager = new TransferManager({
+      peerId: 'peer-a',
+      connection: async () => { throw new Error('unused'); },
+      shares: new ShareRegistry(),
+      authorize: () => undefined
+    });
+    const byte = Uint8Array.of(11);
+    const manifest: FileManifest = {
+      ...oneByteManifest('lane-fin-before-finalize'),
+      digest: chunkDigest(byte)
+    };
+    const chunkWritten = deferred<void>();
+    let finalized = false;
+    const destination: FileDestination = {
+      prepare: async () => new Set(),
+      writeChunk: async () => { chunkWritten.resolve(); },
+      finalize: async () => { finalized = true; },
+      abort: async () => undefined
+    };
+    const control = duplexPair();
+    const context = testContext(testConnection(control.left, new AsyncPipe()));
+    const receiving = privateReceive(manager, context)(
+      control.left,
+      manifest,
+      destination,
+      undefined,
+      new AbortController().signal
+    );
+    const accepted = await readFrame<Record<string, unknown>>(control.right.recv);
+    const lane = new AsyncPipe();
+    await writeFrame(lane, TransferFrameKind.Accept, {
+      transferId: manifest.transferId,
+      attemptId: accepted.value.attemptId,
+      laneToken: accepted.value.laneToken,
+      laneId: 0,
+      count: 1
+    });
+    await writeFrame(lane, TransferFrameKind.ChunkHeader, {
+      index: 0,
+      size: byte.byteLength,
+      digest: chunkDigest(byte)
+    });
+    await lane.writeAll(byte);
+    const handlingLane = manager.handleData(lane, context);
+    await chunkWritten.promise;
+    await writeFrame(control.right.send, TransferFrameKind.Complete, {
+      transferId: manifest.transferId,
+      attemptId: accepted.value.attemptId
+    });
+    await control.right.send.finish();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(finalized).toBe(false);
+
+    await lane.finish();
+    await handlingLane;
+    await receiving;
+    expect(finalized).toBe(true);
+    expect(lane.expectEndCalls).toBe(1);
+    expect((control.left.recv as AsyncPipe).expectEndCalls).toBe(1);
+  });
+
+  it('rejects trailing lane bytes and cleans up without finalizing', async () => {
+    const manager = new TransferManager({
+      peerId: 'peer-a',
+      connection: async () => { throw new Error('unused'); },
+      shares: new ShareRegistry(),
+      authorize: () => undefined
+    });
+    const byte = Uint8Array.of(12);
+    const manifest: FileManifest = {
+      ...oneByteManifest('trailing-lane-bytes'),
+      digest: chunkDigest(byte)
+    };
+    let finalized = false;
+    const destination: FileDestination = {
+      prepare: async () => new Set(),
+      writeChunk: async () => undefined,
+      finalize: async () => { finalized = true; },
+      abort: async () => undefined
+    };
+    const control = duplexPair();
+    const context = testContext(testConnection(control.left, new AsyncPipe()));
+    const receiving = privateReceive(manager, context)(
+      control.left,
+      manifest,
+      destination,
+      undefined,
+      new AbortController().signal
+    );
+    const accepted = await readFrame<Record<string, unknown>>(control.right.recv);
+    const lane = new AsyncPipe();
+    await writeFrame(lane, TransferFrameKind.Accept, {
+      transferId: manifest.transferId,
+      attemptId: accepted.value.attemptId,
+      laneToken: accepted.value.laneToken,
+      laneId: 0,
+      count: 1
+    });
+    await writeFrame(lane, TransferFrameKind.ChunkHeader, {
+      index: 0,
+      size: byte.byteLength,
+      digest: chunkDigest(byte)
+    });
+    await lane.writeAll(byte);
+    await lane.writeAll(Uint8Array.of(99));
+    await lane.finish();
+
+    await expect(manager.handleData(lane, context)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    await expect(receiving).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    const rejection = await readFrame<Record<string, unknown>>(control.right.recv);
+    expect(rejection.kind).toBe(TransferFrameKind.Reject);
+    expect(rejection.value.code).toBe('INVALID_FRAME');
+    expect(finalized).toBe(false);
+    expect(lane.expectEndCalls).toBe(1);
+    expect(lane.stopCalls).toBe(1);
+    expect((control.left.send as AsyncPipe).finishCalls).toBe(1);
+    expect((control.left.recv as AsyncPipe).stopCalls).toBeGreaterThan(0);
   });
 
   it('pins every sender lane to the control connection', async () => {
@@ -843,6 +1041,7 @@ describe('filesystem transfers', () => {
     await acceptAllChunks(control.right.send, offer.value);
     const complete = await readFrame<Record<string, unknown>>(control.right.recv);
     await writeFrame(control.right.send, TransferFrameKind.Complete, complete.value);
+    await control.right.send.finish();
     await transfer.result;
     expect(contextRequests).toBe(1);
     expect(opensA).toBe(1);
@@ -976,7 +1175,7 @@ describe('filesystem transfers', () => {
     expect(events).toEqual(['write-started', 'write-aborted']);
 
     releaseWrite.resolve();
-    await handlingLane;
+    await expect(handlingLane).rejects.toMatchObject({ code: 'INVALID_FRAME' });
     expect(await observed).toMatchObject({ code: 'INVALID_FRAME' });
     expect(events).toEqual(['write-started', 'write-aborted', 'write-finished', 'abort']);
   });
@@ -1036,6 +1235,7 @@ describe('filesystem transfers', () => {
       transferId: manifest.transferId,
       attemptId: accepted.value.attemptId
     });
+    await control.right.send.finish();
     await finalizeStarted.promise;
     await finalizeAborted.promise;
     expect(settled).toBe(false);
@@ -1176,6 +1376,7 @@ describe('filesystem transfers', () => {
         transferId: requestId,
         attemptId: accepted.value.attemptId
       });
+      await second.right.send.finish();
       await readFrame(second.right.recv);
     })();
     let finalized = false;
@@ -1401,7 +1602,12 @@ describe('filesystem transfers', () => {
 
 class RecordingPipe implements QuicSendStream, QuicRecvStream {
   readonly readSizes: number[] = [];
+  finishCalls = 0;
+  expectEndCalls = 0;
+  resetCalls = 0;
+  stopCalls = 0;
   private bytes: number[] = [];
+  private ended = false;
 
   async writeAll(data: Uint8Array): Promise<void> { this.bytes.push(...data); }
   async readExact(size: number): Promise<Uint8Array> {
@@ -1409,10 +1615,14 @@ class RecordingPipe implements QuicSendStream, QuicRecvStream {
     if (this.bytes.length < size) throw new Error('EOF');
     return Uint8Array.from(this.bytes.splice(0, size));
   }
-  async finish(): Promise<void> {}
-  async reset(): Promise<void> {}
+  async finish(): Promise<void> { this.finishCalls += 1; this.ended = true; }
+  async expectEnd(): Promise<void> {
+    this.expectEndCalls += 1;
+    if (!this.ended || this.bytes.length !== 0) throw new P2PError('INVALID_FRAME', 'Expected clean EOF');
+  }
+  async reset(): Promise<void> { this.resetCalls += 1; this.ended = true; }
   async setPriority(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> { this.stopCalls += 1; this.ended = true; }
 }
 
 function duplexPair(): { left: QuicBiStream; right: QuicBiStream } {
@@ -1425,6 +1635,8 @@ function duplexPair(): { left: QuicBiStream; right: QuicBiStream } {
 }
 
 class AsyncPipe implements QuicSendStream, QuicRecvStream {
+  finishCalls = 0;
+  expectEndCalls = 0;
   resetCalls = 0;
   stopCalls = 0;
   readonly waitingForBytes: Promise<void>;
@@ -1452,8 +1664,16 @@ class AsyncPipe implements QuicSendStream, QuicRecvStream {
   }
 
   async finish(): Promise<void> {
+    this.finishCalls += 1;
     this.ended = true;
     for (const waiter of this.waiters.splice(0)) waiter();
+  }
+  async expectEnd(): Promise<void> {
+    this.expectEndCalls += 1;
+    while (!this.ended && this.bytes.length === 0) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    if (!this.ended || this.bytes.length !== 0) throw new P2PError('INVALID_FRAME', 'Expected clean EOF');
   }
   async reset(): Promise<void> {
     this.resetCalls += 1;
@@ -1500,6 +1720,25 @@ class StalledSendStream implements QuicSendStream {
   async setPriority(): Promise<void> {}
 }
 
+class RejectingSendStream implements QuicSendStream {
+  readonly writeAttempted: Promise<void>;
+  resetCalls = 0;
+  private signalWriteAttempted!: () => void;
+
+  constructor() {
+    this.writeAttempted = new Promise<void>((resolve) => { this.signalWriteAttempted = resolve; });
+  }
+
+  async writeAll(): Promise<void> {
+    this.signalWriteAttempted();
+    throw new Error('body reader dropped');
+  }
+
+  async finish(): Promise<void> {}
+  async reset(): Promise<void> { this.resetCalls += 1; }
+  async setPriority(): Promise<void> {}
+}
+
 class FinishStalledSendStream implements QuicSendStream {
   readonly finishStarted: Promise<void>;
   resetCalls = 0;
@@ -1541,8 +1780,35 @@ function testConnection(control: QuicBiStream, data: QuicSendStream): QuicConnec
     acceptUni: async () => { throw new Error('unused'); },
     closed: async () => 'closed',
     close: () => undefined,
-    stats: async () => ({ rttMs: 0, sentBytes: 0, receivedBytes: 0, lostPackets: 0 }),
+    stats: async () => testConnectionStats(),
     configure: () => undefined
+  };
+}
+
+function testConnectionStats(): ConnectionStats {
+  return {
+    connectionId: 'test-connection',
+    rttMs: 0,
+    sentBytes: 0,
+    receivedBytes: 0,
+    lostPackets: 0,
+    sentPackets: 0,
+    congestionWindow: null,
+    relay: null,
+    relayUrl: null,
+    paths: [],
+    streams: {
+      openedBi: 0,
+      acceptedBi: 0,
+      openedUni: 0,
+      acceptedUni: 0,
+      activeSend: 0,
+      activeRecv: 0,
+      sendFinished: 0,
+      sendReset: 0,
+      recvEof: 0,
+      recvStopped: 0
+    }
   };
 }
 
@@ -1569,6 +1835,7 @@ async function acknowledgeEmptyPull(remote: QuicBiStream, token: string, request
   const complete = await readFrame<Record<string, unknown>>(remote.recv);
   expect(complete.kind).toBe(TransferFrameKind.Complete);
   await writeFrame(remote.send, TransferFrameKind.Complete, complete.value);
+  await remote.send.finish();
 }
 
 async function acknowledgeOneChunkPull(remote: QuicBiStream, token: string, requestId: string): Promise<void> {
@@ -1586,6 +1853,7 @@ async function acknowledgeOneChunkPull(remote: QuicBiStream, token: string, requ
   const complete = await readFrame<Record<string, unknown>>(remote.recv);
   expect(complete.kind).toBe(TransferFrameKind.Complete);
   await writeFrame(remote.send, TransferFrameKind.Complete, complete.value);
+  await remote.send.finish();
 }
 
 async function acceptAllChunks(send: QuicSendStream, manifest: FileManifest): Promise<void> {

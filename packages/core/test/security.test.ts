@@ -17,7 +17,13 @@ import {
 import { authenticateConnection } from '../src/security/handshake.js';
 import { authorizationAllowed, freezePrincipal } from '../src/security/types.js';
 import type { SessionAuthenticationContext } from '../src/security/types.js';
-import type { QuicConnection } from '../src/transport/types.js';
+import type {
+  ConnectionStats,
+  QuicBiStream,
+  QuicConnection,
+  QuicRecvStream,
+  QuicSendStream
+} from '../src/transport/types.js';
 
 describe('session security', () => {
   it('fails closed when JavaScript callers omit security configuration', async () => {
@@ -98,7 +104,29 @@ describe('session security', () => {
       issuers: [{ ...base.issuers[0], audience: ['audience', 1] as never }]
     })).toThrow(/audience/);
     expect(() => createOidcSessionSecurity({ ...base, issuers: null as never })).toThrow(/issuer/);
+    expect(() => createOidcSessionSecurity({
+      ...base,
+      authorise: () => false
+    } as never)).toThrow(/unknown field authorise/);
+    expect(() => createOidcSessionSecurity({
+      ...base,
+      dangerouslyAllowInsecureJwks: 'true'
+    } as never)).toThrow(/must be a boolean/);
+    expect(() => createOidcSessionSecurity({
+      ...base,
+      issuers: [{ ...base.issuers[0], algorithims: ['RS256'] }]
+    } as never)).toThrow(/unknown field algorithims/);
+    expect(() => createOidcSessionSecurity(Object.assign(
+      Object.create({}),
+      base
+    ) as never)).toThrow(/plain object/);
+    expect(() => createOidcSessionSecurity({
+      ...base,
+      issuers: [Object.assign(Object.create({}), base.issuers[0])]
+    } as never)).toThrow(/plain object/);
     expect(() => createSharedSecretSecurity(secret, { authorize: null as never })).toThrow(/authorize policy/);
+    expect(() => createSharedSecretSecurity(secret, { authorise: () => false } as never)).toThrow(/unknown field/);
+    expect(() => dangerouslyAllowInsecureSessions({ ttlMs: 60_000 } as never)).toThrow(/unknown field/);
   });
 
   it('binds shared-secret challenges to the nonce, protocol, and Iroh peer IDs', async () => {
@@ -148,6 +176,25 @@ describe('session security', () => {
       signal: new AbortController().signal
     });
     expect(() => authorizationAllowed(result)).toThrow(/invalid decision/);
+  });
+
+  it('denies shared-secret operations unless an authorization policy explicitly grants them', async () => {
+    const security = createSharedSecretSecurity('a'.repeat(32));
+    const result = await security.authorize({
+      principal: freezePrincipal({
+        id: 'principal',
+        subject: 'subject',
+        expiresAt: Date.now() + 60_000,
+        scopes: new Set(['p2prpc:*']),
+        claims: {}
+      }),
+      localPeerId: 'local',
+      remotePeerId: 'remote',
+      sessionId: 'session',
+      action: { kind: 'rpc', path: 'ping', type: 'query', headers: {} },
+      signal: new AbortController().signal
+    });
+    expect(result).toBe(false);
   });
 
   it('strictly verifies issuer, audience, scopes, expiry, and cnf.jkt peer binding', async () => {
@@ -497,7 +544,7 @@ describe('session security', () => {
       acceptUni: () => Promise.reject(new Error('unexpected acceptUni')),
       closed: () => new Promise(() => undefined),
       close: () => undefined,
-      stats: async () => ({ rttMs: null, sentBytes: 0, receivedBytes: 0, lostPackets: 0 }),
+      stats: async () => testConnectionStats(),
       configure: () => undefined
     };
 
@@ -522,8 +569,133 @@ describe('session security', () => {
     expect(observedAbort).toBe(true);
   });
 
+  it.each([
+    { side: 'client' as const, direction: 'outbound' as const },
+    { side: 'server' as const, direction: 'inbound' as const }
+  ])('does not let deferred $side stream cleanup extend the handshake timeout', async ({ side, direction }) => {
+    const resetStarted = deferredSignal();
+    const stopStarted = deferredSignal();
+    const releaseReset = deferredSignal();
+    const releaseStop = deferredSignal();
+    const never = new Promise<never>(() => undefined);
+    let resetCalls = 0;
+    let stopCalls = 0;
+    const stream: QuicBiStream = {
+      send: {
+        writeAll: () => never,
+        finish: () => never,
+        reset: async () => {
+          resetCalls += 1;
+          resetStarted.resolve();
+          await releaseReset.promise;
+        },
+        setPriority: () => never
+      },
+      recv: {
+        readExact: () => never,
+        expectEnd: () => never,
+        stop: async () => {
+          stopCalls += 1;
+          stopStarted.resolve();
+          await releaseStop.promise;
+        }
+      }
+    };
+    const connection = handshakeConnection(side, 'remote-peer', stream);
+    let settled = false;
+    const authentication = authenticateConnection(connection, direction, {
+      localPeerId: 'local-peer',
+      protocol: 'p2prpc/2/deferred-cleanup/1',
+      timeoutMs: 25,
+      maxSessionTtlMs: 60_000,
+      clockSkewMs: 30_000,
+      frameLimits: { maxControlFrameBytes: 1024 },
+      security: createSharedSecretSecurity('s'.repeat(32))
+    }).then(
+      () => { settled = true; throw new Error('unexpected authentication success'); },
+      (error: unknown) => { settled = true; return error; }
+    );
+
+    await Promise.all([resetStarted.promise, stopStarted.promise]);
+    await expect(authentication).resolves.toMatchObject({ code: 'TIMEOUT' });
+    expect(settled).toBe(true);
+    expect(resetCalls).toBe(1);
+    expect(stopCalls).toBe(1);
+
+    releaseReset.resolve();
+    releaseStop.resolve();
+    await Promise.resolve();
+    expect(resetCalls).toBe(1);
+    expect(stopCalls).toBe(1);
+  });
+
+  it('finishes and consumes both successful authentication stream halves exactly once', async () => {
+    const clientToServer = new HandshakePipe();
+    const serverToClient = new HandshakePipe();
+    const clientStream: QuicBiStream = { send: clientToServer, recv: serverToClient };
+    const serverStream: QuicBiStream = { send: serverToClient, recv: clientToServer };
+    const client = handshakeConnection('client', 'server-peer', clientStream);
+    const server = handshakeConnection('server', 'client-peer', serverStream);
+    const security = createSharedSecretSecurity('s'.repeat(32));
+    const common = {
+      protocol: 'p2prpc/2/stream-lifecycle/1',
+      timeoutMs: 1_000,
+      maxSessionTtlMs: 60_000,
+      clockSkewMs: 30_000,
+      frameLimits: { maxControlFrameBytes: 64 * 1024 },
+      security
+    } as const;
+
+    const [clientSession, serverSession] = await Promise.all([
+      authenticateConnection(client, 'outbound', { ...common, localPeerId: 'client-peer' }),
+      authenticateConnection(server, 'inbound', { ...common, localPeerId: 'server-peer' })
+    ]);
+
+    expect(clientSession.id).toBe(serverSession.id);
+    for (const pipe of [clientToServer, serverToClient]) {
+      expect(pipe.finishCalls).toBe(1);
+      expect(pipe.expectEndCalls).toBe(1);
+      expect(pipe.resetCalls).toBe(0);
+      expect(pipe.stopCalls).toBe(0);
+    }
+  });
+
+  it('rejects trailing authentication bytes before granting a session', async () => {
+    const clientToServer = new HandshakePipe(true);
+    const serverToClient = new HandshakePipe();
+    const client = handshakeConnection('client', 'server-peer', {
+      send: clientToServer,
+      recv: serverToClient
+    });
+    const server = handshakeConnection('server', 'client-peer', {
+      send: serverToClient,
+      recv: clientToServer
+    });
+    const security = createSharedSecretSecurity('s'.repeat(32));
+    const common = {
+      protocol: 'p2prpc/2/trailing-auth/1',
+      timeoutMs: 1_000,
+      maxSessionTtlMs: 60_000,
+      clockSkewMs: 30_000,
+      frameLimits: { maxControlFrameBytes: 64 * 1024 },
+      security
+    } as const;
+
+    const outcomes = await Promise.allSettled([
+      authenticateConnection(client, 'outbound', { ...common, localPeerId: 'client-peer' }),
+      authenticateConnection(server, 'inbound', { ...common, localPeerId: 'server-peer' })
+    ]);
+
+    expect(outcomes.every((outcome) => outcome.status === 'rejected')).toBe(true);
+    expect(clientToServer.expectEndCalls).toBe(1);
+    expect(clientToServer.stopCalls).toBeGreaterThan(0);
+    expect(serverToClient.resetCalls).toBeGreaterThan(0);
+  });
+
   it('applies configured control-frame limits to outbound handshake credentials', async () => {
     let writtenBytes = 0;
+    let resetCalls = 0;
+    let stopCalls = 0;
     const connection: QuicConnection = {
       remoteId: 'remote-peer',
       side: 'client',
@@ -531,12 +703,13 @@ describe('session security', () => {
         send: {
           writeAll: async (bytes: Uint8Array) => { writtenBytes += bytes.byteLength; },
           finish: async () => undefined,
-          reset: async () => undefined,
+          reset: async () => { resetCalls += 1; },
           setPriority: async () => undefined
         },
         recv: {
           readExact: async () => { throw new Error('handshake frame should be rejected before a read'); },
-          stop: async () => undefined
+          expectEnd: async () => { throw new Error('unexpected expectEnd'); },
+          stop: async () => { stopCalls += 1; }
         }
       }),
       acceptBi: () => Promise.reject(new Error('unexpected acceptBi')),
@@ -544,7 +717,7 @@ describe('session security', () => {
       acceptUni: () => Promise.reject(new Error('unexpected acceptUni')),
       closed: () => new Promise(() => undefined),
       close: () => undefined,
-      stats: async () => ({ rttMs: null, sentBytes: 0, receivedBytes: 0, lostPackets: 0 }),
+      stats: async () => testConnectionStats(),
       configure: () => undefined
     };
 
@@ -562,8 +735,122 @@ describe('session security', () => {
       }
     })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
     expect(writtenBytes).toBe(1);
+    expect(resetCalls).toBe(1);
+    expect(stopCalls).toBe(1);
   });
 });
+
+class HandshakePipe implements QuicSendStream, QuicRecvStream {
+  finishCalls = 0;
+  expectEndCalls = 0;
+  resetCalls = 0;
+  stopCalls = 0;
+  private readonly bytes: number[] = [];
+  private readonly waiters: Array<() => void> = [];
+  private ended = false;
+
+  constructor(private readonly appendTrailingByteOnFinish = false) {}
+
+  async writeAll(data: Uint8Array): Promise<void> {
+    this.bytes.push(...data);
+    this.wake();
+  }
+
+  async readExact(size: number): Promise<Uint8Array> {
+    while (this.bytes.length < size) {
+      if (this.ended) throw new Error('EOF');
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    return Uint8Array.from(this.bytes.splice(0, size));
+  }
+
+  async finish(): Promise<void> {
+    this.finishCalls += 1;
+    if (this.appendTrailingByteOnFinish) this.bytes.push(0xff);
+    this.ended = true;
+    this.wake();
+  }
+
+  async expectEnd(): Promise<void> {
+    this.expectEndCalls += 1;
+    while (!this.ended && this.bytes.length === 0) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    if (!this.ended || this.bytes.length !== 0) throw new Error('Expected clean EOF');
+  }
+
+  async reset(): Promise<void> {
+    this.resetCalls += 1;
+    this.ended = true;
+    this.wake();
+  }
+
+  async stop(): Promise<void> {
+    this.stopCalls += 1;
+    this.ended = true;
+    this.wake();
+  }
+
+  async setPriority(): Promise<void> {}
+
+  private wake(): void {
+    for (const waiter of this.waiters.splice(0)) waiter();
+  }
+}
+
+function handshakeConnection(side: 'client' | 'server', remoteId: string, stream: QuicBiStream): QuicConnection {
+  return {
+    remoteId,
+    side,
+    openBi: async () => {
+      if (side !== 'client') throw new Error('unexpected openBi');
+      return stream;
+    },
+    acceptBi: async () => {
+      if (side !== 'server') throw new Error('unexpected acceptBi');
+      return stream;
+    },
+    openUni: () => Promise.reject(new Error('unexpected openUni')),
+    acceptUni: () => Promise.reject(new Error('unexpected acceptUni')),
+    closed: () => new Promise(() => undefined),
+    close: () => undefined,
+    stats: async () => testConnectionStats(),
+    configure: () => undefined
+  };
+}
+
+function testConnectionStats(): ConnectionStats {
+  return {
+    connectionId: 'test-connection',
+    rttMs: null,
+    sentBytes: 0,
+    receivedBytes: 0,
+    lostPackets: 0,
+    sentPackets: 0,
+    congestionWindow: null,
+    relay: null,
+    relayUrl: null,
+    paths: [],
+    streams: {
+      openedBi: 0,
+      acceptedBi: 0,
+      openedUni: 0,
+      acceptedUni: 0,
+      activeSend: 0,
+      activeRecv: 0,
+      sendFinished: 0,
+      sendReset: 0,
+      recvEof: 0,
+      recvStopped: 0
+    }
+  };
+}
+
+function deferredSignal(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
 
 function emptyManifest() {
   return { transferId: 'transfer', name: 'empty', size: 0, digest: '0'.repeat(64), chunkSize: 64 * 1024, chunkCount: 0 };

@@ -74,6 +74,23 @@ interface NormalizedIssuer {
 export function createOidcSessionSecurity<TFileMetadata = unknown>(
   options: OidcSessionSecurityOptions<TFileMetadata>
 ): SessionSecurity<TFileMetadata> {
+  validateOptions(
+    options,
+    [
+      'issuers',
+      'getAccessToken',
+      'requiredConnectionScopes',
+      'peerBinding',
+      'bindPrincipalToPeer',
+      'tenantClaim',
+      'clockToleranceSeconds',
+      'maxTokenAge',
+      'acceptedTokenTypes',
+      'authorize',
+      'dangerouslyAllowInsecureJwks'
+    ],
+    'OIDC session security options'
+  );
   if (typeof options.getAccessToken !== 'function') {
     throw new P2PError('UNAUTHORIZED', 'OIDC access-token provider must be a function');
   }
@@ -82,6 +99,12 @@ export function createOidcSessionSecurity<TFileMetadata = unknown>(
   }
   if (options.authorize !== undefined && typeof options.authorize !== 'function') {
     throw new P2PError('UNAUTHORIZED', 'OIDC authorize policy must be a function');
+  }
+  if (
+    options.dangerouslyAllowInsecureJwks !== undefined &&
+    typeof options.dangerouslyAllowInsecureJwks !== 'boolean'
+  ) {
+    throw new P2PError('UNAUTHORIZED', 'dangerouslyAllowInsecureJwks must be a boolean');
   }
   const getAccessToken = options.getAccessToken;
   const bindPrincipalToPeer = options.bindPrincipalToPeer;
@@ -375,6 +398,14 @@ function normalizeIssuers<TFileMetadata>(options: OidcSessionSecurityOptions<TFi
   }
   const output = new Map<string, NormalizedIssuer>();
   for (const configuration of options.issuers) {
+    validateOptions(
+      configuration,
+      ['issuer', 'audience', 'algorithms', 'jwksUri', 'verificationKey'],
+      'OIDC issuer configuration'
+    );
+    if (typeof configuration.issuer !== 'string') {
+      throw new P2PError('UNAUTHORIZED', 'OIDC issuer must be a string');
+    }
     const issuerUrl = validHttpsUrl(configuration.issuer, options.dangerouslyAllowInsecureJwks === true, 'issuer');
     if (issuerUrl.search) throw new P2PError('UNAUTHORIZED', 'OIDC issuer must not contain a query');
     const issuer = configuration.issuer;
@@ -490,4 +521,17 @@ function safeEqual(left: string, right: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validateOptions(value: unknown, allowed: readonly string[], label: string): void {
+  if (!isRecord(value)) throw new P2PError('INVALID_FRAME', `${label} must be a plain object`);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new P2PError('INVALID_FRAME', `${label} must be a plain object`);
+  }
+  const allowedKeys = new Set(allowed);
+  const unknown = Object.keys(value).find((key) => !allowedKeys.has(key));
+  if (unknown !== undefined) {
+    throw new P2PError('INVALID_FRAME', `${label} contains unknown field ${unknown}`);
+  }
 }

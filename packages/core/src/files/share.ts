@@ -80,9 +80,14 @@ export class ShareRegistry<TMetadata = unknown> {
   private readonly now: () => number;
 
   constructor(options: ShareRegistryOptions = {}) {
-    if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    if (!isPlainObject(options)) {
       throw new P2PError('INVALID_FRAME', 'Shared file registry options must be an object');
     }
+    assertOnlyKeys(
+      options,
+      ['defaultTtlMs', 'maxTtlMs', 'reconnectLeaseMs', 'maxReconnects', 'maxEntries', 'now'],
+      'Shared file registry options'
+    );
     this.defaultTtlMs = validateDuration(
       options.defaultTtlMs === undefined ? 5 * 60_000 : options.defaultTtlMs,
       'default share lifetime'
@@ -275,9 +280,14 @@ export class ShareRegistry<TMetadata = unknown> {
 }
 
 function normalizePolicy(policy: SharePolicy, now: number, defaultTtlMs: number, maxTtlMs: number): NormalizedSharePolicy {
-  if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) {
+  if (!isPlainObject(policy)) {
     throw new P2PError('INVALID_FRAME', 'Shared file policy must be an object');
   }
+  assertOnlyKeys(
+    policy,
+    ['expiresAt', 'allowedPrincipals', 'allowedSubjects', 'maxDownloads', 'allowedPeerIds', 'allowBearer'],
+    'Shared file policy'
+  );
   const peers = policy.allowedPeerIds;
   let allowedPeerIds: ReadonlySet<string> | undefined;
   if (peers !== undefined) {
@@ -346,12 +356,30 @@ function validPrincipalId(value: string): boolean {
 }
 
 function validFilePrincipal(value: FilePrincipalIdentity): boolean {
-  return typeof value === 'object' && value !== null &&
+  return isPlainObject(value) &&
+    hasOnlyKeys(value, ['id', 'subject', 'issuer', 'clientId', 'tenantId']) &&
     validPrincipalId(value.id) &&
     validSubject(value.subject) &&
     (value.issuer === undefined || validPrincipalField(value.issuer, 4096)) &&
     (value.clientId === undefined || validPrincipalField(value.clientId, 2048)) &&
     (value.tenantId === undefined || validPrincipalField(value.tenantId, 2048));
+}
+
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasOnlyKeys(value: object, allowed: readonly string[]): boolean {
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key) => keys.has(key));
+}
+
+function assertOnlyKeys(value: object, allowed: readonly string[], label: string): void {
+  if (!hasOnlyKeys(value, allowed)) {
+    throw new P2PError('INVALID_FRAME', `${label} contains an unknown field`);
+  }
 }
 
 function validPrincipalField(value: unknown, maximumBytes: number): value is string {

@@ -4,8 +4,10 @@ export type {
   P2PNodeLimits,
   P2PNodeOptions,
   PeerContext,
+  PeerDiagnostics,
   PeerFiles,
   PeerIdentity,
+  PeerLocator,
   PrincipalMatcher,
   ProtocolIdentity,
   SecurityAuditEvent
@@ -16,6 +18,7 @@ export { fileDestination, fileSource } from './files/fs.js';
 export type { FileDestinationOptions } from './files/fs.js';
 export { ShareRegistry } from './files/share.js';
 export type { ShareRegistryOptions } from './files/share.js';
+export type { FileTransferDiagnostics } from './files/manager.js';
 export type { FileTransferLimits } from './files/validation.js';
 export { Transfer } from './files/transfer.js';
 export type {
@@ -52,5 +55,16 @@ export type {
   SessionPrincipal,
   SessionSecurity
 } from './security/types.js';
-export type { IrohEndpointOptions } from './transport/iroh.js';
-export type { ConnectionStats } from './transport/types.js';
+export type {
+  IrohDiscoveryConfiguration,
+  IrohEndpointOptions,
+  IrohRelayConfiguration
+} from './transport/iroh.js';
+export type {
+  ConnectionPath,
+  ConnectionStats,
+  EndpointDiagnostics,
+  EndpointDiscoveryEvent,
+  EndpointDiscoveryOptions,
+  StreamLifecycleStats
+} from './transport/types.js';

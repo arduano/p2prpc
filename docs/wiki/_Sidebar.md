@@ -5,4 +5,5 @@
 - [Security model](Security-Model.md)
 - [File transfers](File-Transfers.md)
 - [Audit guide](Audit-Guide.md)
+- [Production validation](Production-Validation.md)
 - [Full security policy](../../SECURITY.md)

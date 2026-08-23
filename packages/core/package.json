@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@momics/iroh-http-node": "0.6.0",
+    "@momics/iroh-http-shared": "0.6.1",
     "@napi-rs/blake-hash": "1.3.6",
     "@trpc/client": ">=11.0.0 <12",
     "@trpc/server": ">=11.0.0 <12",

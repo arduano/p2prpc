@@ -184,6 +184,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(options: IrohLinkOptions
               if (op.type !== 'subscription' && !hasUnaryResult) {
                 throw new P2PError('INVALID_FRAME', 'Unary RPC completed without a result');
               }
+              await io(() => stream!.recv.expectEnd(), 'RPC response finish timed out');
               active = false;
               removeAbortListener();
               await cleanup(stream, 'terminal');
@@ -195,6 +196,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(options: IrohLinkOptions
             } else if (frame.kind === RpcFrameKind.Error) {
               const failure = frame.value as RpcFailure;
               if (failure.id !== op.id) throw new P2PError('INVALID_FRAME', 'RPC error ID does not match request');
+              await io(() => stream!.recv.expectEnd(), 'RPC response finish timed out');
               const message = readErrorMessage(failure.shape);
               active = false;
               removeAbortListener();

@@ -22,19 +22,19 @@ const receiver = await createP2PNode({
   security: dangerouslyAllowInsecureSessions(),
   createContext: (context) => context,
   onIncomingFile: (offer) => offer.accept(fileDestination(join(directory, 'received.bin'), { overwrite: true })),
-  iroh: { relayMode: 'disabled' }
+  iroh: { relay: { mode: 'disabled' } }
 });
 const sender = await createP2PNode({
   router,
   protocol: { applicationId: 'benchmark', contractVersion: '1' },
   security: dangerouslyAllowInsecureSessions(),
   createContext: (context) => context,
-  iroh: { relayMode: 'disabled' }
+  iroh: { relay: { mode: 'disabled' } }
 });
 
 try {
   const peer = await sender.connect<typeof router>({
-    ticket: receiver.ticket(),
+    locator: { kind: 'ticket', ticket: await receiver.createTicket() },
     expectedPeerId: receiver.id,
     expectedPrincipal: {
       id: receiver.id,

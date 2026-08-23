@@ -14,6 +14,7 @@ import type {
   QuicBiStream,
   QuicConnection,
   QuicEndpoint,
+  EndpointLocator,
   QuicRecvStream,
   QuicSendStream
 } from '../src/transport/types.js';
@@ -217,7 +218,85 @@ describe('node security boundaries', () => {
         ...connectTarget(endpoint.address.ticket),
         expectedPrinciple: connectTarget(endpoint.address.ticket).expectedPrincipal
       } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      await expect(node.connect({
+        locator: { kind: 'dns' },
+        expectedPrincipal: connectTarget(endpoint.address.ticket).expectedPrincipal
+      } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      await expect(node.connect({
+        locator: { kind: 'dns' },
+        expectedPeerId: 'remote'
+      } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      await expect(node.connect({
+        ...connectTarget(endpoint.address.ticket),
+        locator: { kind: 'dns' }
+      } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
       expect(endpoint.connectCalls).toBe(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it.each([
+    { kind: 'ticket', ticket: 'signed-ticket' } as const,
+    { kind: 'dns' } as const,
+    { kind: 'mdns', serviceName: 'corp-p2prpc' } as const
+  ])('normalizes and snapshots the $kind locator without deriving trust from discovery', async (locator) => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new LocatorEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('locator-session', 'oauth-client-a');
+    const target: ConnectOptions = {
+      locator,
+      expectedPeerId: 'remote',
+      expectedPrincipal: connectTarget('unused').expectedPrincipal
+    };
+
+    try {
+      await node.connect(target);
+      expect(endpoint.legacyConnectCalls).toBe(0);
+      expect(endpoint.locators).toEqual([locator]);
+      expect(endpoint.expectedPeerIds).toEqual(['remote']);
+      expect(Object.isFrozen(endpoint.locators[0])).toBe(true);
+      expect(endpoint.signals[0]).toBeInstanceOf(AbortSignal);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects malformed locator variants before discovery or dialing', async () => {
+    const endpoint = new LocatorEndpoint(new AdmissionConnection(false));
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const principal = connectTarget('unused').expectedPrincipal;
+
+    try {
+      for (const locator of [
+        { kind: 'ticket' },
+        { kind: 'ticket', ticket: 'ticket', peerId: 'discovery-must-not-authorize' },
+        { kind: 'dns', ticket: 'unexpected' },
+        { kind: 'mdns', serviceName: '_invalid._udp' },
+        { kind: 'mdns', serviceName: 'valid', principal: 'untrusted' },
+        { kind: 'unknown' }
+      ]) {
+        await expect(node.connect({
+          locator,
+          expectedPeerId: 'remote',
+          expectedPrincipal: principal
+        } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+      }
+      expect(endpoint.locators).toHaveLength(0);
     } finally {
       await node.close();
     }
@@ -237,6 +316,33 @@ describe('node security boundaries', () => {
       }
     })).rejects.toThrow(/preAuthorizePeer/);
     expect(factoryCalled).toBe(false);
+  });
+
+  it('rejects unknown and inherited node, protocol, and limit options before endpoint startup', async () => {
+    let factoryCalls = 0;
+    const base = {
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => {
+        factoryCalls += 1;
+        return new AdmissionEndpoint(new AdmissionConnection());
+      }
+    };
+    const malformed = [
+      { ...base, preAuthorisePeer: () => true },
+      { ...base, protocol: { ...base.protocol, contractVerison: '2' } },
+      { ...base, limits: { handshakeTimoutMs: 1 } },
+      Object.assign(Object.create({ inherited: true }), base),
+      { ...base, protocol: Object.assign(Object.create({}), base.protocol) },
+      { ...base, limits: Object.assign(Object.create({}), { handshakeTimeoutMs: 1_000 }) }
+    ];
+
+    for (const options of malformed) {
+      await expect(createP2PNode(options as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    }
+    expect(factoryCalls).toBe(0);
   });
 
   it('snapshots security methods so later configuration-object mutation cannot widen access', async () => {
@@ -285,10 +391,291 @@ describe('node security boundaries', () => {
       { relayUrls: null },
       { relayUrls: [] },
       { relayUrls: ['http://relay.example'] },
-      { relayUrls: ['https://relay.example'], allowRelayUrl: () => undefined },
-      { allowRelayUrl: () => true }
+      { relayUrls: ['https://relay.example'], allowRelayUrl: () => undefined }
     ]) {
       await expect(IrohEndpoint.create(alpn, options as never)).rejects.toBeInstanceOf(P2PError);
+    }
+  });
+
+  it('rejects unknown or malformed nested Iroh configuration fields', async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/test/1');
+    for (const options of [
+      { relay: { mode: 'disabled', urls: ['https://relay.example'] } },
+      { relay: { mode: 'custom', urls: ['https://relay.example'], fallback: true } },
+      { discovery: { dns: { serverUrl: 'https://dns.example', cache: true } } },
+      { discovery: { mdns: { serviceName: 'p2prpc', advertise: true, browse: true } } },
+      { discovery: { dns: { serverUrl: 'http://dns.example' } } },
+      { discovery: { dns: { serverUrl: 'https://user@dns.example' } } }
+    ]) {
+      await expect(IrohEndpoint.create(alpn, options as never)).rejects.toBeInstanceOf(P2PError);
+    }
+  });
+
+  it('fails DNS discovery closed when resolved routes cannot be checked by application egress policy', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/dns-policy/1');
+    await expect(IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { dns: true },
+      allowDirectAddress: () => true
+    })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+  });
+
+  it('enforces relay mode on signed ticket route hints', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/ticket-relay-egress/1');
+    const issuer = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
+    const customReceiver = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'custom', urls: ['https://RELAY.example:443'] },
+      allowRelayUrl: () => true
+    });
+    const disabledReceiver = await IrohEndpoint.create(alpn, { relay: { mode: 'disabled' } });
+    const issuerInternal = issuer as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    const customInternal = customReceiver as unknown as {
+      resolveLocator(locator: EndpointLocator, expectedPeerId: string): Promise<{ relayUrl: string | null }>;
+    };
+    const disabledInternal = disabledReceiver as unknown as typeof customInternal;
+    let relayUrl = 'https://outside.example/';
+    issuerInternal.node.discoveryInfo = async () => ({
+      nodeId: issuer.id,
+      directAddress: null,
+      directAddresses: [],
+      relayUrl
+    });
+
+    try {
+      const outsideTicket = await issuer.createTicket();
+      await expect(customInternal.resolveLocator(
+        { kind: 'ticket', ticket: outsideTicket },
+        issuer.id
+      )).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+
+      relayUrl = 'https://relay.example/';
+      const configuredTicket = await issuer.createTicket();
+      await expect(customInternal.resolveLocator(
+        { kind: 'ticket', ticket: configuredTicket },
+        issuer.id
+      )).resolves.toMatchObject({ relayUrl: 'https://relay.example/' });
+
+      await expect(disabledInternal.resolveLocator(
+        { kind: 'ticket', ticket: configuredTicket },
+        issuer.id
+      )).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    } finally {
+      await Promise.all([issuer.close(), customReceiver.close(), disabledReceiver.close()]);
+    }
+  });
+
+  it('canonicalizes custom relay origins and rejects equivalent duplicates before startup', async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/relay-origin-canonicalization/1');
+    await expect(IrohEndpoint.create(alpn, {
+      relay: {
+        mode: 'custom',
+        urls: ['https://RELAY.example:443', 'https://relay.example/']
+      }
+    })).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+  });
+
+  it('defaults mDNS direct hints to LAN address ranges, including scoped IPv6', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/mdns-lan-egress/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { mdns: { serviceName: 'lan-egress', advertise: false } }
+    });
+    const broadEndpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { mdns: { serviceName: 'lan-egress', advertise: false } },
+      allowDirectAddress: () => true
+    });
+    type MdnsDirectInternal = {
+      node: { browsePeers(): AsyncIterable<{ nodeId: string; addrs: string[]; isActive: boolean }> };
+      resolveLocator(locator: EndpointLocator, expectedPeerId: string): Promise<{ directAddresses: string[] }>;
+    };
+    const internal = endpoint as unknown as MdnsDirectInternal;
+    const broadInternal = broadEndpoint as unknown as MdnsDirectInternal;
+    const setAddresses = (target: MdnsDirectInternal, peerId: string, addrs: string[]): void => {
+      target.node.browsePeers = () => ({
+        async *[Symbol.asyncIterator]() {
+          yield { nodeId: peerId, addrs, isActive: true };
+        }
+      });
+    };
+
+    try {
+      const lanAddresses = [
+        '10.0.0.1:4433',
+        '172.16.0.1:4433',
+        '192.168.1.1:4433',
+        '169.254.2.3:4433',
+        '127.0.0.1:4433',
+        '[fd12:3456::1]:4433',
+        '[fe80::1%en0]:4433',
+        '[::1]:4433'
+      ];
+      setAddresses(internal, endpoint.id, lanAddresses);
+      await expect(internal.resolveLocator(
+        { kind: 'mdns', serviceName: 'lan-egress' }, endpoint.id
+      )).resolves.toMatchObject({ directAddresses: lanAddresses });
+
+      setAddresses(internal, endpoint.id, ['203.0.113.10:4433']);
+      await expect(internal.resolveLocator(
+        { kind: 'mdns', serviceName: 'lan-egress' }, endpoint.id
+      )).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+
+      setAddresses(broadInternal, broadEndpoint.id, ['203.0.113.10:4433']);
+      await expect(broadInternal.resolveLocator(
+        { kind: 'mdns', serviceName: 'lan-egress' }, broadEndpoint.id
+      )).resolves.toMatchObject({ directAddresses: ['203.0.113.10:4433'] });
+    } finally {
+      await Promise.all([endpoint.close(), broadEndpoint.close()]);
+    }
+  });
+
+  it('requires explicit authorization for default-relay mDNS hints and custom membership always wins', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/mdns-relay-egress/1');
+    const disabledEndpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { mdns: { serviceName: 'relay-egress', advertise: false } }
+    });
+    const defaultEndpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      discovery: { mdns: { serviceName: 'relay-egress', advertise: false } }
+    });
+    const authorizedDefaultEndpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      discovery: { mdns: { serviceName: 'relay-egress', advertise: false } },
+      allowRelayUrl: () => true
+    });
+    const customEndpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'custom', urls: ['https://approved.example/'] },
+      discovery: { mdns: { serviceName: 'relay-egress', advertise: false } },
+      allowRelayUrl: () => true
+    });
+    type MdnsRelayInternal = {
+      node: { browsePeers(): AsyncIterable<{ nodeId: string; addrs: string[]; isActive: boolean }> };
+      resolveLocator(locator: EndpointLocator, expectedPeerId: string): Promise<{ relayUrl: string | null }>;
+    };
+    const setRelay = (endpoint: IrohEndpoint, value: string): MdnsRelayInternal => {
+      const internal = endpoint as unknown as MdnsRelayInternal;
+      internal.node.browsePeers = () => ({
+        async *[Symbol.asyncIterator]() {
+          yield { nodeId: endpoint.id, addrs: [value], isActive: true };
+        }
+      });
+      return internal;
+    };
+    const resolve = (endpoint: IrohEndpoint, internal: MdnsRelayInternal) => internal.resolveLocator(
+      { kind: 'mdns', serviceName: 'relay-egress' }, endpoint.id
+    );
+
+    try {
+      const disabled = setRelay(disabledEndpoint, 'https://relay.example/');
+      await expect(resolve(disabledEndpoint, disabled)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+
+      const implicitDefault = setRelay(defaultEndpoint, 'https://relay.example/');
+      await expect(resolve(defaultEndpoint, implicitDefault)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+
+      const explicitDefault = setRelay(authorizedDefaultEndpoint, 'https://relay.example/');
+      await expect(resolve(authorizedDefaultEndpoint, explicitDefault))
+        .resolves.toMatchObject({ relayUrl: 'https://relay.example/' });
+
+      const outsideCustom = setRelay(customEndpoint, 'https://relay.example/');
+      await expect(resolve(customEndpoint, outsideCustom)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      const configuredCustom = setRelay(customEndpoint, 'https://approved.example/');
+      await expect(resolve(customEndpoint, configuredCustom))
+        .resolves.toMatchObject({ relayUrl: 'https://approved.example/' });
+    } finally {
+      await Promise.all([
+        disabledEndpoint.close(),
+        defaultEndpoint.close(),
+        authorizedDefaultEndpoint.close(),
+        customEndpoint.close()
+      ]);
+    }
+  });
+
+  it('caps aggregate mDNS route candidates before dialing', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/mdns-candidate-cap/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { mdns: { serviceName: 'candidate-cap', advertise: false } }
+    });
+    const internal = endpoint as unknown as {
+      node: {
+        browsePeers(): AsyncIterable<{
+          nodeId: string;
+          addrs: string[];
+          isActive: boolean;
+        }>;
+      };
+      resolveLocator(
+        locator: EndpointLocator,
+        expectedPeerId: string
+      ): Promise<{ directAddresses: string[]; relayUrl: string | null }>;
+    };
+    internal.node.browsePeers = () => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          nodeId: endpoint.id,
+          addrs: Array.from({ length: 33 }, (_, index) => `127.0.0.1:${4_000 + index}`),
+          isActive: true
+        };
+      }
+    });
+
+    try {
+      await expect(internal.resolveLocator(
+        { kind: 'mdns', serviceName: 'candidate-cap' },
+        endpoint.id
+      )).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  it('creates fresh signed tickets from all current IPv4 and IPv6 route candidates', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/fresh-ticket/1');
+    const endpoint = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
+    const internal = endpoint as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    let generation = 0;
+    internal.node.discoveryInfo = async () => {
+      generation += 1;
+      return {
+        nodeId: endpoint.id,
+        directAddress: `192.0.2.${generation}:4433`,
+        directAddresses: [`192.0.2.${generation}:4433`, `[2001:db8::${generation}]:4433`],
+        relayUrl: `https://relay-${generation}.example/`
+      };
+    };
+    try {
+      const first = decodeTicketBody(await endpoint.createTicket());
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      const second = decodeTicketBody(await endpoint.createTicket());
+
+      expect(generation).toBe(2);
+      expect(first.directAddresses).toEqual(['192.0.2.1:4433', '[2001:db8::1]:4433']);
+      expect(first.relayUrl).toBe('https://relay-1.example/');
+      expect(second.directAddresses).toEqual(['192.0.2.2:4433', '[2001:db8::2]:4433']);
+      expect(second.relayUrl).toBe('https://relay-2.example/');
+      expect(second.issuedAt).toBeGreaterThan(first.issuedAt);
+    } finally {
+      await endpoint.close();
     }
   });
 
@@ -758,6 +1145,40 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('reports quiescent peer transfer diagnostics without exposing mutable manager state', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('diagnostic-session', 'oauth-client-a');
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const diagnostics = await peer.diagnostics();
+      expect(diagnostics).toMatchObject({
+        sessionId: 'diagnostic-session',
+        connection: { sentBytes: 0, receivedBytes: 0, lostPackets: 0 },
+        files: {
+          activeTransfers: 0,
+          queuedTransfers: 0,
+          incomingSessions: 0,
+          reservedSessions: 0,
+          activeLanes: 0
+        }
+      });
+      expect(Object.isFrozen(diagnostics)).toBe(true);
+      expect(Object.isFrozen(diagnostics.files)).toBe(true);
+    } finally {
+      await node.close();
+    }
+  });
+
   it('aborts the exact file context on connection closure and session expiry', async () => {
     const closedConnection = new AdmissionConnection(false, 'remote-closed');
     const expiringConnection = new AdmissionConnection(false, 'remote-expiring');
@@ -1043,6 +1464,54 @@ function connectTarget(ticket: string, expectedPeerId = 'remote'): ConnectOption
   };
 }
 
+function decodeTicketBody(ticket: string): {
+  readonly directAddresses: string[];
+  readonly relayUrl: string | null;
+  readonly issuedAt: number;
+} {
+  const [, body] = ticket.split('.');
+  if (!body) throw new Error('Ticket body is missing');
+  return JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as {
+    directAddresses: string[];
+    relayUrl: string | null;
+    issuedAt: number;
+  };
+}
+
+class LocatorEndpoint implements QuicEndpoint {
+  readonly id = 'local';
+  readonly address = { id: this.id, ticket: 'locator-ticket' };
+  readonly locators: EndpointLocator[] = [];
+  readonly expectedPeerIds: string[] = [];
+  readonly signals: Array<AbortSignal | undefined> = [];
+  legacyConnectCalls = 0;
+
+  constructor(private readonly connection: QuicConnection) {}
+
+  async connect(): Promise<QuicConnection> {
+    this.legacyConnectCalls += 1;
+    throw new Error('Legacy ticket dialing must not be used');
+  }
+
+  async connectLocator(
+    locator: EndpointLocator,
+    _alpn: Uint8Array,
+    expectedPeerId: string,
+    signal?: AbortSignal
+  ): Promise<QuicConnection> {
+    this.locators.push(locator);
+    this.expectedPeerIds.push(expectedPeerId);
+    this.signals.push(signal);
+    return this.connection;
+  }
+
+  async accept(): Promise<null> {
+    return null;
+  }
+
+  async close(): Promise<void> {}
+}
+
 class AdmissionEndpoint implements QuicEndpoint {
   readonly id = 'local';
   readonly address = { id: this.id, ticket: 'admission-ticket' };
@@ -1165,6 +1634,13 @@ class AsyncPipe implements QuicSendStream, QuicRecvStream {
   async finish(): Promise<void> {
     this.ended = true;
     for (const waiter of this.waiters.splice(0)) waiter();
+  }
+
+  async expectEnd(): Promise<void> {
+    while (!this.ended && this.bytes.length === 0) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    if (!this.ended || this.bytes.length !== 0) throw new Error('Expected clean EOF');
   }
 
   async reset(): Promise<void> {

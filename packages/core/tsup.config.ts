@@ -7,5 +7,5 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   treeshake: true,
-  external: ['@momics/iroh-http-node']
+  external: ['@momics/iroh-http-node', '@momics/iroh-http-shared']
 });

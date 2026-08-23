@@ -1,6 +1,6 @@
 # Security model
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md)
+[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md) · [Validation](Production-Validation.md)
 
 ## Security objective
 
@@ -12,7 +12,8 @@ The model assumes the network, routes, remote endpoint, RPC metadata/input, mani
 
 ```text
 outbound: validate + snapshot independently trusted target expectations
-  → verify signed locator and require locator peer ID == expected peer ID
+  → resolve explicit ticket, DNS/PKARR, or mDNS locator for expected peer ID
+  → for tickets, require signed locator peer ID == expected peer ID
   → egress checks, then native dial
   → encrypted endpoint-key-authenticated QUIC
   → require connected endpoint ID == expected peer ID
@@ -25,7 +26,7 @@ outbound: validate + snapshot independently trusted target expectations
   → tRPC dispatch, file offer, or capability lookup
 ```
 
-Inbound connections enter at the QUIC step; they do not present a locator ticket or caller-supplied outbound target expectations. For an outbound connection, locator/connected-endpoint mismatches and endpoint-admission rejection occur before `SessionSecurity.getCredential` is called. The principal check occurs immediately after mutual authentication and before the peer runtime is installed, returned, or exposed through `onPeer`.
+Inbound connections enter at the QUIC step; they do not present a locator or caller-supplied outbound target expectations. For an outbound connection, locator resolution/binding, connected-endpoint mismatches, and endpoint-admission rejection occur before `SessionSecurity.getCredential` is called. The principal check occurs immediately after mutual authentication and before the peer runtime is installed, returned, or exposed through `onPeer`.
 
 Failure at any step is fail-closed. In particular, file pull authorization receives only a non-secret capability hash and runs before registry lookup, reducing capability-oracle behavior.
 
@@ -37,7 +38,7 @@ Outbound callers must supply a locator and two expectations obtained from a trus
 
 ```ts
 await node.connect<RemoteRouter>({
-  ticket,
+  locator: { kind: 'ticket', ticket },
   expectedPeerId,
   expectedPrincipal: {
     subject,
@@ -64,7 +65,11 @@ const expectedPrincipal = {
 };
 ```
 
+The shared-secret helper denies every RPC and file action unless its `authorize` callback explicitly allows it. `authorize: () => true` is a coarse all-holders policy suitable only when possession of the provisioned secret is intentionally the complete authorization boundary; production services should inspect the verified principal and requested action.
+
 The locator remains untrusted routing material for target-selection purposes. Supplying expectations copied only from an attacker-supplied locator defeats the independent binding; production callers should resolve the expected endpoint/principal tuple from an authenticated directory, enrollment record, or similarly trusted bootstrap channel.
+
+The three locator forms are explicit and closed: a signed ticket, Iroh DNS/PKARR lookup, or LAN mDNS browse. They select the initial route strategy, not an exclusive native route source. Node configuration must enable DNS, and doing so installs an endpoint-wide Iroh lookup that may be used after ticket or mDNS hints fail. An mDNS locator explicitly browses, while node-level mDNS configuration controls its default service and automatic advertisement. The locator never chooses relay policy or supplies identity expectations. A signed ticket can be freshly generated with `createTicket()`, which samples current addresses and home relay before signing.
 
 ## OAuth/OIDC without HTTP
 
@@ -80,13 +85,13 @@ Default operation scopes are `p2prpc:rpc`, `p2prpc:rpc:<path>`, `p2prpc:file:pus
 
 ### Bootstrap caveat
 
-The initiator sends its credential only after the signed locator and connected transport endpoint match `expectedPeerId`, and after `preAuthorizePeer` accepts the endpoint. However, the remote application principal cannot be known until that credential exchange completes. An `expectedPrincipal` mismatch therefore rejects the connection before peer installation but may occur after the initiator has disclosed its credential to the expected endpoint key.
+The initiator sends its credential only after route resolution and the connected transport endpoint match `expectedPeerId`, and after `preAuthorizePeer` accepts the endpoint. However, the remote application principal cannot be known until that credential exchange completes. An `expectedPrincipal` mismatch therefore rejects the connection before peer installation but may occur after the initiator has disclosed its credential to the expected endpoint key.
 
 This ordering is an unavoidable bootstrap limit, not principal preauthentication. Use short-lived, audience-specific and preferably endpoint-key-bound tokens; obtain the complete endpoint/principal expectation from a trusted directory; and use `preAuthorizePeer` when an endpoint-key allow-list is available. Direct-address and relay callbacks remain the pre-dial egress controls.
 
 ## Other `SessionSecurity` modes
 
-Shared-secret mode uses an HMAC challenge over the fresh nonce and endpoint tuple. It proves possession of one group secret, creates a principal whose ID/subject is the endpoint ID and whose scope is `p2prpc:*`, and allows every operation unless its optional policy narrows access. It does not distinguish users or tenants. A custom `SessionSecurity` defines the system's actual credential, principal, and authorization strength and must be audited as part of the trusted computing base.
+Shared-secret mode uses an HMAC challenge over the fresh nonce and endpoint tuple. It creates a principal whose ID/subject is the endpoint ID and whose scope is `p2prpc:*`; the secret proves group membership but does not distinguish users or tenants, so the explicit policy remains the authorization boundary. A custom `SessionSecurity` defines the system's actual credential, principal, and authorization strength and must be audited as part of the trusted computing base.
 
 `dangerouslyAllowInsecureSessions()` is an explicit test/development escape hatch with a public fixed credential and allow-all policy. It nullifies the application-authentication objective and must be rejected by production configuration and review.
 
@@ -118,7 +123,9 @@ Data lanes do not perform a new OIDC exchange. They inherit the exact mutually a
 - Session replacement, expiry, close, shutdown, and active capability revocation propagate cancellation.
 - Remote error shapes omit stacks, custom formatter data, and internal messages; public text is sanitized and bounded.
 - Structured security events contain identifiers and decisions, not credentials or capability tokens.
-- Signed route candidates are the only dial targets; implicit DNS/mDNS discovery is disabled and egress callbacks can restrict direct/relay destinations.
+- Every dial starts from an explicit locator. DNS/PKARR is disabled until configured; once enabled, it is an endpoint-wide native fallback and can supplement ticket or mDNS hints. mDNS browsing starts only when selected by a locator or explicit browse API. Every resolved path remains subordinate to the independently trusted expected endpoint/principal.
+- On a DNS-disabled endpoint, signed-ticket and mDNS routes pass through direct/relay egress callbacks. Enabling DNS with either callback fails closed because the pinned wrapper cannot expose DNS-resolved candidates before dial. mDNS defaults to private/link-local/loopback direct addresses; a callback can explicitly broaden them. Use distinct endpoints when route-source isolation is required.
+- Relay configuration is explicit: default, custom HTTPS URLs, or disabled. Default-network mDNS relay hints require an explicit callback. Custom ticket/mDNS hints must belong to configured canonical origins before any callback can narrow them; disabled endpoints reject all relay hints. Custom relays may still upgrade to direct. In exact-pinned `@momics/iroh-http-node` 0.6.0, disabled means loopback-only, so relay-less production operation is not claimed.
 
 ## Enterprise deployment profile
 

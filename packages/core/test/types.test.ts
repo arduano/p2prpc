@@ -17,3 +17,20 @@ it('requires a typed expected target for outbound connections', () => {
   expectTypeOf<ConnectArgument>().toEqualTypeOf<ConnectOptions>();
   expectTypeOf<ConnectArgument['expectedPrincipal']>().toEqualTypeOf<PrincipalMatcher>();
 });
+
+const completePrincipal: PrincipalMatcher = {
+  subject: 'subject',
+  issuer: null,
+  clientId: null,
+  tenantId: null
+};
+
+// @ts-expect-error A peer ID and principal cannot select a route by themselves.
+const missingLocator: ConnectOptions = { expectedPeerId: 'peer', expectedPrincipal: completePrincipal };
+// @ts-expect-error Discovery cannot supply the independently trusted endpoint expectation.
+const missingEndpoint: ConnectOptions = { locator: { kind: 'dns' }, expectedPrincipal: completePrincipal };
+// @ts-expect-error Discovery cannot supply the independently trusted principal expectation.
+const missingPrincipal: ConnectOptions = { locator: { kind: 'dns' }, expectedPeerId: 'peer' };
+// @ts-expect-error Legacy and current locator forms are mutually exclusive.
+const ambiguousLocator: ConnectOptions = { locator: { kind: 'dns' }, ticket: 'legacy-ticket', expectedPeerId: 'peer', expectedPrincipal: completePrincipal };
+void [missingLocator, missingEndpoint, missingPrincipal, ambiguousLocator];
