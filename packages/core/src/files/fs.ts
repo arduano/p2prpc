@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { constants, type BigIntStats } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { link, lstat, open, rename, unlink, type FileHandle } from 'node:fs/promises';
+import process from 'node:process';
 import { P2PError } from '../errors.js';
 import type {
   FileDestination,
@@ -871,7 +872,11 @@ async function syncDirectory(path: string, signal?: AbortSignal): Promise<void> 
     // Node reports these codes when directory fsync is unavailable on the
     // current platform/filesystem. Authorization and I/O failures remain
     // visible instead of silently weakening the requested durability.
-    if (!DIRECTORY_SYNC_UNSUPPORTED_CODES.has(errorCode(cause) ?? '')) throw cause;
+    const code = errorCode(cause) ?? '';
+    const unsupported = DIRECTORY_SYNC_UNSUPPORTED_CODES.has(code) || (
+      process.platform === 'win32' && handle !== undefined && code === 'EPERM'
+    );
+    if (!unsupported) throw cause;
   } finally {
     await handle?.close();
   }

@@ -131,7 +131,7 @@ describe('private RPC value codec', () => {
       { json: [[1]], meta: { values: ['map'], v: 1 } },
       { json: '2026-01-02', meta: { values: ['Date'], v: 1 } },
       { json: '/safe/ig', meta: { values: ['regexp'], v: 1 } },
-      { json: 'HTTP://EXAMPLE.COM', meta: { values: ['URL'], v: 1 } },
+      { json: 'URN:example:a', meta: { values: ['URL'], v: 1 } },
       { json: [1], meta: { values: [['typed-array', 'Uint16Array'], {}], v: 1 } },
       { json: [1], meta: { values: [['typed-array', 'Uint16Array'], ['extra']], v: 1 } }
     ]) {
