@@ -4,9 +4,16 @@ import { constants, type BigIntStats } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { link, lstat, open, rename, unlink, type FileHandle } from 'node:fs/promises';
 import { P2PError } from '../errors.js';
-import type { FileDestination, FileManifest, FileSource } from './types.js';
+import type {
+  FileDestination,
+  FileDestinationFinalizeContext,
+  FileManifest,
+  FileSource,
+  PreparedFileSource
+} from './types.js';
 import {
   DEFAULT_FILE_TRANSFER_LIMITS,
+  assertOnlyKeys,
   cloneValidatedMetadata,
   expectedChunkSize,
   resolveFileTransferLimits,
@@ -21,6 +28,9 @@ import {
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const MAX_RESUME_STATE_BYTES = 32 * 1024 * 1024;
 const FILE_IO_SEGMENT_BYTES = 64 * 1024;
+const RESUME_HEADER_BYTES = 64;
+const RESUME_RECORD_BYTES = 33;
+const RESUME_MAGIC = Buffer.from([0x50, 0x32, 0x50, 0x52, 0x50, 0x43, 0x33, 0x00]);
 
 interface FileIdentity {
   readonly dev: bigint;
@@ -44,9 +54,53 @@ export async function fileSource<TMetadata = unknown>(path: string, metadata?: T
   const name = basename(path);
   validateFileName(name, DEFAULT_FILE_TRANSFER_LIMITS);
   const size = Number(initialStats.size);
+  const prepare = async (signal?: AbortSignal): Promise<PreparedFileSource<TMetadata>> => {
+    throwIfCancelled(signal);
+    const handle = await openSecure(path, constants.O_RDONLY, 'source');
+    let closed = false;
+    try {
+      assertStableSource(await handle.stat({ bigint: true }), identity);
+      throwIfCancelled(signal);
+    } catch (cause) {
+      try {
+        await handle.close();
+      } catch (cleanup) {
+        throw cleanupAfterFailure('Prepared file source cleanup failed', cause, cleanup);
+      }
+      throw cause;
+    }
+    const prepared: PreparedFileSource<TMetadata> = {
+      name,
+      size,
+      async readChunk(index, chunkSize, readSignal) {
+        if (closed) throw new P2PError('INTERNAL', 'Prepared file source is closed');
+        throwIfCancelled(readSignal);
+        validateChunkSize(chunkSize);
+        const chunkCount = size === 0 ? 0 : Math.ceil(size / chunkSize);
+        if (!Number.isSafeInteger(index) || index < 0 || index >= chunkCount) {
+          throw new P2PError('INVALID_FRAME', `Chunk ${String(index)} is out of range`);
+        }
+        assertStableSource(await handle.stat({ bigint: true }), identity);
+        const offset = index * chunkSize;
+        const data = Buffer.allocUnsafe(Math.min(chunkSize, size - offset));
+        await readFully(handle, data, offset, readSignal);
+        throwIfCancelled(readSignal);
+        assertStableSource(await handle.stat({ bigint: true }), identity);
+        return data;
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        await handle.close();
+      }
+    };
+    if (metadata !== undefined) Object.defineProperty(prepared, 'metadata', { value: metadata, enumerable: true });
+    return Object.freeze(prepared);
+  };
   const source: FileSource<TMetadata> = {
     name,
     size,
+    prepare,
     async readChunk(index, chunkSize, signal) {
       throwIfCancelled(signal);
       validateChunkSize(chunkSize);
@@ -77,11 +131,12 @@ export async function fileSource<TMetadata = unknown>(path: string, metadata?: T
 }
 
 interface ResumeState {
-  readonly version: 1;
-  readonly digest: string;
-  readonly size: number;
-  readonly chunkSize: number;
   readonly chunks: Array<readonly [index: number, digest: string]>;
+}
+
+interface LoadedResumeState {
+  readonly state: ResumeState;
+  readonly handle: FileHandle;
 }
 
 export interface FileDestinationOptions {
@@ -99,6 +154,10 @@ export function fileDestination<TMetadata = unknown>(
   path: string,
   options: FileDestinationOptions = {}
 ): FileDestination<TMetadata> {
+  if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+    throw new P2PError('INVALID_FRAME', 'File destination options must be an object');
+  }
+  assertOnlyKeys(options as Record<string, unknown>, ['overwrite', 'durable', 'maxChunkSize'], 'File destination options');
   if (options.overwrite !== undefined && typeof options.overwrite !== 'boolean') {
     throw new P2PError('INVALID_FRAME', 'File destination overwrite must be a boolean');
   }
@@ -108,65 +167,33 @@ export function fileDestination<TMetadata = unknown>(
   const maxChunkSize = validateChunkSize(options.maxChunkSize ?? DEFAULT_FILE_TRANSFER_LIMITS.maxChunkSize);
   const destinationLimits: FileTransferLimits = { ...DEFAULT_FILE_TRANSFER_LIMITS, maxChunkSize };
   const partialPath = `${path}.p2prpc.part`;
-  const statePath = `${path}.p2prpc.state.json`;
+  const statePath = `${path}.p2prpc.state`;
   const lockPath = `${path}.p2prpc.lock`;
   const completed = new Map<number, string>();
   let partialHandle: FileHandle | undefined;
   let partialIdentity: FileIdentity | undefined;
+  let stateHandle: FileHandle | undefined;
+  let stateIdentity: FileIdentity | undefined;
   let lockHandle: FileHandle | undefined;
   let lockIdentity: FileIdentity | undefined;
   let preparedKey: string | undefined;
   let writesSinceFlush = 0;
-  let persistChain = Promise.resolve();
+  let flushChain = Promise.resolve();
   let finished = false;
 
-  const enqueuePersist = (manifest: FileManifest<TMetadata>, signal?: AbortSignal): Promise<void> => {
-    const task = persistChain.then(() => persistState(manifest, signal));
-    persistChain = task.catch(() => undefined);
+  const enqueueFlush = (manifest: FileManifest<TMetadata>, signal?: AbortSignal): Promise<void> => {
+    const task = flushChain.then(() => flushState(manifest, signal));
+    flushChain = task.catch(() => undefined);
     return task;
   };
 
-  const persistState = async (manifest: FileManifest<TMetadata>, signal?: AbortSignal): Promise<void> => {
+  const flushState = async (manifest: FileManifest<TMetadata>, signal?: AbortSignal): Promise<void> => {
     throwIfCancelled(signal);
     requirePrepared(manifest);
-    const state: ResumeState = {
-      version: 1,
-      digest: manifest.digest,
-      size: manifest.size,
-      chunkSize: manifest.chunkSize,
-      chunks: [...completed.entries()].sort(([left], [right]) => left - right)
-    };
-    const serialized = JSON.stringify(state);
-    if (Buffer.byteLength(serialized) > MAX_RESUME_STATE_BYTES) {
-      throw new P2PError('RESOURCE_LIMIT', 'File resume state exceeds its maximum size');
-    }
-    const temporaryStatePath = `${statePath}.${randomUUID()}.tmp`;
-    let temporary: FileHandle | undefined;
-    try {
-      throwIfCancelled(signal);
-      temporary = await open(
-        temporaryStatePath,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW,
-        0o600
-      );
-      throwIfCancelled(signal);
-      await writeFully(temporary, Buffer.from(serialized), 0, signal);
-      throwIfCancelled(signal);
-      if (options.durable !== false) {
-        await temporary.sync();
-        throwIfCancelled(signal);
-      }
-      await temporary.close();
-      temporary = undefined;
-      throwIfCancelled(signal);
-      await rename(temporaryStatePath, statePath);
-      throwIfCancelled(signal);
-      if (options.durable !== false) await syncDirectory(dirname(path), signal);
-      writesSinceFlush = 0;
-    } finally {
-      await temporary?.close().catch(() => undefined);
-      await unlink(temporaryStatePath).catch(() => undefined);
-    }
+    if (!stateHandle) throw new P2PError('INTERNAL', 'File resume state is not open');
+    if (options.durable !== false) await stateHandle.sync();
+    throwIfCancelled(signal);
+    writesSinceFlush = 0;
   };
 
   const requirePrepared = (manifest: FileManifest<TMetadata>): FileHandle => {
@@ -181,11 +208,13 @@ export function fileDestination<TMetadata = unknown>(
     let identity = lockIdentity;
     lockHandle = undefined;
     lockIdentity = undefined;
-    if (handle && !identity) {
-      identity = await handle.stat({ bigint: true }).then(fileIdentity, () => undefined);
-    }
-    await handle?.close().catch(() => undefined);
-    if (identity) await unlinkIfIdentity(lockPath, identity);
+    await cleanupAll('File destination lock cleanup failed', [
+      async () => {
+        if (handle && !identity) identity = fileIdentity(await handle.stat({ bigint: true }));
+      },
+      async () => { if (handle) await handle.close(); },
+      async () => { if (identity) await unlinkIfIdentity(lockPath, identity); }
+    ]);
   };
 
   return {
@@ -207,7 +236,11 @@ export function fileDestination<TMetadata = unknown>(
         throwIfCancelled(signal);
       } catch (cause) {
         preparedKey = undefined;
-        await releaseLock();
+        try {
+          await releaseLock();
+        } catch (cleanup) {
+          throw cleanupAfterFailure('File destination lock acquisition cleanup failed', cause, cleanup);
+        }
         if (errorCode(cause) === 'EEXIST' || errorCode(cause) === 'ELOOP') {
           throw new P2PError('REJECTED', 'Destination is already being written');
         }
@@ -220,8 +253,10 @@ export function fileDestination<TMetadata = unknown>(
           throw new P2PError('REJECTED', 'Destination already exists');
         }
         throwIfCancelled(signal);
-        const state = await readState(statePath, manifest, signal);
-        if (state) {
+        const loadedState = await readState(statePath, manifest, signal);
+        if (loadedState) {
+          stateHandle = loadedState.handle;
+          stateIdentity = fileIdentity(await stateHandle.stat({ bigint: true }));
           partialHandle = await openSecure(partialPath, constants.O_RDWR, 'partial destination').catch(() => undefined);
           if (partialHandle) {
             throwIfCancelled(signal);
@@ -232,7 +267,7 @@ export function fileDestination<TMetadata = unknown>(
             } else {
               partialIdentity = fileIdentity(stats);
               await partialHandle.chmod(0o600);
-              for (const [index, digest] of state.chunks) {
+              for (const [index, digest] of loadedState.state.chunks) {
                 throwIfCancelled(signal);
                 const length = expectedChunkSize(manifest, index);
                 const data = Buffer.allocUnsafe(length);
@@ -243,9 +278,13 @@ export function fileDestination<TMetadata = unknown>(
           }
         }
         if (!partialHandle) {
+          await stateHandle?.close();
+          stateHandle = undefined;
+          if (stateIdentity) await unlinkIfIdentity(statePath, stateIdentity);
+          else await unlinkIfPresent(statePath);
+          stateIdentity = undefined;
           throwIfCancelled(signal);
-          await unlink(partialPath).catch(() => undefined);
-          await unlink(statePath).catch(() => undefined);
+          await unlinkIfPresent(partialPath);
           throwIfCancelled(signal);
           partialHandle = await open(
             partialPath,
@@ -256,15 +295,29 @@ export function fileDestination<TMetadata = unknown>(
           await partialHandle.truncate(manifest.size);
           throwIfCancelled(signal);
           partialIdentity = fileIdentity(await partialHandle.stat({ bigint: true }));
+          stateHandle = await createResumeState(statePath, manifest, options.durable !== false, signal);
+          stateIdentity = fileIdentity(await stateHandle.stat({ bigint: true }));
+          if (options.durable !== false) await syncDirectory(dirname(path), signal);
         }
         throwIfCancelled(signal);
         return new Set(completed.keys());
       } catch (cause) {
-        await partialHandle?.close().catch(() => undefined);
+        const partialToClose = partialHandle;
+        const stateToClose = stateHandle;
         partialHandle = undefined;
         partialIdentity = undefined;
+        stateHandle = undefined;
+        stateIdentity = undefined;
         preparedKey = undefined;
-        await releaseLock();
+        try {
+          await cleanupAll('File destination preparation cleanup failed', [
+            async () => { if (partialToClose) await partialToClose.close(); },
+            async () => { if (stateToClose) await stateToClose.close(); },
+            releaseLock
+          ]);
+        } catch (cleanup) {
+          throw cleanupAfterFailure('File destination preparation cleanup failed', cause, cleanup);
+        }
         throw cause;
       }
     },
@@ -276,17 +329,21 @@ export function fileDestination<TMetadata = unknown>(
       if (data.byteLength !== expected) throw new P2PError('INVALID_FRAME', `Wrong size for chunk ${index}`);
       await writeFully(handle, data, index * manifest.chunkSize, signal);
       throwIfCancelled(signal);
-      completed.set(index, chunkDigest(data));
+      const digest = chunkDigest(data);
+      if (!stateHandle) throw new P2PError('INTERNAL', 'File resume state is not open');
+      await writeResumeRecord(stateHandle, index, digest, signal);
+      completed.set(index, digest);
       writesSinceFlush += 1;
-      if (writesSinceFlush >= 16) await enqueuePersist(manifest, signal);
+      if (writesSinceFlush >= 16) await enqueueFlush(manifest, signal);
     },
 
-    async finalize(manifest, signal) {
+    async finalize(manifest, context) {
+      const { signal, markCommitted } = validateFinalizeContext(context);
       throwIfCancelled(signal);
       const handle = requirePrepared(manifest);
       if (completed.size !== manifest.chunkCount) throw new P2PError('INTEGRITY_FAILED', 'File has missing chunks');
-      await enqueuePersist(manifest, signal);
-      await persistChain;
+      await enqueueFlush(manifest, signal);
+      await flushChain;
       throwIfCancelled(signal);
       const stats = await handle.stat({ bigint: true });
       if (!stats.isFile() || stats.size !== BigInt(manifest.size)) {
@@ -308,49 +365,104 @@ export function fileDestination<TMetadata = unknown>(
       // before it; once the syscall starts, finalize runs to success so callers
       // never observe TIMEOUT followed by a later published file.
       throwIfCancelled(signal);
+      let linkedPublication = false;
       if (options.overwrite) {
         await rename(partialPath, path);
       } else {
         try {
           await link(partialPath, path);
+          linkedPublication = true;
         } catch (cause) {
           if (errorCode(cause) === 'EEXIST') throw new P2PError('REJECTED', 'Destination already exists');
           throw cause;
         }
-        await unlink(partialPath).catch(() => undefined);
       }
-      // Nothing after this point may turn a successful atomic publication into
-      // an error observed by the caller.
+      // The rename/link above is the irreversible publication boundary. Tell
+      // the manager synchronously before descriptor, staging, lock, or
+      // directory-durability cleanup can fail. This prevents a known commit
+      // from being reclassified as a reject/retry.
       finished = true;
+      let commitNotificationFailure: unknown;
+      try {
+        markCommitted();
+      } catch (cause) {
+        // A caller-supplied notification must not strand native resources.
+        // Preserve it and finish every post-commit cleanup operation below.
+        commitNotificationFailure = cause;
+      }
+      // Publication is known. Cleanup and directory durability are one
+      // explicit post-commit phase: every operation is attempted, and any
+      // failure is surfaced as OUTCOME_UNKNOWN rather than returning success
+      // with leaked descriptors or persistent staging/lock files.
       partialHandle = undefined;
       partialIdentity = undefined;
-      if (options.durable !== false) await syncDirectory(dirname(path));
-      await handle.close().catch(() => undefined);
-      await unlink(statePath).catch(() => undefined);
-      await releaseLock();
+      const resumeHandle = stateHandle;
+      const resumeIdentity = stateIdentity;
+      stateHandle = undefined;
+      stateIdentity = undefined;
+      try {
+        await cleanupAll('Published file cleanup or durability confirmation failed', [
+          async () => {
+            if (commitNotificationFailure !== undefined) throw commitNotificationFailure;
+          },
+          async () => { await handle.close(); },
+          async () => { if (resumeHandle) await resumeHandle.close(); },
+          async () => { if (linkedPublication) await unlinkIfPresent(partialPath); },
+          async () => { if (resumeIdentity) await unlinkIfIdentity(statePath, resumeIdentity); },
+          releaseLock,
+          async () => { if (options.durable !== false) await syncDirectory(dirname(path)); }
+        ]);
+      } catch (cause) {
+        throw new P2PError(
+          'OUTCOME_UNKNOWN',
+          'File was published, but cleanup or directory durability could not be confirmed',
+          { cause }
+        );
+      }
     },
 
     async abort(manifest, abortOptions, signal) {
       if (finished) return;
       if (!signal?.aborted && partialHandle && preparedKey === manifestKey(manifest) && !abortOptions.discard) {
-        await enqueuePersist(manifest, signal).catch(() => undefined);
-        await persistChain.catch(() => undefined);
+        await enqueueFlush(manifest, signal).catch(() => undefined);
+        await flushChain.catch(() => undefined);
       }
       const identity = partialIdentity;
-      await partialHandle?.close().catch(() => undefined);
+      const partialToClose = partialHandle;
       partialHandle = undefined;
       partialIdentity = undefined;
-      if (abortOptions.discard) {
-        if (identity) await unlinkIfIdentity(partialPath, identity);
-        await unlink(statePath).catch(() => undefined);
-      }
+      const stateToClose = stateHandle;
+      stateHandle = undefined;
+      const resumeIdentity = stateIdentity;
+      stateIdentity = undefined;
       preparedKey = undefined;
       completed.clear();
       writesSinceFlush = 0;
       finished = abortOptions.discard;
-      await releaseLock();
+      await cleanupAll('File destination rollback cleanup failed', [
+        async () => { if (partialToClose) await partialToClose.close(); },
+        async () => { if (stateToClose) await stateToClose.close(); },
+        async () => { if (abortOptions.discard && identity) await unlinkIfIdentity(partialPath, identity); },
+        async () => { if (abortOptions.discard && resumeIdentity) await unlinkIfIdentity(statePath, resumeIdentity); },
+        releaseLock
+      ]);
     }
   };
+}
+
+function validateFinalizeContext(
+  value: FileDestinationFinalizeContext
+): FileDestinationFinalizeContext {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    typeof value.markCommitted !== 'function' ||
+    (value.signal !== undefined && !(value.signal instanceof AbortSignal))
+  ) {
+    throw new P2PError('INVALID_FRAME', 'File destination finalize context is invalid');
+  }
+  return value;
 }
 
 export async function createManifest<TMetadata>(
@@ -495,47 +607,112 @@ async function readState<TMetadata>(
   path: string,
   manifest: FileManifest<TMetadata>,
   signal?: AbortSignal
-): Promise<ResumeState | undefined> {
+): Promise<LoadedResumeState | undefined> {
   let handle: FileHandle | undefined;
   try {
     throwIfCancelled(signal);
-    handle = await openSecure(path, constants.O_RDONLY, 'resume state');
+    handle = await openSecure(path, constants.O_RDWR, 'resume state');
     throwIfCancelled(signal);
     const stats = await handle.stat({ bigint: true });
-    if (!stats.isFile() || stats.size > BigInt(MAX_RESUME_STATE_BYTES)) return undefined;
+    const expectedSize = resumeStateSize(manifest.chunkCount);
+    if (!stats.isFile() || stats.size !== BigInt(expectedSize)) return undefined;
     throwIfCancelled(signal);
-    const serialized = Buffer.alloc(Number(stats.size));
+    const serialized = Buffer.alloc(expectedSize);
     await readFully(handle, serialized, 0, signal);
     throwIfCancelled(signal);
-    const parsed = JSON.parse(serialized.toString('utf8')) as unknown;
-    if (!isResumeState(parsed) || parsed.digest !== manifest.digest || parsed.size !== manifest.size || parsed.chunkSize !== manifest.chunkSize) {
-      return undefined;
-    }
-    const seen = new Set<number>();
-    for (const [index, digest] of parsed.chunks) {
-      if (!Number.isSafeInteger(index) || index < 0 || index >= manifest.chunkCount || seen.has(index)) return undefined;
+    if (!resumeHeaderMatches(serialized.subarray(0, RESUME_HEADER_BYTES), manifest)) return undefined;
+    const chunks: Array<readonly [number, string]> = [];
+    for (let index = 0; index < manifest.chunkCount; index += 1) {
+      const offset = resumeRecordOffset(index);
+      const marker = serialized[offset];
+      if (marker === 0) continue;
+      if (marker !== 1) return undefined;
+      const digest = serialized.subarray(offset + 1, offset + RESUME_RECORD_BYTES).toString('hex');
       validateDigest(digest, 'resume chunk digest');
-      seen.add(index);
+      chunks.push([index, digest]);
     }
-    return parsed;
+    const loaded = { state: { chunks }, handle };
+    handle = undefined;
+    return loaded;
   } catch {
     if (signal?.aborted) throw signalError(signal);
     return undefined;
   } finally {
-    await handle?.close().catch(() => undefined);
+    await handle?.close();
   }
 }
 
-function isResumeState(value: unknown): value is ResumeState {
-  if (typeof value !== 'object' || value === null) return false;
-  const state = value as Partial<ResumeState>;
-  return state.version === 1 &&
-    typeof state.digest === 'string' &&
-    Number.isSafeInteger(state.size) &&
-    Number.isSafeInteger(state.chunkSize) &&
-    Array.isArray(state.chunks) &&
-    state.chunks.length <= DEFAULT_FILE_TRANSFER_LIMITS.maxChunkCount &&
-    state.chunks.every((entry) => Array.isArray(entry) && entry.length === 2);
+async function createResumeState<TMetadata>(
+  path: string,
+  manifest: FileManifest<TMetadata>,
+  durable: boolean,
+  signal?: AbortSignal
+): Promise<FileHandle> {
+  const size = resumeStateSize(manifest.chunkCount);
+  let handle: FileHandle | undefined;
+  try {
+    throwIfCancelled(signal);
+    handle = await open(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW, 0o600);
+    throwIfCancelled(signal);
+    await handle.truncate(size);
+    await writeFully(handle, createResumeHeader(manifest), 0, signal);
+    if (durable) await handle.sync();
+    throwIfCancelled(signal);
+    const output = handle;
+    handle = undefined;
+    return output;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function writeResumeRecord(
+  handle: FileHandle,
+  index: number,
+  digest: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const offset = resumeRecordOffset(index);
+  await writeFully(handle, Uint8Array.of(0), offset, signal);
+  await writeFully(handle, Buffer.from(digest, 'hex'), offset + 1, signal);
+  // The completion marker is last. A crash can lose work and cause a safe
+  // retransmit, but cannot bless an incompletely written digest record.
+  await writeFully(handle, Uint8Array.of(1), offset, signal);
+}
+
+function createResumeHeader<TMetadata>(manifest: FileManifest<TMetadata>): Buffer {
+  const header = Buffer.alloc(RESUME_HEADER_BYTES);
+  RESUME_MAGIC.copy(header, 0);
+  header.writeUInt32BE(3, 8);
+  header.writeUInt32BE(RESUME_HEADER_BYTES, 12);
+  header.writeBigUInt64BE(BigInt(manifest.size), 16);
+  header.writeUInt32BE(manifest.chunkSize, 24);
+  header.writeUInt32BE(manifest.chunkCount, 28);
+  Buffer.from(manifest.digest, 'hex').copy(header, 32);
+  return header;
+}
+
+function resumeHeaderMatches<TMetadata>(header: Uint8Array, manifest: FileManifest<TMetadata>): boolean {
+  const view = Buffer.from(header.buffer, header.byteOffset, header.byteLength);
+  return view.subarray(0, RESUME_MAGIC.byteLength).equals(RESUME_MAGIC) &&
+    view.readUInt32BE(8) === 3 &&
+    view.readUInt32BE(12) === RESUME_HEADER_BYTES &&
+    view.readBigUInt64BE(16) === BigInt(manifest.size) &&
+    view.readUInt32BE(24) === manifest.chunkSize &&
+    view.readUInt32BE(28) === manifest.chunkCount &&
+    view.subarray(32, 64).toString('hex') === manifest.digest;
+}
+
+function resumeStateSize(chunkCount: number): number {
+  const size = RESUME_HEADER_BYTES + chunkCount * RESUME_RECORD_BYTES;
+  if (!Number.isSafeInteger(size) || size > MAX_RESUME_STATE_BYTES) {
+    throw new P2PError('RESOURCE_LIMIT', 'File resume state exceeds its maximum size');
+  }
+  return size;
+}
+
+function resumeRecordOffset(index: number): number {
+  return RESUME_HEADER_BYTES + index * RESUME_RECORD_BYTES;
 }
 
 async function openSecure(path: string, flags: number, label: string): Promise<FileHandle> {
@@ -572,7 +749,11 @@ async function openSecure(path: string, flags: number, label: string): Promise<F
     }
     return handle;
   } catch (cause) {
-    await handle.close().catch(() => undefined);
+    try {
+      await handle.close();
+    } catch (cleanup) {
+      throw cleanupAfterFailure(`Secure ${label} handle cleanup failed`, cause, cleanup);
+    }
     throw cause;
   }
 }
@@ -656,7 +837,25 @@ async function pathHasIdentity(path: string, identity: FileIdentity): Promise<bo
 }
 
 async function unlinkIfIdentity(path: string, identity: FileIdentity): Promise<void> {
-  if (await pathHasIdentity(path, identity)) await unlink(path).catch(() => undefined);
+  let stats: BigIntStats;
+  try {
+    stats = await lstat(path, { bigint: true });
+  } catch (cause) {
+    if (errorCode(cause) === 'ENOENT') return;
+    throw cause;
+  }
+  if (!stats.isFile() || stats.dev !== identity.dev || stats.ino !== identity.ino) {
+    throw new P2PError('INTEGRITY_FAILED', 'Managed file path changed during cleanup');
+  }
+  await unlinkIfPresent(path);
+}
+
+async function unlinkIfPresent(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (cause) {
+    if (errorCode(cause) !== 'ENOENT') throw cause;
+  }
 }
 
 async function syncDirectory(path: string, signal?: AbortSignal): Promise<void> {
@@ -667,13 +866,41 @@ async function syncDirectory(path: string, signal?: AbortSignal): Promise<void> 
     throwIfCancelled(signal);
     await handle.sync();
     throwIfCancelled(signal);
-  } catch {
+  } catch (cause) {
     if (signal?.aborted) throw signalError(signal);
-    // Directory fsync is not supported by every Node platform/filesystem.
+    // Node reports these codes when directory fsync is unavailable on the
+    // current platform/filesystem. Authorization and I/O failures remain
+    // visible instead of silently weakening the requested durability.
+    if (!DIRECTORY_SYNC_UNSUPPORTED_CODES.has(errorCode(cause) ?? '')) throw cause;
   } finally {
-    await handle?.close().catch(() => undefined);
+    await handle?.close();
   }
 }
+
+async function cleanupAll(
+  message: string,
+  operations: readonly (() => Promise<void>)[]
+): Promise<void> {
+  const failures: unknown[] = [];
+  for (const operation of operations) {
+    try {
+      await operation();
+    } catch (cause) {
+      failures.push(cause);
+    }
+  }
+  if (failures.length > 0) {
+    throw new P2PError('INTERNAL', message, {
+      cause: new AggregateError(failures, message)
+    });
+  }
+}
+
+function cleanupAfterFailure(message: string, operation: unknown, cleanup: unknown): P2PError {
+  return new P2PError('OUTCOME_UNKNOWN', message, { cause: { operation, cleanup } });
+}
+
+const DIRECTORY_SYNC_UNSUPPORTED_CODES = new Set(['EBADF', 'EISDIR', 'EINVAL', 'ENOTSUP', 'EOPNOTSUPP']);
 
 function manifestKey(manifest: FileManifest): string {
   return `${manifest.digest}:${manifest.size}:${manifest.chunkSize}:${manifest.chunkCount}`;

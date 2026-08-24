@@ -7,25 +7,28 @@ import type {
   SessionPrincipal,
   SessionSecurity
 } from './types.js';
+import { markPeerBoundSessionSecurity, type PeerBoundSessionSecurity } from './types.js';
 
 export interface SharedSecretSecurityOptions<TFileMetadata = unknown> {
   readonly sessionTtlMs?: number;
   readonly clockSkewMs?: number;
-  readonly authorize?: (context: AuthorizationContext<TFileMetadata>) => Promise<AuthorizationResult> | AuthorizationResult;
+  /** Authentication proves secret membership; this callback grants each operation. */
+  readonly authorize: (context: AuthorizationContext<TFileMetadata>) => Promise<AuthorizationResult> | AuthorizationResult;
 }
 
 /**
  * HMAC challenge authentication for deployments that have a securely
  * provisioned application secret but no OIDC issuer. Each side proves the
- * secret over its fresh handshake nonce and the two authenticated Iroh IDs.
+ * secret over the complete role-specific v3 challenge transcript, including
+ * both fresh nonces and both authenticated Iroh IDs.
  */
 export function createSharedSecretSecurity<TFileMetadata = unknown>(
   secret: Uint8Array | string,
-  options: SharedSecretSecurityOptions<TFileMetadata> = {}
-): SessionSecurity<TFileMetadata> {
+  options: SharedSecretSecurityOptions<TFileMetadata>
+): PeerBoundSessionSecurity<TFileMetadata> {
   validateOptions(options, ['sessionTtlMs', 'clockSkewMs', 'authorize'], 'Shared-secret security options');
-  if (options.authorize !== undefined && typeof options.authorize !== 'function') {
-    throw new P2PError('UNAUTHORIZED', 'Shared-secret authorize policy must be a function');
+  if (typeof options.authorize !== 'function') {
+    throw new P2PError('UNAUTHORIZED', 'Shared-secret authorize policy is required and must be a function');
   }
   const customAuthorize = options.authorize;
   const key = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
@@ -37,8 +40,9 @@ export function createSharedSecretSecurity<TFileMetadata = unknown>(
     throw new P2PError('RESOURCE_LIMIT', 'Shared-secret clock skew must be between 0 and 10 minutes');
   }
 
-  return {
+  return markPeerBoundSessionSecurity({
     getCredential(context) {
+      validateContextRole(context, context.localPeerId);
       const timestamp = Date.now();
       return {
         scheme: 'P2PRPC-HMAC-SHA256',
@@ -47,21 +51,14 @@ export function createSharedSecretSecurity<TFileMetadata = unknown>(
     },
     authenticate(credential, context) {
       if (credential.scheme !== 'P2PRPC-HMAC-SHA256') throw new P2PError('UNAUTHORIZED', 'Unsupported session credential');
+      validateContextRole(context, context.remotePeerId);
       const separator = credential.value.indexOf('.');
       const timestamp = Number(credential.value.slice(0, separator));
       const received = credential.value.slice(separator + 1);
       if (separator < 1 || !Number.isSafeInteger(timestamp) || Math.abs(Date.now() - timestamp) > skew) {
         throw new P2PError('UNAUTHORIZED', 'Session credential is stale');
       }
-      const nonce = context.remotePeerId === context.initiatorPeerId ? context.initiatorNonce : context.responderNonce;
-      const expected = mac(key, {
-        localPeerId: context.remotePeerId,
-        remotePeerId: context.localPeerId,
-        direction: context.direction === 'inbound' ? 'outbound' : 'inbound',
-        protocol: context.protocol,
-        nonce,
-        signal: context.signal
-      }, timestamp);
+      const expected = mac(key, context, timestamp);
       if (!safeEqual(received, expected)) throw new P2PError('UNAUTHORIZED', 'Invalid session credential');
       const principal: SessionPrincipal = {
         id: context.remotePeerId,
@@ -75,9 +72,9 @@ export function createSharedSecretSecurity<TFileMetadata = unknown>(
     authorize(context) {
       // Authentication and authorization are intentionally separate. A
       // shared secret proves membership only; policy must grant each action.
-      return customAuthorize === undefined ? false : customAuthorize(context);
+      return customAuthorize(context);
     }
-  };
+  });
 }
 
 /** Explicit test/development escape hatch. Never use this in production. */
@@ -125,17 +122,34 @@ function validateDuration(value: number, label: string, maximum: number): void {
 
 function mac(key: Uint8Array, context: CredentialRequestContext, timestamp: number): string {
   return createHmac('sha256', key)
-    .update('p2prpc-session-credential-v1\n')
-    .update(context.protocol)
-    .update('\n')
-    .update(context.localPeerId)
-    .update('\n')
-    .update(context.remotePeerId)
-    .update('\n')
-    .update(context.nonce)
-    .update('\n')
-    .update(String(timestamp))
+    .update('p2prpc-session-credential-v3\n')
+    .update(JSON.stringify([
+      3,
+      context.protocol,
+      context.role,
+      context.initiatorPeerId,
+      context.responderPeerId,
+      context.initiatorNonce,
+      context.responderNonce,
+      context.initiatorPresentedAt,
+      context.responderPresentedAt,
+      context.transcriptHash,
+      timestamp
+    ]))
     .digest('base64url');
+}
+
+function validateContextRole(
+  context: CredentialRequestContext,
+  presenterPeerId: string
+): void {
+  if (context.role !== 'initiator' && context.role !== 'responder') {
+    throw new P2PError('UNAUTHORIZED', 'Session credential has an invalid handshake role');
+  }
+  const expected = context.role === 'initiator' ? context.initiatorPeerId : context.responderPeerId;
+  if (presenterPeerId !== expected || context.initiatorPeerId === context.responderPeerId) {
+    throw new P2PError('UNAUTHORIZED', 'Session credential role does not match the authenticated peer');
+  }
 }
 
 function safeEqual(left: string, right: string): boolean {

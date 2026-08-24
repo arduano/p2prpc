@@ -1,8 +1,8 @@
-import { pack, unpack } from 'msgpackr';
+import { Packr } from 'msgpackr';
 import { P2PError } from './errors.js';
 import type { QuicRecvStream, QuicSendStream } from './transport/types.js';
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 4;
 
 export enum StreamKind {
   Rpc = 1,
@@ -25,17 +25,19 @@ export enum TransferFrameKind {
   Accept = 21,
   Reject = 22,
   ChunkHeader = 23,
-  Progress = 24,
   Complete = 25,
-  Cancel = 26,
+  /** Echoes the receiver's fresh completion challenge before either half closes. */
+  Receipt = 26,
   Pull = 27
 }
 
 export enum SessionFrameKind {
   ClientHello = 40,
-  ServerHello = 41,
-  ClientAck = 42,
-  ServerReady = 43
+  ServerChallenge = 41,
+  ClientCredential = 42,
+  ServerCredential = 43,
+  ClientFinished = 44,
+  ServerFinished = 45
 }
 
 export interface Frame<T = unknown> {
@@ -58,6 +60,14 @@ export const DEFAULT_FRAME_LIMITS: FrameLimits = {
 };
 
 const utf8 = new TextDecoder('utf-8', { fatal: true });
+// Keep the project-canonical map16 encoding explicit instead of inheriting a
+// mutable/default codec configuration from the hosting application.
+const frameCodec = new Packr({
+  useRecords: false,
+  variableMapSize: false,
+  mapsAsObjects: true,
+  moreTypes: false
+});
 
 export async function writeStreamKind(send: QuicSendStream, kind: StreamKind): Promise<void> {
   await send.writeAll(Uint8Array.of(kind));
@@ -84,7 +94,13 @@ export async function writeFrame(
 ): Promise<void> {
   if (!Number.isSafeInteger(kind) || kind < 0 || kind > 255) throw new P2PError('INVALID_FRAME', 'Invalid frame kind');
   const shapeLimits = validateFrameLimits(limits);
-  const body = pack(value);
+  validateOutboundValue(value, limits.maxControlFrameBytes, shapeLimits);
+  let body: Uint8Array;
+  try {
+    body = frameCodec.pack(value);
+  } catch (cause) {
+    throw new P2PError('INVALID_FRAME', 'Outbound frame is not serializable plain data', { cause });
+  }
   if (body.byteLength > limits.maxControlFrameBytes) {
     throw new P2PError('RESOURCE_LIMIT', `Outbound frame length ${body.byteLength} exceeds ${limits.maxControlFrameBytes}`);
   }
@@ -112,7 +128,7 @@ export async function readFrame<T = unknown>(
   try {
     const body = await recv.readExact(length);
     validateMessagePack(body, shapeLimits);
-    value = unpack(body) as T;
+    value = frameCodec.unpack(body) as T;
   } catch (cause) {
     if (cause instanceof P2PError) throw cause;
     throw new P2PError('INVALID_FRAME', 'Invalid MessagePack frame', { cause });
@@ -132,6 +148,13 @@ interface MessagePackState extends MessagePackShapeLimits {
   items: number;
 }
 
+interface OutboundShapeState extends MessagePackShapeLimits {
+  readonly maxBytes: number;
+  readonly ancestors: WeakSet<object>;
+  items: number;
+  estimatedBytes: number;
+}
+
 function validateFrameLimits(limits: FrameLimits): MessagePackShapeLimits {
   if (
     !Number.isSafeInteger(limits.maxControlFrameBytes) ||
@@ -149,6 +172,157 @@ function validateFrameLimits(limits: FrameLimits): MessagePackShapeLimits {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid control-frame depth limit');
   }
   return { maxItems, maxDepth };
+}
+
+/**
+ * Reject oversized or exotic outbound values before msgpackr allocates a body.
+ * The byte estimate is a conservative upper bound for the plain MessagePack
+ * subset accepted by validateMessagePack(), so packing cannot create an
+ * allocation larger than the configured frame limit.
+ */
+function validateOutboundValue(
+  value: unknown,
+  maxBytes: number,
+  limits: MessagePackShapeLimits
+): void {
+  const state: OutboundShapeState = {
+    ...limits,
+    maxBytes,
+    ancestors: new WeakSet(),
+    items: 0,
+    estimatedBytes: 0
+  };
+  visitOutboundValue(value, 0, state);
+}
+
+function visitOutboundValue(value: unknown, depth: number, state: OutboundShapeState): void {
+  if (depth > state.maxDepth) {
+    throw new P2PError('RESOURCE_LIMIT', 'MessagePack nesting exceeds the configured limit');
+  }
+  reserveOutbound(state, 1, 0);
+  if (value === null || typeof value === 'boolean') {
+    reserveOutbound(state, 0, 1);
+    return;
+  }
+  if (typeof value === 'number') {
+    if (Object.is(value, -0)) throw invalidOutboundValue();
+    reserveOutbound(state, 0, 9);
+    return;
+  }
+  if (typeof value === 'bigint') {
+    reserveOutbound(state, 0, 9);
+    return;
+  }
+  if (typeof value === 'string') {
+    reserveOutbound(state, 0, encodedStringUpperBound(value));
+    return;
+  }
+  if (isWireByteArray(value)) {
+    reserveOutbound(state, 0, checkedEncodedLength(value.byteLength));
+    return;
+  }
+  if (typeof value !== 'object' || value === null) throw invalidOutboundValue();
+  if (state.ancestors.has(value)) throw invalidOutboundValue();
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      assertPlainArray(value, state);
+      reserveOutbound(state, 0, 5);
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw invalidOutboundValue();
+        visitOutboundValue(descriptor.value, depth + 1, state);
+      }
+      return;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw invalidOutboundValue();
+    reserveOutbound(state, 0, 5);
+    // Enumerate incrementally: Object.keys() would allocate an attacker-sized
+    // key array before the item/byte budgets get a chance to reject it.
+    let entries = 0;
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      entries += 1;
+      if (entries > 0xffff) {
+        throw new P2PError('RESOURCE_LIMIT', 'Outbound object exceeds the project map limit');
+      }
+      if (isPrototypeKey(key)) throw invalidOutboundValue();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw invalidOutboundValue();
+      reserveOutbound(state, 1, encodedStringUpperBound(key));
+      visitOutboundValue(descriptor.value, depth + 1, state);
+    }
+    // msgpackr consults hasOwnProperty while walking plain objects. Reject
+    // hidden/symbol/accessor fields as well, so a non-enumerable shadow cannot
+    // execute between preflight and packing.
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        typeof key !== 'string' ||
+        isPrototypeKey(key) ||
+        !descriptor ||
+        !descriptor.enumerable ||
+        !Object.hasOwn(descriptor, 'value')
+      ) throw invalidOutboundValue();
+    }
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function assertPlainArray(value: readonly unknown[], state: OutboundShapeState): void {
+  if (Object.getPrototypeOf(value) !== Array.prototype) throw invalidOutboundValue();
+  // A dense array contributes at least one item and one byte per element.
+  // Reject impossible shapes before walking indexes or enumerating keys.
+  if (
+    value.length > state.maxItems - state.items ||
+    value.length > state.maxBytes - state.estimatedBytes
+  ) {
+    throw new P2PError('RESOURCE_LIMIT', 'Outbound array exceeds configured frame limits');
+  }
+  let elements = 0;
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw invalidOutboundValue();
+    if (key === 'length') continue;
+    if (
+      typeof key !== 'string' ||
+      !descriptor.enumerable ||
+      !/^(?:0|[1-9]\d*)$/.test(key) ||
+      Number(key) >= value.length
+    ) throw invalidOutboundValue();
+    elements += 1;
+  }
+  if (elements !== value.length) throw invalidOutboundValue();
+}
+
+function encodedStringUpperBound(value: string): number {
+  return checkedEncodedLength(Buffer.byteLength(value));
+}
+
+function checkedEncodedLength(length: number): number {
+  if (!Number.isSafeInteger(length) || length < 0) throw invalidOutboundValue();
+  return length + 5;
+}
+
+function reserveOutbound(state: OutboundShapeState, items: number, bytes: number): void {
+  if (
+    !Number.isSafeInteger(items) ||
+    !Number.isSafeInteger(bytes) ||
+    state.items + items > state.maxItems
+  ) {
+    throw new P2PError('RESOURCE_LIMIT', 'MessagePack values exceed the configured limit');
+  }
+  state.items += items;
+  if (bytes > state.maxBytes - state.estimatedBytes) {
+    throw new P2PError('RESOURCE_LIMIT', `Outbound frame exceeds ${state.maxBytes} bytes`);
+  }
+  state.estimatedBytes += bytes;
+}
+
+function invalidOutboundValue(): P2PError {
+  return new P2PError('INVALID_FRAME', 'Outbound frame must contain bounded, accessor-free plain data');
 }
 
 /**
@@ -183,8 +357,9 @@ function parseMessagePackValue(state: MessagePackState, depth: number, mapKey: b
     return undefined;
   }
   if (token >= 0x80 && token <= 0x8f) {
-    parseMessagePackMap(state, token & 0x0f, depth);
-    return undefined;
+    // Plain objects are encoded by this protocol's pinned msgpackr settings
+    // as map16, including empty/small objects.
+    throw invalidMessagePackShape();
   }
 
   switch (token) {
@@ -195,48 +370,101 @@ function parseMessagePackValue(state: MessagePackState, depth: number, mapKey: b
     case 0xc4:
       skipBytes(state, readUnsigned(state, 1));
       return undefined;
-    case 0xc5:
-      skipBytes(state, readUnsigned(state, 2));
+    case 0xc5: {
+      const length = readUnsigned(state, 2);
+      if (length <= 0xff) throw invalidMessagePackShape();
+      skipBytes(state, length);
       return undefined;
-    case 0xc6:
-      skipBytes(state, readUnsigned(state, 4));
+    }
+    case 0xc6: {
+      const length = readUnsigned(state, 4);
+      if (length <= 0xffff) throw invalidMessagePackShape();
+      skipBytes(state, length);
       return undefined;
+    }
     case 0xca:
-    case 0xce:
-    case 0xd2:
-      skipBytes(state, 4);
+      // The encoder deliberately uses float64 only. Accepting float32 would
+      // give the same JavaScript number multiple wire representations.
+      throw invalidMessagePackShape();
+    case 0xcb: {
+      const offset = state.offset;
+      const number = readFloat64(state);
+      if (
+        (Number.isNaN(number) && (
+          state.view.getUint32(offset) !== 0x7ff8_0000 ||
+          state.view.getUint32(offset + 4) !== 0
+        )) ||
+        Object.is(number, -0) ||
+        (Number.isInteger(number) && number >= -0x8000_0000 && number <= 0xffff_ffff)
+      ) {
+        throw invalidMessagePackShape();
+      }
       return undefined;
-    case 0xcb:
-    case 0xcf:
-    case 0xd3:
-      skipBytes(state, 8);
-      return undefined;
+    }
     case 0xcc:
-    case 0xd0:
-      skipBytes(state, 1);
+      if (readUnsigned(state, 1) < 0x80) throw invalidMessagePackShape();
       return undefined;
     case 0xcd:
+      if (readUnsigned(state, 2) <= 0xff) throw invalidMessagePackShape();
+      return undefined;
+    case 0xce:
+      if (readUnsigned(state, 4) <= 0xffff) throw invalidMessagePackShape();
+      return undefined;
+    case 0xcf: {
+      const highByte = readUnsigned(state, 1);
+      if ((highByte & 0x80) === 0) throw invalidMessagePackShape();
+      skipBytes(state, 7);
+      return undefined;
+    }
+    case 0xd0:
+      if (readSigned(state, 1) >= -32) throw invalidMessagePackShape();
+      return undefined;
     case 0xd1:
-      skipBytes(state, 2);
+      if (readSigned(state, 2) >= -0x80) throw invalidMessagePackShape();
       return undefined;
-    case 0xd9:
-      return readMessagePackString(state, readUnsigned(state, 1));
-    case 0xda:
-      return readMessagePackString(state, readUnsigned(state, 2));
-    case 0xdb:
-      return readMessagePackString(state, readUnsigned(state, 4));
-    case 0xdc:
-      parseMessagePackArray(state, readUnsigned(state, 2), depth);
+    case 0xd2:
+      if (readSigned(state, 4) >= -0x8000) throw invalidMessagePackShape();
       return undefined;
-    case 0xdd:
-      parseMessagePackArray(state, readUnsigned(state, 4), depth);
+    case 0xd3:
+      // Signed int64 is also the canonical representation of every signed
+      // bigint, including values that would fit in a smaller number token.
+      skipBytes(state, 8);
       return undefined;
+    case 0xd9: {
+      const length = readUnsigned(state, 1);
+      if (length < 32) throw invalidMessagePackShape();
+      return readMessagePackString(state, length);
+    }
+    case 0xda: {
+      const length = readUnsigned(state, 2);
+      if (length <= 0xff) throw invalidMessagePackShape();
+      return readMessagePackString(state, length);
+    }
+    case 0xdb: {
+      const length = readUnsigned(state, 4);
+      if (length <= 0xffff) throw invalidMessagePackShape();
+      return readMessagePackString(state, length);
+    }
+    case 0xdc: {
+      const length = readUnsigned(state, 2);
+      if (length < 16) throw invalidMessagePackShape();
+      parseMessagePackArray(state, length, depth);
+      return undefined;
+    }
+    case 0xdd: {
+      const length = readUnsigned(state, 4);
+      if (length <= 0xffff) throw invalidMessagePackShape();
+      parseMessagePackArray(state, length, depth);
+      return undefined;
+    }
     case 0xde:
+      // msgpackr intentionally emits map16 for small plain objects so it can
+      // reserve the count and serialize them in one pass. This is the sole
+      // project-canonical exception to preferred MessagePack sizing.
       parseMessagePackMap(state, readUnsigned(state, 2), depth);
       return undefined;
     case 0xdf:
-      parseMessagePackMap(state, readUnsigned(state, 4), depth);
-      return undefined;
+      throw invalidMessagePackShape();
     default:
       // 0xc1 and all extension encodings (0xc7-0xc9, 0xd4-0xd8) are not
       // emitted by the plain p2prpc wire schema and are deliberately rejected.
@@ -254,7 +482,7 @@ function parseMessagePackMap(state: MessagePackState, length: number, depth: num
   const keys = new Set<string>();
   for (let index = 0; index < length; index += 1) {
     const key = parseMessagePackValue(state, depth + 1, true);
-    if (key === undefined || key === '__proto__' || keys.has(key)) throw invalidMessagePackShape();
+    if (key === undefined || isPrototypeKey(key) || keys.has(key)) throw invalidMessagePackShape();
     keys.add(key);
     parseMessagePackValue(state, depth + 1, false);
   }
@@ -288,6 +516,20 @@ function readUnsigned(state: MessagePackState, size: 1 | 2 | 4): number {
   return state.view.getUint32(offset);
 }
 
+function readSigned(state: MessagePackState, size: 1 | 2 | 4): number {
+  const offset = state.offset;
+  skipBytes(state, size);
+  if (size === 1) return state.view.getInt8(offset);
+  if (size === 2) return state.view.getInt16(offset);
+  return state.view.getInt32(offset);
+}
+
+function readFloat64(state: MessagePackState): number {
+  const offset = state.offset;
+  skipBytes(state, 8);
+  return state.view.getFloat64(offset);
+}
+
 function skipBytes(state: MessagePackState, count: number): void {
   if (!Number.isSafeInteger(count) || count < 0 || count > state.bytes.byteLength - state.offset) {
     throw invalidMessagePackShape();
@@ -297,6 +539,22 @@ function skipBytes(state: MessagePackState, count: number): void {
 
 function invalidMessagePackShape(): P2PError {
   return new P2PError('INVALID_FRAME', 'Invalid or non-canonical MessagePack frame');
+}
+
+function isWireByteArray(value: unknown): value is Uint8Array {
+  if (typeof value !== 'object' || value === null) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Uint8Array.prototype && prototype !== Buffer.prototype) return false;
+  if (
+    Object.getOwnPropertyDescriptor(value, 'byteLength') ||
+    Object.getOwnPropertyDescriptor(value, 'constructor') ||
+    Object.getOwnPropertyDescriptor(value, Symbol.iterator)
+  ) throw invalidOutboundValue();
+  return true;
+}
+
+function isPrototypeKey(value: string): boolean {
+  return value === '__proto__' || value === 'prototype' || value === 'constructor';
 }
 
 export function encodeVarint(value: number): Uint8Array {
@@ -321,7 +579,10 @@ export async function readVarint(recv: QuicRecvStream): Promise<number> {
     if (byte === undefined) throw new P2PError('INVALID_FRAME', 'Truncated varint');
     value += (byte & 0x7f) * multiplier;
     if (!Number.isSafeInteger(value)) throw new P2PError('INVALID_FRAME', 'Varint exceeds safe integer range');
-    if ((byte & 0x80) === 0) return value;
+    if ((byte & 0x80) === 0) {
+      if (index > 0 && (byte & 0x7f) === 0) throw new P2PError('INVALID_FRAME', 'Varint is not canonical');
+      return value;
+    }
     multiplier *= 128;
   }
   throw new P2PError('INVALID_FRAME', 'Varint is too long');
@@ -330,5 +591,19 @@ export async function readVarint(recv: QuicRecvStream): Promise<number> {
 export function assertRecord(value: unknown, label: string): asserts value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new P2PError('INVALID_FRAME', `${label} must be an object`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new P2PError('INVALID_FRAME', `${label} must be a plain object`);
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== 'string' ||
+      isPrototypeKey(key) ||
+      !descriptor ||
+      !descriptor.enumerable ||
+      !Object.hasOwn(descriptor, 'value')
+    ) throw new P2PError('INVALID_FRAME', `${label} contains an unsafe field`);
   }
 }

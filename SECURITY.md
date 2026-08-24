@@ -1,110 +1,123 @@
-# Security policy and threat model
+# Security policy
+
+## Reporting
+
+Do not open a public issue with secrets or exploit details. Use [GitHub private vulnerability reporting](https://github.com/arduano/p2prpc/security/advisories/new) and include affected commit/version, impact, reproduction, and any proposed mitigation. Rotate credentials, capability tokens, or endpoint keys included in a report.
+
+Before the first npm release, only `main` is supported. After releases begin, the current minor line and `main` are intended to receive fixes.
 
 ## Security target
 
-p2prpc assumes the network, signed tickets, DNS/PKARR and mDNS route results, request metadata, remote endpoints, RPC inputs, file manifests, and file contents may be hostile. It relies on Iroh/QUIC for transport confidentiality and possession of an endpoint key, and adds mandatory application authentication and authorization before dispatch. Knowledge of an address, locator, or peer ID is never intended to authorize RPC or file work.
+p2prpc treats the network, locators, DNS/PKARR and mDNS results, remote endpoint, request metadata/input, file manifest/metadata/content, and capability presenter as hostile.
 
-Reviewers can use the concise [architecture and security wiki](./docs/wiki/Home.md) before this detailed control and residual-risk register.
+An Iroh endpoint ID proves possession of a transport key. A signed ticket proves which endpoint signed route hints. Neither authorizes application work. The current QUIC application protocol/ALPN is v4; the credential-handshake format remains v3. p2prpc dispatches RPC or file streams only after:
 
-## Supported versions
+1. the connected endpoint matches an independently trusted expectation for outbound calls;
+2. optional endpoint-key admission succeeds;
+3. both peers complete the exact six-message protocol-v3 application handshake;
+4. the authenticated principal matches the expected principal for outbound calls;
+5. the current session and operation pass explicit authorization.
 
-Before the first npm release, security fixes are maintained on `main` only. After releases begin, maintainers intend to support `main` and the latest released minor line. Older snapshots and unsupported dependency combinations may not receive fixes.
+The concise, audit-oriented model is in the [security wiki](./docs/wiki/Security-Model.md) and [audit guide](./docs/wiki/Audit-Guide.md).
 
-| Version | Status |
-|---|---|
-| `main` | Supported |
-| npm package | Not yet published |
-| Other snapshots | Unsupported |
+## Implemented controls
 
-The intended enterprise deployment uses short-lived OAuth access tokens with exact issuer/audience validation and proof-of-possession binding to managed Iroh endpoint keys. A provisioned HMAC secret is suitable for smaller workload-to-workload deployments. Human identity, workload identity, device identity, and authorization policy should remain distinct in audit records.
+### Identity and authorization
 
-## Controls implemented
+- Production root creation accepts only branded peer-bound OIDC or shared-secret factories; no anonymous default exists.
+- The v3 transcript commits protocol, roles, both endpoint IDs, fresh 256-bit nonces, timestamps, credentials, grant expiries, transcript hashes, and session ID.
+- Unknown handshake fields, wrong roles/IDs/protocol, stale timestamps, excessive credentials, transcript mismatch, trailing bytes, and incomplete finish fail closed.
+- The responder withholds its credential until the initiator authenticates.
+- Physical reconnect repeats endpoint admission, authentication, exact principal comparison, and operation authorization. A runtime cannot swap canonical principal; a same-principal inbound connection may revive a retained disconnected outbound runtime.
+- Every RPC path/type, file push, and capability pull receives a current-session authorization decision.
+- Connection replacement, expiry, peer close, and node close abort session-bound signals.
 
-- Fail-closed required `SessionSecurity`; no anonymous default.
-- Mutual protocol-v2 handshake with fresh 256-bit nonces, transcript-derived session ID, bounded credential/frame size, deadline, exact contract identity, mutual credential verification, and expiry closure.
-- Authentication repeated on every physical reconnect; principal swapping on one endpoint runtime is rejected.
-- Connection replacement, expiry, explicit peer close, and node shutdown abort active RPC and file-operation signals; a closed peer handle cannot reconnect itself.
-- OAuth JWT verification through `jose`: exact configured issuer/audience, HTTPS JWKS, algorithm allow-list, time claims, access-token type, scopes, a one-hour default/24-hour maximum token age, and default `cnf.jkt` binding to the Iroh Ed25519 identity.
-- Canonical, collision-resistant OIDC principal IDs derived from the verified issuer/subject/client tuple; conflicting `client_id` and `azp` claims are rejected.
-- Per-operation authorization for every RPC path/type, incoming file push, and capability pull.
-- Normalized, immutable, bounded request metadata separated from a frozen trusted session principal/claims and frozen library-owned `PeerContext` view. Credential, forwarding, HTTP authority/origin, and library-owned names are reserved; security-relevant display text rejects or sanitizes C0/C1 and Unicode bidirectional/zero-width formatting controls.
-- Domain-separated Ed25519-signed, expiring, size-bounded locator tickets with strict peer-key, timestamp-ordering, socket-address, relay-URL, and canonical-encoding validation. Tickets are never authorization capabilities.
-- Required outbound target binding: every `connect()` supplies an explicit signed-ticket, DNS/PKARR, or mDNS locator plus a separately trusted expected endpoint ID and exact canonical principal matcher. Route/connection identity mismatch and endpoint admission fail before credentials are requested; principal mismatch fails before a peer runtime is installed or returned. The frozen target is retained across reconnects, with dynamic locators resolved again.
-- Bounded unauthenticated handshakes, application stream handlers, control-frame bytes/items/nesting, RPC paths/headers, file manifests, chunks, lanes, active transfers, and transfer queues. MessagePack is preflighted before decoding and rejects extensions, invalid UTF-8 map keys, duplicate keys, and `__proto__`.
-- Peer-bound, expiring, one-operation file capabilities by default; only domain-separated token hashes are stored. Capability failures are deliberately non-oracular.
-- Exact authenticated-connection binding for file control/data lanes, receiver-issued transfer attempt and lane secrets, duplicate-session rejection, and strict chunk-size validation before allocation. The built-in filesystem destination performs full-file BLAKE3 verification before publication.
-- Capability operations bound across bounded reconnects to peer ID, the complete canonical principal tuple (ID, issuer, subject, OAuth client, and tenant), operation ID, and negotiated chunk-size/lane fingerprint. Active revocation aborts reservations.
-- No-follow/stability-checked file sources and exclusive private, locked, verified, atomically published destinations.
-- Remote RPC error shapes strip stacks, custom data, and internal-error messages.
+### OIDC/OAuth
 
-The security regression suite includes a native raw-Iroh peer which has the target ID and direct routes but cannot invoke a tRPC mutation without the application handshake.
+- Exact configured issuer and audience, an explicit allow-list drawn from `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, `ES512`, and Ed25519 `EdDSA`, a configured HTTPS JWKS/static JWKS/single static public key, signature, `iat`, `exp`, access-token `typ`, maximum age, and bounded clock tolerance. The production OIDC factory rejects HTTP JWKS endpoints and arbitrary JOSE key-resolver callbacks.
+- Required `p2prpc:connect`; operations require `p2prpc:rpc`, exact `p2prpc:rpc:<path>`, `p2prpc:file:push`, or `p2prpc:file:pull`, while `p2prpc:*` satisfies every library scope. Custom policy can narrow but cannot restore a missing scope.
+- Canonical immutable issuer/subject/client/tenant principal and deeply bounded claims/scopes.
+- Exact `cnf.jkt` binding to the authenticated remote Iroh Ed25519 key, or an authoritative directory callback only when `cnf` is absent. Malformed/mismatched present `cnf` never falls back.
+- Token-controlled `jku` and `x5u` are ignored; only p2prpc constructs local or remote JWKS resolvers. Static and fetched JWKS are capped at 64 keys/256 KiB and accept only importable public material compatible with the issuer allow-list. Static JWKs require explicit `alg`; fetched JWKs may omit it, but a present `alg` must be compatible/allow-listed and every fetched key requires a bounded unique `kid`. Mutable JWKs and descriptor-safe configuration are snapshotted at construction.
+- Remote JWKS fetches reject redirects, have a 5-second timeout, 30-second success/failure cooldown, and 10-minute cache lifetime. A removed key can remain accepted until cache refresh, and established sessions are not reverified; revocation latency is therefore bounded by cache, token, and session lifetimes unless deployment policy adds an online decision.
 
-## Operational requirements
+p2prpc is a resource server, not an authorization server: applications own browser/workload login, token acquisition/refresh, and storage. OAuth remains valuable without HTTP because audience, scopes, short grants, identity, and key rotation are transport-independent.
 
-- Persist Iroh secret keys in a secrets manager or managed device keystore. Ephemeral endpoint identities make peer binding and audit correlation unstable.
-- Bootstrap expected peer IDs and expected canonical principal tuples through a trusted directory, device-management channel, or equivalent authenticated mechanism independently of route discovery. Signed tickets prove which endpoint key authored their routing data; DNS/PKARR and mDNS provide routes for the separately named key. None says that the endpoint belongs to an approved application principal. For optional principal fields, a `null` matcher value explicitly requires absence.
-- Use access tokens intended for this service, preferably `typ: at+jwt`, with short expiry. Never present ID or refresh tokens. Mint a narrow token for the expected peer/audience in `getAccessToken` where the authorization server supports it.
-- Assign a distinct OAuth audience and required connection scope per application, environment, and trust domain. Do not let a broadly accepted token turn one authenticated service into a confused deputy for another.
-- Use `preAuthorizePeer` for an organization-wide endpoint-key allow-list and inbound admission. This hook runs before the session handshake and must remain a cheap key-admission check; outbound calls also enforce their required per-call expected endpoint. It does not replace expected-principal matching, credential verification, or operation policy.
-- Keep `peerBinding: 'required'`, or implement `bindPrincipalToPeer` against an authoritative managed-key directory.
-- Rotate/revoke endpoint keys and signing keys through organizational lifecycle controls. Use short JWT/session lifetimes or introspection for urgent revocation.
-- Treat RPC headers as caller assertions even after normalization and freezing. Middleware must derive identity and membership from `ctx.auth.principal` and compare metadata such as a requested tenant against verified claims or authoritative policy.
-- For non-idempotent mutations, require a bounded `idempotency-key` header and atomically key durable operation state by the complete verified principal tuple, verified tenant, procedure path, and key. The caller-supplied key is replay-control input, not identity or permission.
-- Select relay behavior with `iroh.relay`: the default Iroh network, explicit custom HTTPS URLs, or disabled. Custom relays are relay-assisted and may upgrade to direct. DNS/PKARR is endpoint-wide and may supplement ticket or mDNS hints. For isolated or filtered routing, use a DNS-disabled endpoint and restrict candidates with `iroh.allowDirectAddress` and `iroh.allowRelayUrl`; enabling DNS plus either callback fails closed because the pinned wrapper cannot expose resolved candidates before dialing. Without a callback, mDNS accepts only private/link-local/loopback direct hints and rejects default-network relay hints. Custom relay mode restricts ticket/mDNS hints to its configured canonical origins; disabled mode rejects every relay hint.
-- Exact-pinned `@momics/iroh-http-node` 0.6.0 maps disabled relays to loopback-only networking. This release does not claim production relay-less or real-LAN-direct support until a fixed upstream version passes the published validation matrix.
-- Resolve authorized application object IDs inside service-owned source roots; never pass caller-supplied paths to `fileSource()`. Source and destination parent directories must be inaccessible to untrusted local users who could replace a path component. Put received files in quarantine and run malware, DLP, and content-type policy before making them available. A BLAKE3 digest proves transfer consistency, not that content is safe or trusted.
-- Treat file capability tokens as secrets. Return them only through authorized procedures, never place them in request metadata, and redact them from logs, traces, and durable audit records.
-- Treat a surviving `.p2prpc.lock` as potentially live. There is no automatic stale-lock breaking; after a crash, remove it only after establishing that no writer owns that destination.
-- Ensure long-lived subscriptions produce application data or heartbeat events inside the configured per-read I/O timeout. The built-in client defaults to 30 seconds and the protocol has no heartbeat frame.
-- Treat trace IDs, tenant headers, filenames, metadata, and rejection text as untrusted when logging or displaying them.
-- Do not put credentials, personal data, or other secrets in application-authored tRPC error messages. Non-internal messages are sanitized and capped, but are intentionally visible to the authenticated caller.
-- Apply application-specific rate, tenant, aggregate disk, and business-operation limits above the library defaults.
-- Export `onSecurityEvent` records to a durable sink and monitor delivery health. The callback is best-effort and in-process; it is not a durable, complete, or backpressured audit log.
-- Review the pinned native Iroh dependency, provenance, SBOM, platform builds, relay configuration, and QUIC behavior as part of the production supply-chain review.
-- Review the packaged dependency licenses and the Iroh artifact caveat recorded in [`packages/core/THIRD_PARTY_NOTICES.md`](./packages/core/THIRD_PARTY_NOTICES.md).
+### RPC and metadata
 
-## Known residual risks
+- Request frames and remote error shapes use exact schemas; response IDs/paths/codes must be internally consistent.
+- Header names/values/count/aggregate bytes are bounded, normalized, frozen, and stripped of credential/proxy/library-reserved names and unsafe display controls.
+- `ctx.p2p` separates verified identity from untrusted caller headers and cannot be replaced by application context.
+- MessagePack is byte/item/depth bounded and accepts one project-canonical encoding: duplicate/prototype keys, overlong varints, alternate numeric/container encodings, extensions, accessors, symbols, and exotic prototypes are rejected. RPC SuperJSON uses a private built-in-only, acyclic codec; global custom transformers, classes, symbols, aliases, and cycles are not wire types. Outbound values are preflighted before serialization; inbound annotation paths are canonical, non-overlapping, target-checked, and allocation-bounded before value construction.
+- Internal tRPC errors, stacks, formatter extensions, and unsanitized peer text are not exposed.
+- RPC is never transparently retried; after dispatch uncertainty is `OUTCOME_UNKNOWN`.
 
-- `@momics/iroh-http-node` is pinned to 0.6.0 because its 0.6.1 wrapper reports an internal native-binding version of 0.6.0 and fails when napi-rs strict version enforcement is enabled. CI loads the pin with `NAPI_RS_ENFORCE_VERSION_CHECK=1`. Upstream's Linux binaries require glibc 2.34 or newer; Alpine/musl and older glibc distributions are unsupported. Its npm artifacts also omit their declared MIT/Apache license texts, as detailed in the third-party notices.
-- `@momics/iroh-http-node` 0.6 does not expose custom native QUIC ALPN, stream priorities (`setPriority` is a no-op), configured stream-count limits, or configured receive-window limits through this adapter. Flow control remains native-managed. The authenticated application handshake supplies protocol isolation, while JavaScript admission limits, deadlines, and cleanup bound dispatched work. A native stream-open operation cannot currently be aborted; a stream which resolves after its caller timed out is cleaned up when it arrives.
-- During outbound bootstrap the initiator presents its credential only after route resolution and the connection match the separately trusted expected endpoint ID, but before it can authenticate and compare the remote application principal. Trusted target provisioning, `preAuthorizePeer`, proof-of-possession binding, narrow audience, and short token lifetime limit disclosure to an approved endpoint key running an unexpected application identity.
-- The handshake refresh model is reconnect-on-expiry rather than in-place token refresh. Existing work ends when the connection closes.
-- JWT revocation is not instantaneous without short lifetimes or a custom introspection-backed authenticator.
-- OIDC `authorize` is deliberately unable to override missing mandatory scopes. Custom policy can only reduce the access granted by the connection and operation scopes.
-- Shared-secret authentication denies every RPC and file action unless an explicit `authorize` callback grants it. Unknown or misspelled security-policy fields are rejected rather than falling back to a permissive default.
-- Application callbacks and tRPC procedures can still consume unbounded CPU, memory, disk, or time. Use deadlines, rate limits, worker isolation, and tenant quotas appropriate to the workload.
-- Prefer `allowedPrincipals: [ctx.auth.principal]` for file capabilities. `allowedSubjects` is deprecated because it compares a raw issuer-scoped subject. `allowBearer: true` permits omission of endpoint-ID binding only; an explicit `allowedPeerIds` list still applies, and `allowedPrincipals` can bind the complete issuer/subject/client/tenant identity.
-- `maxDownloads` counts logical operation IDs, not exactly-once network delivery. Explicit revocation aborts active reservations. Passive expiry prevents a new or reconnecting reservation but is not a standalone timer that guarantees termination of active work at the exact expiry instant. A disconnected operation has a fixed 30-second reconnect lease and five reconnects by default, and it is reauthenticated and reauthorized on every new connection.
-- Resume state is bound to file digest, size, and chunk size, and saved chunks are re-hashed, but it is not bound to a peer, principal, session, or capability. Authorization is independent. Resume state is not a substitute for an enterprise transfer database, retention policy, or cleanup service.
-- Leaf-level no-follow and identity checks do not defend against a local attacker who controls a source or destination parent directory, and they do not authorize a caller to select a source path.
-- Custom file sources and destinations must cooperate with abort signals. The library waits for a side-effecting callback to settle after abort so callers cannot observe a timeout followed by late publication; a callback that ignores cancellation can therefore leave its transfer promise pending. Isolate or wrap untrusted implementations.
-- Custom file destinations are trusted storage adapters and must verify complete staged content against the manifest immediately before publishing it. The transport checks each received chunk, but it cannot independently re-read an opaque custom destination. Prefer `fileDestination()` or require equivalent verification and atomic-commit behavior in storage-adapter review.
-- Concurrency limits bound simultaneous unauthenticated handshakes but do not impose a source-IP or endpoint-key attempt rate, which the current native adapter does not expose. Internet-facing deployments should add relay, network-edge, or admission-directory rate limiting in addition to `preAuthorizePeer`.
-- Security-event callbacks can lose events on process failure or sink failure. Once policy evaluation begins, exceptions/timeouts emit a generic denied authorization event; a stale-session rejection before evaluation begins does not.
-- Cancellation is cooperative and cannot undo a mutation that has already begun.
-- RPC delivery is not exactly once. Durable, atomic application-level idempotency is required wherever replaying or losing the response to a completed mutation would be unsafe.
-- Production and maintainer dependencies are audited in CI. The maintainer toolchain overrides `tsup`'s esbuild dependency to a patched compatible release until `tsup` updates its declared range.
+### Files and capabilities
 
-## Reporting vulnerabilities
+- Root `ctx.p2p.files.share()` and `peer.files.share()` automatically bind a capability to the current endpoint and complete principal; arbitrary/bearer policy is advanced-only. A captured request facade rejects after its exact session is replaced or expires.
+- Capability and logical-operation IDs are random; registries store domain-separated hashes and bounded indexed records.
+- Expiry, logical-download count, atomic reservation, active revocation, reconnect lease/attempt limit, endpoint/principal/fingerprint matching, and completion reconciliation are enforced.
+- File control/data lanes are bound to the exact authenticated connection, attempt, and receiver-issued lane secret.
+- Pull retry authority is private to the exact current attempt and is granted only after typed current-transport loss, stream drain, and prepared-source closure. Callback-visible errors, stale abort reasons, plain `DISCONNECTED` errors, and untyped connection aborts cannot authorize reconnect.
+- File wire v4 commits use a fresh receiver receipt challenge. The sender keeps its send half open, echoes that token only after seeing durable success, and then sends FIN; a pre-sent or mismatched receipt cannot retire correctness-critical push state.
+- Active and acknowledgement-ambiguous push records occupy a hard store bounded independently per peer, per canonical principal across endpoint keys, and node-wide; capacity exhaustion rejects admission and never evicts correctness-critical state. Acknowledged/rejected outcomes occupy a separate replay-tombstone store with evictable bounds at the same three scopes. Acknowledged throughput therefore does not exhaust hard reconciliation capacity or create an unbounded node-wide peer map.
+- Sources use no-follow identity checks and retain one prepared descriptor across hashing and send.
+- Destinations use no-follow private staging/lock/resume files, bounded binary v3 resume state, chunk and complete BLAKE3 verification, and atomic durable publication.
+- Remote names are display values only. Applications choose trusted destination paths.
+- Optional metadata is rejected without a configured Standard Schema v1 validator; plain data is accessor/prototype checked and copied before packing, and validated output is snapshotted. Binary metadata is defensively copied again on every public manifest access.
 
-Do not publish secrets or exploit details in a public issue. Use GitHub's [private vulnerability reporting](https://github.com/arduano/p2prpc/security/advisories/new) with affected versions, impact, reproduction details, and suggested remediation. Maintainers will acknowledge reports as availability permits and coordinate disclosure after a fix or mitigation is ready. Rotate any credentials or endpoint keys included in a report.
+### Availability and lifecycle
 
-## Breaking migration from 0.1
+- Global, endpoint, and principal quotas cover handshakes, streams, direction-separated file transfers, library-controlled buffers, callbacks, and fair bounded queues.
+- Each quota scope independently reserves outbound/inbound file-control and outbound/inbound file-data progress. Stream limits admit those four classes plus one general/RPC stream; buffer limits admit three control frames plus both data buffers.
+- Requests too large for any applicable ceiling reject immediately rather than queue forever.
+- Handshakes also use global/per-peer token buckets.
+- Streams, prepared sources, destinations, reservations, callbacks, and tasks have explicit owners and exact terminal cleanup. Timeout does not erase ownership of an underlying promise that is still running.
+- Shutdown is bounded by `shutdownTimeoutMs`; a non-cooperative owner makes `close()` reject with `TIMEOUT` while accounting remains active and transport teardown still proceeds.
+- Slow file progress consumers are independently conflated and cannot backpressure a transfer.
+- File receive timeouts measure lack of progress rather than total duration; lane/chunk/64 KiB segment/write/FIN progress refreshes the watchdog while each stalled operation remains bounded.
+- Failed native stream cleanup quarantines/closes the physical connection.
+- Initial install, replacement, duplicate arbitration, runtime revival, and reconnect share one final admission-success gate after synchronous callbacks. Public promise continuations recheck it after their last `await`, and queued `onPeer` delivery is conditional on the exact selection remaining current. A peer is returned only while its node, registry slot, live-map entry, epoch, and session remain current; callback-triggered closure rejects acquisition instead of returning a stale handle.
+- Receiver reconciliation expiry uses a deadline index and removes only due records, rather than scanning all retained peer/principal state on each operation. Node close first rejects new ledger admission; it clears retained state only after all ledger-owning work settles, even when the public close deadline expires first.
 
-- Replace `connect(ticket)` with `connect({ locator: { kind: 'ticket', ticket }, expectedPeerId, expectedPrincipal })`; DNS/PKARR and mDNS use their corresponding locator variants. The principal matcher requires exact `subject`, `issuer`, `clientId`, and `tenantId` expectations (`null` means absent) and accepts an optional canonical `id` check. Source expectations independently of the locator; shared-secret peers use the endpoint ID as `id`/`subject` with the optional fields set to `null`.
-- Add required `security`; replace `authorizePeer` with optional `preAuthorizePeer` only for cheap endpoint-key filtering.
-- `PeerContext` now contains `auth` and per-call `request`, including normalized `request.headers`.
-- The library-owned `PeerContext` object passed to `createContext` is now frozen. Context factories which augmented that input by mutation must return a new application context instead.
-- Node options are snapshotted at construction, including captured security methods and copied Iroh secret-key/relay lists. Do not rely on later mutation of the original options object for policy or key rotation.
-- Use `p2pRpcContext(headers)` in tRPC call options; credentials cannot be sent as request headers.
-- File sharing must specify `allowedPeerIds` unless `allowBearer: true` is deliberate. Defaults are five minutes and one logical download.
-- Incoming file offers now include the verified `principal`, `sessionId`, and an offer-decision abort signal tied to the authenticated connection attempt.
-- OIDC `principal.id` is now `oidc:<base64url SHA-256>` over a domain-separated encoding of `[issuer, subject, clientId ?? null]`. Migrate ACLs, database keys, cached grants, and audit correlation keyed by the earlier readable/delimiter ID. `issuer`, `subject`, and `clientId` remain separately available.
-- OIDC tokens now have a one-hour default maximum age and cannot configure an age above 24 hours. Custom OIDC `authorize` callbacks no longer grant operations missing their required scope.
-- RPC metadata now reserves HTTP credential/routing names and all `p2prpc-*`/`x-p2prpc-*` names. Rename any application metadata that used them.
-- Protocol v2 control frames now reject MessagePack extensions, non-string or duplicate map keys, `__proto__`, invalid UTF-8 keys, excessive decoded values, and excessive nesting. Custom peers must emit the documented plain-data wire subset.
-- Locator-ticket signatures now include an explicit domain separator. Regenerate any previously issued `p2prpc2` locator tickets; earlier protocol-v2 tickets intentionally fail signature verification after this upgrade.
-- Active file capability revocation now aborts its reservations. Reconnects retain a logical operation only for the same complete principal tuple and negotiated chunk-size/lane fingerprint within bounded retry policy.
-- Code constructing a complete `P2PNodeLimits` value must add `maxControlFrameItems`, `maxControlFrameDepth`, `maxFileChunkSize`, `maxGlobalFileTransfers`, `maxPeers`, and `connectTimeoutMs`; ordinary partial `limits` objects need no change.
-- `peer.close()` now permanently retires that handle instead of allowing a later RPC to reconnect it implicitly.
-- Wire identity is `p2prpc/2/...`; v1 peers and unsigned `p2prpc1` tickets are intentionally incompatible.
+## Deployment requirements
+
+- Store persistent Iroh secret keys in a managed keystore; bootstrap endpoint and exact principal expectations through an authenticated channel independent of discovery.
+- Use distinct OAuth audiences/scopes per application, environment, and trust domain. Prefer short access-token/session lifetimes; use introspection/directory policy when urgent revocation is required.
+- Keep peer proof-of-possession binding mandatory. Never use ID or refresh tokens as access tokens.
+- Treat request headers as assertions. Compare a requested tenant with verified principal claims or authoritative policy.
+- Use durable, atomic application idempotency for mutations, keyed by verified principal/tenant, procedure, and a bounded caller key.
+- Resolve authorized object IDs inside service-owned source roots. Never pass an untrusted path to `fileSource()` or derive a destination from `manifest.name`.
+- Quarantine received files and apply malware, DLP, type, retention, and storage authorization policy. BLAKE3 proves consistency, not safety.
+- Treat capability tokens as secrets; never put them in headers, logs, traces, or durable audit records.
+- Export `onSecurityEvent` to a monitored durable sink. The in-process callback is intentionally best effort.
+- Bound application procedures, schemas, databases, custom callbacks, disk use, and tenant workloads above library limits. Cooperate promptly with supplied `AbortSignal`s.
+- Review any import from `@p2prpc/core/advanced` as part of the trusted computing base. Never deploy `@p2prpc/core/testing`.
+
+## Discovery and native boundary
+
+- Custom relays are canonical HTTPS origins and remote hints must remain in the configured set. Egress callback exceptions deny.
+- Signed-ticket direct candidates require `allowDirectAddress`; default-relay ticket hints require `allowRelayUrl`. Omission rejects rather than allows remote pre-authentication egress. These hooks inspect canonical untrusted remote candidates, not local default-relay selection or configured custom origins.
+- With pinned `@momics/iroh-http-node` 0.6.0, DNS-resolved routes cannot be inspected before dial, so DNS plus custom relay or candidate filters is rejected.
+- Relay-disabled mode removes relay use without disabling UDP networking. This requires an exact-version compatibility seam for node 0.6.0/shared 0.6.1; it targets only the endpoint's exact options object, restores the original export before yielding, and refuses an unexpected version, module graph, descriptor, or call path.
+- Relay-less ticket/mDNS routes require direct reachability and explicit deployment validation; they cannot traverse NATs that require a relay.
+- mDNS defaults to private/link-local/loopback direct candidates and requires explicit policy for default-network relay hints.
+- Native flow control and some QUIC settings are wrapper-managed; the adapter cannot promise cancellation of an already-started native stream open. Late streams are cleaned when delivered and native handle return-to-baseline is a release gate.
+- The exact-pinned Iroh packages require narrow relay-normalization and writer-cleanup compatibility seams. Dependency provenance, platform targets, licenses, SBOM, and native lifecycle evidence are part of release review.
+- Production tRPC client/server versions are exact-pinned to the pair exercised by the wire, type-resolution, and package gates.
+
+## Residual risks
+
+- During outbound mutual bootstrap, a credential is disclosed to the independently approved endpoint key before the remote application principal can be verified. Narrow peer-bound tokens, expected endpoint provisioning, audience separation, and `preAuthorizePeer` reduce this exposure.
+- JWT revocation is bounded by token/session lifetime unless deployments add introspection or authoritative online policy.
+- JavaScript cancellation cannot kill arbitrary application code or undo a committed mutation. A callback that ignores abort can delay structured shutdown and retain admission ownership.
+- RPC delivery is not exactly once. `OUTCOME_UNKNOWN` requires durable reconciliation/idempotency.
+- The node-scoped receiver ledger survives physical connection replacement and same-process runtime revival. Its push reconciliation and acknowledged/rejected replay tombstones remain process-local and time/bound limited: process loss, TTL expiry, or tombstone eviction ends that protection, so durable application state remains authoritative.
+- A custom file destination is trusted to perform complete verification immediately before atomic commit; prefer the built-in destination.
+- Leaf no-follow checks cannot protect a parent directory controlled by a hostile local user.
+- Security/audit callbacks can lose events on sink or process failure.
+- Iroh/native implementations remain a dependency trust boundary and must pass the exact-commit external topology and native-handle gates.
+
+## Release status
+
+Local tests create a candidate, not production approval. The exact source commit must also pass ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled two-host cases; 100-peer mixed workload; and 5,000 pushes plus 5,000 pulls over one authenticated physical connection with stream/task/share/reconciliation/memory/native-handle return-to-baseline. No qualifying external evidence is claimed until those artifacts exist. The one published tarball is then built from that commit, validated without rebuilding in the publish job, and bound to the lab run by the release manifest. See [Production Validation](./docs/wiki/Production-Validation.md).

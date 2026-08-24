@@ -4,69 +4,42 @@
 [![CodeQL](https://github.com/arduano/p2prpc/actions/workflows/codeql.yml/badge.svg)](https://github.com/arduano/p2prpc/actions/workflows/codeql.yml)
 [![Docs](https://github.com/arduano/p2prpc/actions/workflows/pages.yml/badge.svg)](https://arduano.github.io/p2prpc/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D20.3-339933?logo=node.js&logoColor=white)](./packages/core/package.json)
 
-Type-safe peer-to-peer RPC, subscriptions, and parallel resumable file transfer over one Iroh QUIC connection, with mandatory application authentication.
+Type-safe peer-to-peer tRPC, subscriptions, and secure parallel file transfer over one Iroh QUIC connection.
 
-`@p2prpc/core` combines tRPC's router/type system with Iroh's encrypted Ed25519 transport identity. Every physical connection completes a bounded, mutual application handshake before any RPC or file stream is dispatched. RPC calls use independent bidirectional streams; files use a control stream plus bounded parallel data lanes, so interactive traffic can progress alongside bulk transfer.
+p2prpc separates route discovery, Iroh endpoint identity, application identity, authorization, RPC metadata, and file capabilities. Knowing a node ID or signed ticket is never enough to dispatch work: both peers must finish the bounded mutual session handshake, establish an expiring principal, and authorize each operation. The current QUIC application protocol/ALPN is v4; its credential handshake format remains v3.
 
-Read the [published architecture wiki](https://arduano.github.io/p2prpc/) for the concise system model, or browse its [Markdown source](./docs/wiki/Home.md) in the repository.
+```text
+authenticated Iroh QUIC connection
+├── one bidirectional stream per RPC
+├── one bidirectional control stream per file operation
+└── bounded unidirectional file-data lanes
+```
 
-Production readiness requires the tiered [validation matrix](./docs/wiki/Production-Validation.md), including a 10,000-file stream-lifecycle gate over one authenticated QUIC connection. A local lifecycle run has passed but remains explicitly ineligible for that production gate because the pinned Iroh HTTP wrapper provides only loopback when relays are disabled. See the documented support boundary before designing a relay-free deployment.
+The [architecture and security wiki](https://arduano.github.io/p2prpc/) is the concise audit model. Start with [System Model](./docs/wiki/Home.md), [Lifecycles](./docs/wiki/Lifecycles.md), and the [Audit Guide](./docs/wiki/Audit-Guide.md).
 
-> [!NOTE]
-> p2prpc is pre-1.0. The `@p2prpc/core` package is configured for public publishing, but it has not yet been published to npm or qualified by the controlled production-validation lab. The install command below applies after the first registry release; contributors can use the workspace directly with `npm ci`.
+> [!IMPORTANT]
+> This is a pre-1.0 release candidate and has not been published to npm. Publishing remains blocked until the exact candidate passes the external discovery/relay, mixed-load, and 10,000-file lifecycle gates in [Production Validation](./docs/wiki/Production-Validation.md).
 
 ## Requirements
 
-- Node.js 20.3 or newer and an ES module application; CommonJS `require()` is not supported
-- An `@momics/iroh-http-node` native target: glibc 2.34+ Linux x64/arm64, macOS x64/arm64, or Windows x64
-- Matching application ID and contract version
-- A `SessionSecurity` implementation on every node
+- Node.js 20.3+ in an ES module application
+- TypeScript and tRPC 11
+- A supported `@momics/iroh-http-node` native target
+- matching application ID and contract version on both peers
+- peer-bound shared-secret or OIDC security on every production node
 
-Browser and React Native runtimes need separate transports and are not part of this release.
+CommonJS, browsers, and React Native are outside this release.
 
-Route bootstrap and trust are separate. `connect()` accepts a signed-ticket locator, Iroh DNS/PKARR lookup, or LAN mDNS lookup, but always also requires an independently trusted endpoint ID and complete expected principal:
-
-```ts
-// The remote endpoint should generate tickets when sharing them so current
-// direct addresses and its current home relay are captured.
-const ticket = await remoteNode.createTicket();
-
-const locator = { kind: 'ticket', ticket } as const;
-// Or use dynamic discovery. DNS must be enabled on the dialing node; mDNS
-// requires the remote endpoint to advertise the same service name.
-// const locator = { kind: 'dns' } as const;
-// const locator = { kind: 'mdns', serviceName: 'my-app-lan' } as const;
-```
-
-Node-level Iroh configuration independently selects relay and discovery behavior. Relay defaults to Iroh's public network; custom relay URLs are HTTPS-only and relay-assisted connections may still upgrade to direct paths. DNS/PKARR is an endpoint-wide Iroh lookup: when enabled, the native dialer may use it as fallback even if a signed ticket or mDNS supplied the initial route hints.
-
-```ts
-const connectivityOptions = {
-  iroh: {
-    relay: { mode: 'custom', urls: ['https://relay.example.com'] },
-    discovery: {
-      dns: true, // or { serverUrl: 'https://dns.example.com' }
-      mdns: { serviceName: 'my-app-lan', advertise: true }
-    }
-  }
-} as const;
-```
-
-The mixed discovery configuration above intentionally permits DNS fallback for every dial. Use a separate DNS-disabled endpoint when route-source isolation or candidate filtering is required. `relay: { mode: 'disabled' }` is the relay-less setting, but the pinned `@momics/iroh-http-node` 0.6.0 currently maps it to loopback-only networking. This release therefore does not claim production relay-less/LAN-direct support until a fixed upstream version passes the documented validation matrix. DNS/PKARR resolution fails closed when `allowDirectAddress` or `allowRelayUrl` is configured because this wrapper cannot expose resolved candidates before dialing. By default, mDNS accepts only private, link-local, or loopback direct addresses and no default-network relay hint; callbacks may explicitly broaden that policy. Custom relay mode accepts ticket/mDNS relay hints only from its configured canonical origins, and disabled mode rejects all relay hints.
-
-The exact-pinned `@momics/iroh-http-shared` 0.6.1 session sink also needs a narrow writer-cleanup compatibility seam: if native `sendChunk` rejects, p2prpc invokes `finishBody` once on the opaque handle and preserves the original error. Startup fails closed if the node wrapper resolves a different shared-package instance. The [production validation guide](docs/wiki/Production-Validation.md#native-writer-compatibility-boundary) explains this upstream boundary and the native-handle gate.
-
-## Install
+After the first registry release:
 
 ```bash
-npm install @p2prpc/core @trpc/client @trpc/server
+npm install @p2prpc/core @trpc/client@11.18.0 @trpc/server@11.18.0
 ```
 
-## Typed RPC and request metadata
+## Secure RPC MVP
 
-The smallest secure setup uses at least 32 bytes of cryptographically random, separately provisioned application secret material. The helper can check byte length, not entropy; a repeated or human-memorable 32-character string is not equivalent to a 256-bit secret. The secret authenticates group membership, while the explicit `authorize` callback grants operations; omitting that callback denies every RPC and file action. OAuth/OIDC is described below.
+The shared-secret helper requires at least 32 bytes of separately provisioned random material and an explicit authorization policy. It proves workload-group membership; it does not identify individual users or tenants.
 
 ```ts
 import { initTRPC, TRPCError } from '@trpc/server';
@@ -80,10 +53,8 @@ import {
 
 const t = initTRPC.context<PeerContext>().create();
 const tenantProcedure = t.procedure.use(({ ctx, next }) => {
-  // Headers are bounded but caller-controlled. The principal is verified.
-  // The explicit allow-all policy below grants each authenticated secret holder
-  // membership in this example's single tenant.
-  if (ctx.request.headers['x-tenant-id'] !== 'tenant-a') {
+  // Headers are untrusted assertions; the principal is verified.
+  if (ctx.p2p.request.headers['x-tenant-id'] !== 'tenant-a') {
     throw new TRPCError({ code: 'FORBIDDEN' });
   }
   return next();
@@ -91,245 +62,190 @@ const tenantProcedure = t.procedure.use(({ ctx, next }) => {
 
 const appRouter = t.router({
   hello: tenantProcedure
-    .input(z.object({ name: z.string() }))
+    .input(z.object({ name: z.string().max(100) }))
     .query(({ input, ctx }) => ({
       greeting: `Hello ${input.name}`,
-      subject: ctx.auth.principal.subject,
-      peerId: ctx.peer.id
+      principal: ctx.p2p.auth.principal.id,
+      endpoint: ctx.p2p.peer.id
     }))
 });
 export type AppRouter = typeof appRouter;
 
+// Load these exact values from trusted deployment/bootstrap configuration.
+const approvedDirectRoutes = new Set(['203.0.113.10:4433']);
+const approvedRelayOrigins = new Set(['https://relay.example']);
 const node = await createP2PNode({
   router: appRouter,
-  protocol: { applicationId: 'my-app', contractVersion: '1' },
+  protocol: { applicationId: 'com.example.service', contractVersion: '1' },
   security: createSharedSecretSecurity(process.env.P2PRPC_SHARED_SECRET!, {
-    // Coarse MVP policy: every holder may perform every operation. Replace
-    // this with path/file/tenant-aware policy for production.
-    authorize: () => true
+    authorize: ({ action }) => action.kind === 'rpc'
   }),
-  createContext: (requestContext) => requestContext
+  iroh: {
+    allowDirectAddress: (candidate) => approvedDirectRoutes.has(candidate),
+    allowRelayUrl: (origin) => approvedRelayOrigins.has(origin)
+  },
+  createContext: (ctx) => ctx
 });
 
-// Obtain the expected identity independently of untrusted route discovery.
-// A signed ticket locates this peer; it does not authorize it.
 const peer = await node.connect<AppRouter>({
   locator: { kind: 'ticket', ticket: remoteTicket },
-  expectedPeerId: remotePeerId,
+  expectedPeerId: remoteEndpointId,
   expectedPrincipal: {
-    id: remotePeerId,
-    subject: remotePeerId,
+    id: remoteEndpointId,
+    subject: remoteEndpointId,
     issuer: null,
     clientId: null,
     tenantId: null
   }
 });
-const result = await peer.rpc.hello.query(
+
+const reply = await peer.rpc.hello.query(
   { name: 'Ada' },
   { context: p2pRpcContext({ 'x-tenant-id': 'tenant-a', traceparent }) }
 );
 ```
 
-Header names are normalized to lowercase and the resulting record is frozen. The default limits are 64 fields, 64 bytes per name, 8 KiB per value, and 16 KiB total. C0/C1 controls, Unicode bidirectional/zero-width formatting controls, and duplicates are rejected. The reserved namespace includes `authorization`, `cookie`, `set-cookie`, `connection`, `forwarded`, `host`, `origin`, `proxy-*`, `x-forwarded-*`, `x-real-ip`, `p2prpc-*`, and `x-p2prpc-*`. Bearer credentials are sent only inside the encrypted handshake, never copied into request headers.
+`connect()` always requires a locator plus independently trusted endpoint and principal expectations. Targets are exact-key validated, copied, frozen, and retained unchanged for reconnection. Discovery never supplies trust.
 
-Metadata is still asserted by the caller. It is appropriate for trace IDs, locale, requested tenant, and similar routing hints, but it must not be treated as identity or proof of membership. tRPC middleware should compare it with `ctx.auth.principal` or other verified policy data. `getRequestHeaders` can supply per-peer defaults; per-call values supplied with `p2pRpcContext()` override those defaults after both sets are validated.
+Header names are lowercased and the map is immutable. Count, name, value, and aggregate byte limits are enforced; credential/proxy/`p2prpc-*` names and unsafe Unicode/control characters are rejected. Use metadata for tracing, locale, idempotency keys, or a requested tenant—not identity. Verified identity is `ctx.p2p.auth.principal`.
 
-The library-owned `PeerContext` view passed into `createContext` is frozen, as are its authenticated session, principal, request, headers, and connection facade. If `createContext` returns a different application context, preserve that separation between verified identity and caller assertions rather than copying either into mutable or user-controlled fields.
+Calls are never transparently retried. Cancellation or disconnect after dispatch yields `OUTCOME_UNKNOWN`; non-idempotent procedures need durable application idempotency.
 
-Outbound `connect()` always requires the locator plus a separately trusted endpoint ID and exact application-principal matcher. `subject`, `issuer`, `clientId`, and `tenantId` are provider-neutral canonical identity fields; use `null` to require an optional field to be absent. `id` is an optional additional check of the authenticator's stable principal ID. Shared-secret principals use the endpoint ID for both `id` and `subject` and have no issuer, client, or tenant, as shown above. OIDC callers should instead provide the expected issuer/subject/client/tenant tuple. The target is validated and snapshotted before dialing, retained for reconnects, and cannot be weakened by later object mutation.
+## OIDC/OAuth without HTTP
 
-Node configuration is snapshotted at construction. In particular, the security methods and their original receiver are captured, and Iroh key and relay lists are defensively copied; mutating the original options object later cannot widen authorization. Application callback closures and any services they reference remain application-owned and must apply their own concurrency and lifecycle controls.
-
-Each RPC opens its own stream. Calls are not automatically retried after disconnection because mutations may not be idempotent.
-
-For a non-idempotent mutation, require a bounded `idempotency-key` metadata value and atomically store the result or operation state under the verified principal tuple, verified tenant, procedure path, and key. Return the recorded result for a duplicate. The key is replay-control input supplied by the caller, not identity or authorization evidence, and in-memory deduplication is insufficient when processes can restart.
-
-`peer.close()` is terminal for that local `Peer` handle: it removes the runtime, aborts active RPC/file signals, and disables automatic reconnect. Reconnecting from that side requires an explicit `node.connect()` and returns a new handle; the remote endpoint can independently establish a later inbound runtime. Physical connection replacement, session expiry, and node shutdown likewise abort the signal exposed to tRPC procedures and middleware.
-
-The default client I/O timeout is 30 seconds per stream operation, including each subscription response read. There is no protocol heartbeat frame, so a subscription which may otherwise be silent must yield an application heartbeat/data item within the idle window. Applications using `irohLink` directly may instead select a larger bounded `ioTimeoutMs`; the built-in `Peer` client currently uses the 30-second default.
-
-## OAuth/OIDC deployment
-
-The OIDC helper treats p2prpc as an OAuth resource server. Your application obtains and refreshes short-lived access tokens; p2prpc does not handle browser login, device flow, or refresh tokens.
+p2prpc is an OAuth resource server. Your application obtains and refreshes access tokens through its normal flow; p2prpc mutually presents and verifies them inside the encrypted QUIC handshake.
 
 ```ts
-import { createOidcSessionSecurity } from '@p2prpc/core';
+import {
+  createOidcSessionSecurity,
+  irohPeerIdJwkThumbprint
+} from '@p2prpc/core';
 
 const security = createOidcSessionSecurity({
   issuers: [{
-    issuer: 'https://id.example.com',
-    audience: 'urn:example:p2prpc',
+    issuer: 'https://identity.example.com',
+    audience: 'urn:example:p2prpc:production',
     algorithms: ['RS256', 'ES256'],
-    jwksUri: 'https://id.example.com/.well-known/jwks.json'
+    jwksUri: 'https://identity.example.com/.well-known/jwks.json'
   }],
-  getAccessToken: ({ remotePeerId }) => tokenManager.accessTokenFor(remotePeerId)
+  getAccessToken: async ({ localPeerId, remotePeerId }) =>
+    tokenManager.getAccessToken({
+      audience: 'urn:example:p2prpc:production',
+      destinationPeerId: remotePeerId,
+      // cnf.jkt binds the token to this presenting node, not its destination.
+      confirmationJkt: await irohPeerIdJwkThumbprint(localPeerId)
+    }),
+  authorize: ({ principal, action }) =>
+    principal.tenantId === 'tenant-a' &&
+    (action.kind !== 'rpc' || !action.path.startsWith('admin.'))
 });
 ```
 
-The required `expectedPeerId` is bound to the selected route (including a ticket's signed peer ID when that locator is used) and checked again against the connected transport identity before `getAccessToken` is called. The initiator must still present its access token before it can authenticate the remote *application* principal. `expectedPrincipal` is therefore checked immediately after mutual authentication and before the peer is installed or returned, but it cannot prevent disclosure to the already approved endpoint key. Obtain the locator and the expected peer/principal tuple through appropriately trusted bootstrap channels, with the expectations independent of route discovery; mint short-lived peer/audience-specific tokens; and use `preAuthorizePeer` for an organization-wide endpoint-key allow-list or inbound admission policy:
+OAuth remains useful without HTTP: it provides issuer-managed short lifetimes, audience and scope separation, client/tenant identity, signature-key rotation, and centralized grants—properties a plain API key does not inherently provide. HTTP redirects, token acquisition, and refresh tokens are out of scope.
 
-```ts
-const approvedPeerIds = new Set(configuredPeerIds);
+Transport binding is not assumed. A token must contain `cnf.jkt` matching the presenting node's authenticated Iroh key, or—only when `cnf` is absent—an explicitly configured authoritative directory must bind the verified principal to that key. `irohPeerIdJwkThumbprint(localPeerId)` produces the canonical binding value; `remotePeerId` is only a destination hint for application-owned token selection. A malformed or mismatched present `cnf` always fails. Verification also requires configured issuer/audience/algorithms/JWKS, `iat`, `exp`, access-token `typ`, maximum age, and `p2prpc:connect`. Operations require `p2prpc:rpc`, exact `p2prpc:rpc:<path>`, `p2prpc:file:push`, or `p2prpc:file:pull`; `p2prpc:*` satisfies all library scopes.
 
-const node = await createP2PNode({
-  // ...router, protocol, security, and createContext...
-  preAuthorizePeer: ({ id }) => approvedPeerIds.has(id)
-});
-```
+Static JWKs require an explicit compatible allow-listed `alg`. Fetched JWKs may omit `alg` for provider compatibility, but any present value must be compatible and allow-listed; every fetched key requires a bounded unique `kid`. Remote JWKS uses HTTPS only, a 5-second fetch timeout, a 30-second success/failure refresh cooldown, and a 10-minute cache lifetime. Removing a key therefore does not invalidate an already authenticated session, and a cached key may remain usable until refresh; use short token/session lifetimes or online policy for urgent revocation.
 
-`preAuthorizePeer` runs before either side exchanges application credentials. For outbound connections it is cumulative with the required per-call expected peer; for inbound connections it remains the available endpoint-key admission gate. It is not a substitute for expected-principal matching, `SessionSecurity` authentication, or per-operation authorization.
+See [Security Model](./docs/wiki/Security-Model.md) for the exact transcript and policy model.
 
-The locator explicitly selects the initial route strategy: `{ kind: 'dns' }` requests node-enabled DNS/PKARR lookup, while `{ kind: 'mdns' }` actively browses its named/default LAN service. Node-level mDNS configuration selects the default service and optional automatic advertisement; it is not an implicit dial path. Node-level DNS is different: it installs an endpoint-wide native lookup that may be consulted after ticket or mDNS hints fail. Route results never supply `expectedPeerId` or `expectedPrincipal`. For restricted egress or route-source isolation, use a DNS-disabled endpoint and apply `allowDirectAddress`/`allowRelayUrl` to candidates. Enabling DNS plus either callback is rejected rather than dialing candidates the application could not inspect. Custom relay mode independently restricts remote relay hints to configured origins; an explicit callback can narrow but cannot override that set.
+## File push
 
-With OIDC, compare the requested tenant to the verified claim instead: `ctx.request.headers['x-tenant-id'] === ctx.auth.principal.tenantId`. The header selects a tenant; it never proves membership in one.
-
-Verification is strict: configured issuer, audience, algorithm allow-list, signature/JWKS, `iat`, `exp`, access-token `typ` (`at+jwt` by default), and the `p2prpc:connect` scope. Token age is limited to one hour by default; `maxTokenAge` can tighten that limit and cannot exceed 24 hours. By default, the token must contain an RFC 7800-style `cnf.jkt` equal to the JWK thumbprint of the remote Iroh Ed25519 key. This turns the transport's proof of key possession into token proof of possession without pretending the non-HTTP protocol is RFC 9449 DPoP.
-
-Assign a distinct OAuth audience and connection scope to each application, environment, and trust domain. Reusing a broad audience and `p2prpc:connect` grant across unrelated services creates a confused-deputy path even when signatures and peer binding are valid.
-
-Verified `client_id` or `azp` is retained as `principal.clientId`; if both claims are present they must agree. `principal.id` is a non-readable stable identifier of the form `oidc:<base64url SHA-256>`, derived with domain separation from the JSON tuple `[issuer, subject, clientId ?? null]`. Code should use the separately retained `issuer`, `subject`, and `clientId` fields when it needs those values.
-
-If an issuer cannot mint `cnf`-bound tokens, configure `bindPrincipalToPeer` to consult an enterprise directory mapping the verified issuer/subject/client to allowed Iroh keys. This fallback runs only when no usable `cnf.jkt` is present; a non-empty mismatched thumbprint always fails. `peerBinding: 'optional'` or `'disabled'` is an explicit weaker bearer-token mode.
-
-Default authorization scopes are:
-
-- `p2prpc:connect`
-- `p2prpc:rpc` or `p2prpc:rpc:<router.path>`
-- `p2prpc:file:push`
-- `p2prpc:file:pull`
-- `p2prpc:*` for an administrative service identity
-
-Pass `authorize` to the OIDC helper for tenant, role, path, mutation, metadata, or file-specific policy. It runs only after the mandatory connection and operation scope checks pass, so it may narrow access but cannot grant an operation for which the token lacks scope. JWT revocation is bounded by token/session lifetime; use short tokens or a custom introspection-backed `SessionSecurity` where immediate revocation is required.
-
-`onSecurityEvent` emits credential-free structured records for installed/rejected/expired sessions and core RPC/file authorization decisions. Once policy evaluation starts, an exception or timeout produces a denied event with a generic reason; a stale-session rejection before evaluation starts does not. Audit callbacks are best-effort, in-process, and deliberately cannot backpressure or alter protocol state. Monitor callback/sink health and forward records to a durable external audit system.
-
-The hashed OIDC principal ID is a breaking identity migration from earlier readable/delimiter-based IDs. Migrate ACLs, database keys, audit correlation, and cached grants keyed by the previous ID before upgrading. The underlying verified issuer, subject, and client ID do not change.
-
-## Files
-
-File bytes never pass through tRPC serialization. A tRPC procedure normally returns a short-lived capability handle; the client then opens the separate transfer protocol on the same authenticated session.
-
-Push only after the receiver authorizes the session scope and selects a destination:
+File bytes bypass tRPC serialization and use a control stream plus bounded data lanes. The receiver makes a discriminated decision and chooses a trusted destination path; a remote filename is never treated as a path.
 
 ```ts
 const receiver = await createP2PNode({
-  router: appRouter,
-  protocol: { applicationId: 'my-app', contractVersion: '1' },
-  security,
-  createContext: (context) => context,
-  onIncomingFile(offer) {
-    // principal/sessionId are trusted; signal follows this authenticated attempt.
-    // The name is untrusted display text and never a destination path.
-    if (offer.principal.tenantId !== 'tenant-a') return offer.reject();
-    offer.accept(fileDestination('/quarantine/incoming.bin'));
+  // router, protocol, security, createContext...
+  onIncomingFile: async (offer) => {
+    if (offer.principal.tenantId !== 'tenant-a') {
+      return { reject: 'tenant policy' };
+    }
+    return { accept: fileDestination('/srv/quarantine/incoming.bin') };
   }
 });
 
-const transfer = await peer.files.sendFile(await fileSource('/data/video.mp4'));
-transfer.onProgress(console.log);
+const transfer = await peer.files.sendFile(await fileSource('/srv/export/video.mp4'));
+for await (const progress of transfer.progress()) console.log(progress);
 await transfer.result;
 ```
 
-Pull capabilities are peer-bound by default, stop accepting new or reconnecting operations after five minutes, permit one logical operation, and are stored only as domain-separated SHA-256 token hashes. The normal flow issues one from an already-authorized tRPC procedure and binds it to both the calling endpoint and its complete verified principal:
+`fileSource()` retains one no-follow, identity-checked descriptor from hashing through transmission. `fileDestination()` uses bounded binary resume state, per-chunk and complete BLAKE3 verification, no-follow staging/lock files, and atomic durable publication.
+
+Wire v4 closes every file delivery with a receiver-generated 256-bit receipt challenge after publication. A valid receiver completion makes sender success permanent. For a push, the echoed receipt also lets the receiver demote its hard acknowledgement-ambiguous record to a bounded replay tombstone. The node-lifetime ledger survives physical connection replacement and same-process runtime revival, but not process restart. Hard records have per-peer, canonical-principal, and node-wide caps and are never capacity-evicted; tombstones have separate evictable caps. This preserves reconciliation for a lost acknowledgement without making normal acknowledged push throughput wait for a 15-minute TTL.
+
+## Typed capability pull
+
+Issue a share from the session-bound file facade inside an authorized tRPC procedure. The root API automatically binds the 256-bit capability to the request's endpoint and complete current principal; callers cannot substitute arbitrary bindings or create bearer shares.
 
 ```ts
-// On the receiver. Authorize an application document ID, then resolve it inside
-// a trusted, service-owned source root; never accept a caller-supplied path.
 const filesRouter = t.router({
   requestDownload: tenantProcedure
     .input(z.object({ documentId: z.string().uuid() }))
     .query(async ({ input, ctx }) => {
-      const path = await documentStore.authorizedPath(ctx.auth.principal, input.documentId);
-      return node.files.share(await fileSource(path), {
-        allowedPeerIds: [ctx.peer.id],
-        allowedPrincipals: [ctx.auth.principal],
-        expiresAt: Math.min(Date.now() + 60_000, ctx.auth.expiresAt),
+      const path = await documents.authorizedPath(ctx.p2p.auth.principal, input.documentId);
+      return ctx.p2p.files.share(await fileSource(path), {
+        expiresAt: Math.min(Date.now() + 60_000, ctx.p2p.auth.expiresAt),
         maxDownloads: 1
       });
     })
 });
-// Mount this as `files` in the node's application router.
-const appRouter = t.router({ files: filesRouter });
 
-// On the caller. The handle is typed like any other tRPC result.
 const handle = await peer.rpc.files.requestDownload.query({ documentId });
 const transfer = await peer.files.download(
   handle,
-  fileDestination('/downloads/archive.tar')
+  fileDestination('/srv/downloads/report.pdf'),
+  // Normally omit this for a random ID. Persist and reuse it only when the
+  // same logical capability redemption must survive reconnect/retry.
+  { operationId: durableDownloadOperationId }
 );
 await transfer.result;
 ```
 
-The secret capability travels in the authorized RPC response and then in transfer control setup. File contents do not: raw chunks are striped across separate QUIC data streams, so unrelated RPCs and subscriptions continue in parallel. Session credentials are used only by the mutual handshake and are never copied into RPC headers, capability records, or file lanes.
+Only a domain-separated token hash is stored. Logical operations have bounded records, expiry/download budgets, revocation, principal/endpoint/fingerprint binding, and fixed reconnect leases. A lost final acknowledgement cannot authorize a different operation or silently justify an unsafe retry.
 
-Setting `allowBearer: true` permits omission of the endpoint-ID restriction; it does not erase an explicitly supplied `allowedPeerIds` list or bypass session authentication, file-pull authorization, expiry, or download limits. Add `allowedPrincipals: [ctx.auth.principal]` to keep an exact issuer/subject/client/tenant restriction even when endpoint mobility requires a bearer capability. A capability is secondary file authorization, not session authentication.
+Pushes use `SendFileOptions.transferId`, which is part of the manifest and may be reused only for the exact same push manifest. Pulls instead use `DownloadFileOptions.operationId`, which identifies one capability redemption; `download()` does not accept a push `transferId`.
 
-Treat the handle token as a secret even when it is peer-bound: return it only from an authorized tRPC procedure, do not place it in RPC metadata, and redact it from logs and telemetry.
+Optional file metadata requires a Standard Schema v1 runtime schema on the node; metadata without one is rejected.
 
-`maxDownloads` counts distinct logical operation IDs, not packet delivery attempts. Calling `node.files.revoke(handle)` removes the capability and immediately aborts its active reservations. Passive expiry rejects a later reservation/reconnect but is not an independent timer that kills active work at the exact expiry millisecond; use explicit revocation or a session/policy deadline for a hard cutoff. A disconnected operation can resume only with the same peer ID, complete canonical principal identity (ID, issuer, subject, OAuth client, and tenant), operation ID, and negotiated chunk-size/lane fingerprint, within a fixed 30-second lease and at most five reconnects by default. Every reconnect repeats session authentication and file authorization. Endpoint-key rotation requires a new explicit `node.connect()` and newly issued capabilities. `allowedPrincipals` is the preferred identity restriction; `allowedSubjects` compares only the raw verified `subject` and is safe as a global check only for a single issuer or an issuer-aware surrounding policy.
+## Discovery and relays
 
-Files are split into bounded BLAKE3-checked chunks and striped over independently authenticated connection streams. The built-in `fileDestination()` also hashes the complete partial file against the manifest immediately before atomic publication. Manifests, names, metadata, missing ranges, lane counts, chunk counts, file sizes, active sessions, and queues are bounded before allocation. Validated manifests are frozen and metadata is exposed through detached snapshots; reconnects require metadata as well as every content field to remain equal. Control and data lanes are tied to the exact authenticated connection context and use receiver-issued attempt IDs and random lane tokens, so a replacement session, stale stream, or duplicate stream cannot attach by transfer ID alone. Session expiry, connection replacement, node shutdown, and active capability revocation abort affected work; a bounded reconnect creates a fresh authenticated and authorized attempt.
+Supported locator forms are:
 
-`fileSource()` rejects symlinks and detects inode/size/time changes around every read. Opens also compare the path and opened-file identities, preserving the leaf-symlink defense on platforms without `O_NOFOLLOW`. These checks establish file stability, not entitlement: applications must map an authorized opaque object ID to a path inside a trusted, service-owned source root. Never pass a remote RPC value directly to `fileSource()`, and do not rely on leaf checks when an untrusted local user controls a source parent directory. `fileDestination()` uses no-follow/exclusive private partial files, a destination lock, bounded verified resume state, full-file verification, and atomic no-replace publication when `overwrite` is false. Its default maximum chunk size is 4 MiB; when a node deliberately raises `maxFileChunkSize`, pass the same value as `fileDestination(path, { maxChunkSize })`. Resume state matches the digest, size, and chunk size and every saved chunk is re-hashed before reuse. It is content-bound rather than peer/principal/capability-bound, so authorization remains an independent requirement.
+```ts
+{ kind: 'ticket', ticket }
+{ kind: 'dns' }
+{ kind: 'mdns', serviceName: 'corp-p2prpc' }
+```
 
-Custom `FileSource` and `FileDestination` implementations are trusted storage adapters. A custom source must return stable bytes for the lifetime of a manifest. A custom destination's `finalize()` must independently verify the complete staged content against `manifest.digest` immediately before publishing it; per-chunk transport checks alone do not replace that final check. It must also honor the abort/commit contract documented by the TypeScript interface. Prefer the built-in filesystem adapters unless another storage backend can provide equivalent guarantees.
+Node Iroh options select default, custom, or disabled relay policy and separately enable DNS/PKARR or mDNS. A remote signed ticket containing direct candidates requires `allowDirectAddress`; a remote default-relay hint requires `allowRelayUrl`. Custom relay membership is already an explicit allowlist. The callback receives only canonical untrusted remote candidates—not local default selection or configured custom origins—and callback exceptions deny before dial.
 
-Destination parent directories must be trusted and service-owned: leaf no-follow checks cannot protect against an attacker who can replace a parent path component. The exclusive `.p2prpc.lock` is removed during normal cleanup, but stale locks are not broken automatically. After a crash, an operator may remove one only after proving that no writer still owns the destination. Remote filenames are untrusted display text and are never interpreted as local paths.
+With pinned Iroh wrapper 0.6.0:
 
-## Security model
+- DNS plus custom relay or candidate filtering is rejected because resolved routes cannot be inspected before dial.
+- relay-disabled mode keeps UDP networking enabled while removing relay use. A version-locked compatibility seam corrects the wrapper's accidental loopback-only normalization, restores its module export synchronously, and fails closed on dependency drift.
+- relay-less signed tickets and mDNS work only where peers have mutually reachable direct addresses; they do not provide relay/NAT traversal.
+- mDNS defaults to private/link-local/loopback direct candidates and requires explicit policy for default-network relay hints.
+- Omitting signed-ticket policy does not mean “allow all”; any corresponding remote route hint is rejected.
 
-| Layer | Establishes | Does not establish |
-|---|---|---|
-| Signed locator ticket | Self-authenticated endpoint-key attestation over routes, protocol hint, and issue/expiry times | Enterprise ownership, confidentiality, or permission |
-| Iroh QUIC identity | Encrypted channel and possession of the endpoint Ed25519 key | Application user/workload authorization |
-| Session handshake | Mutual short-lived principal, exact app contract, nonces, session ID, expiry | Per-operation permission |
-| Authorization policy | RPC path/type and file push/pull permission | Trust in caller metadata or file names |
-| File capability | A bounded grant for one shared source | Authentication of an otherwise unknown peer |
+See [Production Validation](./docs/wiki/Production-Validation.md) for the exact topology matrix.
 
-The first accepted bidirectional stream must be session authentication, and RPC/file dispatch loops do not start before it completes. The handshake is bounded to 64 KiB and ten seconds, mutually checks the exact `p2prpc/2/<application>/<contract>` identity, derives a unique session ID from both peer IDs and 256-bit nonces, and closes at the shorter credential/session expiry. Every reconnect fetches fresh credentials and repeats authentication. A connection cannot replace another session with a different canonical principal ID, issuer, subject, OAuth client, or tenant.
+## API trust boundary
 
-Remote RPC responses omit stacks, tRPC formatter/custom data, and internal-error messages. Non-internal messages deliberately authored by application procedures are sanitized (including C0/C1 and Unicode bidirectional/zero-width formatting controls) and capped at 8 KiB before being sent; they must not contain secrets. The client performs the same sanitization and cap on an authenticated peer's error message.
-
-The library includes `dangerouslyAllowInsecureSessions()` only for tests and isolated benchmarks. It is deliberately explicit; omitting `security` fails node creation.
-
-See [SECURITY.md](./SECURITY.md) for the threat model, enterprise controls, residual risks, and audit notes.
+- `@p2prpc/core` — production node/peer APIs and branded peer-bound security factories.
+- `@p2prpc/core/advanced` — custom authenticators/transports, raw link/registry components; explicitly expands the deployment TCB.
+- `@p2prpc/core/testing` — endpoint injection and `dangerouslyAllowInsecureSessions()`; never use in production.
 
 ## Development
 
 ```bash
-npm ci
+npm ci --strict-allow-scripts
 npm run lint
 npm run typecheck
 npm test
 npm run test:integration
 npm run build
-npm run test:minimum-runtime
+npm run check:docs
 npm run docs:build
-npm audit --audit-level=low
 ```
 
-Run the example with the same separately exchanged secret in two terminals:
-
-```bash
-# Generate once, then copy the output into both terminal environments.
-openssl rand -base64 32
-P2PRPC_SHARED_SECRET='<same-generated-secret>' npm start -w @p2prpc/cli-example -- serve ./downloads
-P2PRPC_SHARED_SECRET='<same-generated-secret>' npm start -w @p2prpc/cli-example -- connect '<expected-peer-id>' '<ticket>' ./large-file.bin
-```
-
-`npm run benchmark` runs 1,000 RPCs while transferring a 256 MiB file.
-
-## Wire layout
-
-| QUIC stream | Direction | Purpose |
-|---|---:|---|
-| Session authentication | bidirectional | Mandatory mutual credential handshake before application streams |
-| RPC | bidirectional | One query, mutation, or subscription with bounded metadata |
-| Transfer control | bidirectional | Authorization, offers, acceptance, missing ranges, completion |
-| Transfer data | unidirectional | Attempt-bound indexed chunks across bounded parallel lanes |
-
-Control envelopes use length-bounded MessagePack frames with configurable pre-decode item-count and nesting limits (`maxControlFrameItems` and `maxControlFrameDepth`). Only plain-data MessagePack is accepted: map keys must be unique UTF-8 strings, `__proto__` is rejected, and extension values are not part of the wire contract. tRPC values use SuperJSON inside that envelope. File bodies are raw bytes. `@momics/iroh-http-node` 0.6 does not expose custom native QUIC ALPN, stream priorities, configured stream-count limits, or configured receive-window limits through this adapter. Native flow control remains in charge; JavaScript admission limits, deadlines, and cleanup are defense in depth. A timed-out native stream open cannot be aborted directly, although a stream which resolves late is cleaned up. These limitations are tracked in the security notes.
-
-## Community and license
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) before proposing a change, use [SUPPORT.md](./SUPPORT.md) to choose the right public or private channel, and follow the [Code of Conduct](./CODE_OF_CONDUCT.md). p2prpc is available under the [MIT License](./LICENSE); runtime dependency licensing and the current Iroh packaging caveat are recorded in the [third-party notices](./packages/core/THIRD_PARTY_NOTICES.md).
+The repository is MIT licensed. Third-party native packaging notes are in [THIRD_PARTY_NOTICES.md](./packages/core/THIRD_PARTY_NOTICES.md), and vulnerabilities should follow [SECURITY.md](./SECURITY.md).

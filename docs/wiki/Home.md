@@ -1,63 +1,72 @@
-# p2prpc architecture wiki
+# System model
 
-This wiki is the shortest complete model of p2prpc for architecture and security reviewers. It describes protocol v2 as implemented in `@p2prpc/core`.
+p2prpc is a TypeScript library for typed tRPC calls and parallel file transfer over one authenticated Iroh QUIC connection. This wiki describes wire protocol v4 and is intentionally written for architecture and security review. The application credential handshake and on-disk resume state remain format v3; those version numbers are independent.
 
-## System in one sentence
+## Five-minute model
 
-p2prpc runs typed tRPC calls and a separate resumable file protocol over one mutually authenticated Iroh QUIC connection, using independent streams so RPC and bulk data can progress concurrently.
+An Iroh endpoint has an Ed25519 **endpoint ID**. A locator—signed ticket, DNS/PKARR, or mDNS—only helps reach that endpoint. It never grants application access.
+
+Before accepting an RPC or file stream, both endpoints complete a six-message application handshake:
 
 ```text
-application router / typed tRPC client
-                 │
-              P2PNode
-                 │  mandatory mutual application session
-      ┌──────────┼────────────────────┐
-      │          │                    │
-  RPC stream  file control stream  file data lanes
-   (bi, one      (bi, one per       (uni, bounded N
-   per call)      attempt)           per attempt)
-      └──────────┴────────────────────┘
-                 │
-          encrypted Iroh QUIC
+ClientHello       ->
+                  <- ServerChallenge
+ClientCredential  ->
+                  <- ServerCredential
+ClientFinished    ->
+                  <- ServerFinished
 ```
 
-File capability handles may be returned by tRPC, but file bytes never enter tRPC or SuperJSON.
+The transcript commits protocol identity, roles, both endpoint IDs, both fresh 256-bit nonces, timestamps, both credentials, both grant expiries, and the derived session ID. The result is an immutable, expiring **authenticated session** containing a canonical application **principal**.
 
-## Non-negotiable invariants
+Every operation then passes explicit authorization. RPC metadata is available to tRPC middleware at `ctx.p2p.request.headers`, but remains an untrusted caller assertion. Identity comes only from `ctx.p2p.auth.principal`.
 
-1. A signed ticket, DNS/PKARR result, mDNS announcement, or address alone cannot select an outbound target: callers must independently supply the exact expected Iroh peer ID and application-principal tuple, and all are bound before the peer is exposed.
-2. No RPC or file stream is dispatched until both endpoints complete the application handshake.
-3. Every RPC, file push, and file pull is authorized again before dispatch or capability lookup.
-4. `ctx.auth.principal` is verified identity; `ctx.request.headers`, RPC input, filenames, manifests, metadata, and file content are caller-controlled.
-5. File data lanes are valid only for one authenticated physical connection and one receiver-created transfer attempt.
+RPC and files do not share a serializer:
 
-These are production invariants. The explicitly named `dangerouslyAllowInsecureSessions()` test/development escape hatch intentionally provides no real application authentication and must be prohibited in deployed configurations.
+```text
+authenticated QUIC connection
+├── bidirectional stream per RPC
+├── bidirectional control stream per file operation
+└── bounded unidirectional file-data lanes
+```
 
-## The eight concepts
+tRPC carries typed control values and capability handles. File bytes stay outside tRPC and use chunked, resumable streams with backpressure.
 
-| Concept | Meaning |
+## Trust boundaries
+
+| Value | Security meaning |
 |---|---|
-| Locator | Initial route strategy: signed expiring ticket, Iroh DNS/PKARR lookup, or LAN mDNS browse. Route data is never a bearer grant or identity expectation; node-enabled DNS may be an endpoint-wide fallback. |
-| Outbound target | A snapshotted locator plus independently trusted expected endpoint ID and exact principal matcher; all are rechecked on reconnect. |
-| Endpoint ID | Iroh Ed25519 public-key identity proved by the encrypted transport. |
-| Principal | Verified application identity derived from OAuth/OIDC or another `SessionSecurity`. |
-| Session | Short-lived binding of both endpoint IDs, fresh nonces, protocol contract, and principals to one physical connection. |
-| RPC metadata | Bounded, normalized headers-like caller assertions exposed to tRPC middleware. |
-| File capability | Opaque secret granting bounded access to one local `FileSource`; it is secondary to session and operation authorization. |
-| Transfer attempt | One control exchange plus bounded parallel data lanes, tied to the exact connection and fresh lane credentials. |
+| Locator or discovered route | Untrusted reachability hint |
+| Iroh endpoint ID | Transport proof of key possession; not application authorization |
+| Expected endpoint and principal | Out-of-band trust asserted by the dialer |
+| Session principal | Verified application identity |
+| RPC headers | Bounded, normalized, immutable, but untrusted metadata |
+| File manifest/name/metadata | Untrusted until exact validation; name is never a path |
+| Share handle | Short-lived secondary capability, bound to an authenticated endpoint and full principal by the safe API |
 
-## Read this wiki
+## Production API boundary
 
-- [Architecture](Architecture.md): components, boundaries, and stream layout.
-- [Data model](Data-Model.md): identities, objects, ownership, and data classification.
-- [Lifecycles](Lifecycles.md): node, session, reconnect, RPC, and cancellation state changes.
-- [Security model](Security-Model.md): threat model, OAuth/OIDC compromise, and authorization layers.
-- [File transfers](File-Transfers.md): capability pull, push, lanes, integrity, resume, and publication.
-- [Audit guide](Audit-Guide.md): source map, control evidence, deployment checklist, and non-guarantees.
-- [Production validation](Production-Validation.md): discovery/relay lab matrix, resource gates, and the 10,000-file single-connection test.
+The package root exposes peer-bound OIDC and shared-secret factories, `createP2PNode`, typed peers, RPC metadata helpers, and safe file APIs. It does not expose anonymous sessions, custom credential implementations, raw transports, or a directly constructible transfer.
 
-The repository [security policy](../../SECURITY.md) is the detailed threat model and residual-risk register. Source and tests remain authoritative if documentation and behavior ever diverge.
+- `@p2prpc/core/advanced` is an explicit trust boundary for custom security, transports, raw links, and registries.
+- `@p2prpc/core/testing` contains the intentionally insecure session helper and injected-endpoint node factory.
 
-## Scope
+Root `createP2PNode` rejects an unbranded custom security object at runtime as well as at the TypeScript boundary.
 
-This release targets TypeScript on Node.js and p2prpc protocol v2 over Iroh. It is not HTTP, does not implement browser login or OAuth token acquisition, and does not make tRPC types into an authorization boundary. Applications still own business policy, input schemas, storage authorization, quotas, idempotency, audit retention, and content scanning.
+## OAuth in a non-HTTP protocol
+
+p2prpc acts as an OAuth resource server. The application obtains and refreshes access tokens; the library presents and verifies them during the QUIC handshake. HTTP redirects, authorization-code exchange, and refresh tokens are deliberately out of scope.
+
+OAuth still adds material value: issuer-managed short lifetimes, signed audience/scope grants, key rotation through configured JWKS, tenant/client identity, and centralized policy. A plain API key cannot provide those properties by itself. OAuth does not secure discovery or magically bind a bearer token to QUIC, so p2prpc additionally requires either exact `cnf.jkt` binding to the presenting Iroh key or an authoritative principal-to-peer directory decision. Token acquisition should compute the presenter binding with `irohPeerIdJwkThumbprint(localPeerId)`; `remotePeerId` is only the destination selector.
+
+Verification accepts explicitly allow-listed RSA (`RS*`/`PS*`), NIST EC (`ES*`), or Ed25519 (`EdDSA`) algorithms. Static JWKs require explicit compatible `alg`; fetched keys may omit it but all need unique bounded `kid`. The exact scopes are `p2prpc:connect`, `p2prpc:rpc`, `p2prpc:rpc:<exact-path>`, `p2prpc:file:push`, `p2prpc:file:pull`, and the library wildcard `p2prpc:*`. See [Security Model](Security-Model.md) for key and JWKS lifecycle bounds.
+
+## Availability boundary
+
+Global, per-endpoint, and per-principal quotas bound handshakes, streams, direction-separated file transfers, buffers, callbacks, and queues. Each scope independently reserves an outbound file control, inbound file control, outbound data lane, and inbound data lane; general work and the other three classes cannot consume that class's last slot. Configuration therefore admits at least five streams: one general/RPC stream plus those four file progress paths. File progress is conflated per observer. Each resource has one owner and exact-once release; scheduler shutdown rejects queued/new work without erasing active ownership.
+
+The pinned Iroh wrapper supports default, custom, and disabled relay policies plus signed tickets, DNS/PKARR, and mDNS with the restrictions in [Production Validation](Production-Validation.md). Signed-ticket direct/default-relay routes require explicit egress policy before dial; custom relays use configured membership. Relay-disabled retains direct LAN networking through a fail-closed exact-version compatibility seam. DNS plus custom filtering is rejected because resolved DNS routes are not exposed for inspection.
+
+## Responsibility split
+
+p2prpc owns authentication framing, endpoint/principal binding, operation authorization hooks, bounded metadata, lifecycle accounting, transfer integrity, and atomic local file publication. Applications still own token acquisition, bootstrap trust, business authorization, tRPC input schemas, durable mutation idempotency, storage ACLs, malware scanning, audit retention, and operational monitoring.

@@ -122,6 +122,8 @@ validate_campaign_contract() {
         (.campaign.parameters.dnsEnabled | type == "boolean") and
         .campaign.parameters.dnsEnabled == (.campaign.parameters.locator == "dns") and
         (.campaign.parameters.customRelayCount | nonnegative_integer) and
+        .campaign.parameters.customRelayCount <= 32 and
+        (.campaign.parameters.locator != "dns" or .campaign.parameters.relay != "custom") and
         (if .campaign.parameters.relay == "custom" then
           .campaign.parameters.customRelayCount > 0
         else
@@ -145,6 +147,17 @@ validate_campaign_contract() {
         .campaign.metrics.activeTransfersAfter == 0 and
         (.campaign.metrics.activeHandlesAfter | nonnegative_integer) and
         .campaign.metrics.activeHandlesAfter == 0;
+      def relayless_evidence:
+        if .campaign.parameters.relay == "disabled" then
+          (.campaign.parameters.hostCount | positive_integer) and
+          .campaign.parameters.hostCount >= 2 and
+          .campaign.metrics.advertisedRelayUrlNull == true and
+          (.campaign.metrics.nonLoopbackDirectPathsObserved | positive_integer) and
+          (.campaign.metrics.relayPathsObserved | nonnegative_integer) and
+          .campaign.metrics.relayPathsObserved == 0
+        else
+          true
+        end;
       def topology_locator_scenarios:
         if .campaign.parameters.locator == "ticket" then
           [
@@ -207,7 +220,11 @@ validate_campaign_contract() {
             "relay.custom.direct-upgrade.file"
           ]
         elif .campaign.parameters.relay == "disabled" then
-          ["relay.disabled.enforced"]
+          [
+            "relay.disabled.enforced",
+            "relay.disabled.non-loopback-direct",
+            "relay.disabled.no-relay-path"
+          ]
         else
           []
         end;
@@ -215,6 +232,7 @@ validate_campaign_contract() {
       if $driver == "p2prpc-lab-canary" then
         .campaign.id == "raw-iroh-canary" and
         expected_route_parameters and
+        relayless_evidence and
         includes_scenarios([
           "transport.connect",
           "stream.open",
@@ -238,6 +256,7 @@ validate_campaign_contract() {
       elif $driver == "p2prpc-lab-topology-suite" then
         .campaign.id == "topology-and-fault-matrix" and
         expected_route_parameters and
+        relayless_evidence and
         (.campaign.parameters.relay != "custom" or .campaign.parameters.customRelayCount >= 2) and
         includes_scenarios(topology_locator_scenarios + topology_relay_scenarios + [
           "protocol.rpc",
@@ -252,6 +271,8 @@ validate_campaign_contract() {
         clean_metrics
       elif $driver == "p2prpc-lab-mixed-suite" then
         .campaign.id == "mixed-load" and
+        expected_route_parameters and
+        relayless_evidence and
         includes_scenarios([
           "workload.rpc",
           "workload.files",
@@ -296,7 +317,7 @@ validate_campaign_contract() {
         ]) and
         .campaign.parameters.fileBytes == 17179869184 and
         (.campaign.parameters.customRelayCount | positive_integer) and
-        .campaign.parameters.customRelayCount >= 2 and
+        (.campaign.parameters.customRelayCount >= 2 and .campaign.parameters.customRelayCount <= 32) and
         ($expectedCustomRelayCount == "" or
           .campaign.parameters.customRelayCount == ($expectedCustomRelayCount | tonumber)) and
         (.campaign.metrics.fileBytesTransferred | positive_integer) and

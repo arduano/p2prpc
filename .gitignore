@@ -9,8 +9,7 @@ coverage/
 !.env.example
 .p2prpc-identity
 *.p2prpc.part
-*.p2prpc.state.json
-*.p2prpc.state.json.*.tmp
+*.p2prpc.state
 *.p2prpc.lock
 benchmark-results/
 docs/wiki/.vitepress/cache/

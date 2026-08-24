@@ -88,15 +88,29 @@ export interface EndpointDiscoveryOptions {
 export interface QuicConnection {
   readonly remoteId: string;
   readonly side: 'client' | 'server';
-  openBi(): Promise<QuicBiStream>;
+  /** Open options are consumed by the managed runtime; raw adapters MUST ignore them. */
+  openBi(options?: StreamOpenOptions): Promise<QuicBiStream>;
   acceptBi(): Promise<QuicBiStream>;
-  openUni(): Promise<QuicSendStream>;
+  /** Open options are consumed by the managed runtime; raw adapters MUST ignore them. */
+  openUni(options?: StreamOpenOptions): Promise<QuicSendStream>;
   acceptUni(): Promise<QuicRecvStream>;
+  /**
+   * Fulfill only after the physical connection and all native streams are
+   * terminal. Rejection reports an adapter-observation failure and MUST NOT be
+   * used as evidence of closure; p2prpc intentionally retains resource
+   * ownership in that case. Every call must observe the same close lifecycle.
+   */
   closed(): Promise<string>;
   close(code: bigint, reason: Uint8Array): void;
   stats(): Promise<ConnectionStats>;
   pathChanges?(signal?: AbortSignal): AsyncIterable<ConnectionPath>;
-  configure(options: { maxBiStreams: bigint; maxUniStreams: bigint; receiveWindow: bigint }): void;
+}
+
+export interface StreamOpenOptions {
+  /** Cancels managed admission or quarantines the connection once native opening has begun. */
+  readonly signal?: AbortSignal;
+  readonly fileControl?: 'outbound';
+  readonly fileData?: 'outbound';
 }
 
 export interface EndpointAddress {

@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '*.md'], {
   encoding: 'utf8'
-}).trim().split('\n').filter(Boolean);
+}).trim().split('\n').filter((file) => file.length > 0 && existsSync(file));
 const failures = [];
 
 for (const file of files) {

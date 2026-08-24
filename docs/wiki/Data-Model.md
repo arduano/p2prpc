@@ -1,85 +1,74 @@
 # Data model
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md) · [Validation](Production-Validation.md)
+This page names the objects an audit will encounter and the authority each carries.
 
-## Object graph
+## Ownership tree
 
 ```text
 P2PNode
-├─ endpoint { endpointId, ticket snapshot, DNS/mDNS configuration }
-├─ router + SessionSecurity + resource limits
-├─ peerRuntime[endpointId]
-│  ├─ current physicalConnection
-│  ├─ authenticatedSession ──> remote SessionPrincipal
-│  ├─ outboundTarget? { locator, expectedPeerId, expectedPrincipal }
-│  ├─ many independent RPC streams
-│  └─ many bounded transfer attempts
-└─ shareRegistry[SHA-256(capability token)]
-   └─ shareEntry { FileSource, policy, logical operations }
-
-transfer attempt
-├─ exact physicalConnection + authenticatedSession
-├─ FileManifest + FileDestination
-├─ transferId + fresh attemptId + secret laneToken
-└─ one control stream + N data lanes
+├── Iroh endpoint and immutable configuration snapshot
+├── resource scheduler and handshake rate limiter
+├── bounded share/operation registry
+├── node-lifetime receiver commit/replay ledger
+└── Peer runtime slot, keyed by endpoint; at most maxPeers including pending admission
+    ├── expected locator + endpoint/principal matcher (outbound only)
+    ├── authenticated session
+    ├── one current managed QUIC connection
+    ├── RPC/file stream tasks
+    └── transfer manager
 ```
 
-## Identity is deliberately split
+Outbound runtimes retain their snapshotted trust expectations and canonical principal while disconnected. They can be revived by an outbound reconnect or a newly authenticated inbound connection for the same endpoint and exact principal. Purely inbound runtimes have no trusted reconnect target and are removed when their connection ends.
 
-| Identity | Form | Lifetime | Use |
-|---|---|---|---|
-| Endpoint identity | Iroh Ed25519 public key / peer ID | Key lifetime | Transport authentication, route signing, optional admission allow-list, token proof-of-possession binding. |
-| Application principal | `SessionPrincipal` | Credential lifetime | Authorization and audit subject. Includes issuer, subject, client, tenant, scopes, verified claims, and expiry. |
-| Session identity | Transcript-derived SHA-256 ID | One authenticated physical connection | Correlates operations and uniquely names one handshake transcript. Runtime and exact-connection checks reject stale state. |
+The runtime-slot registry is the sole `maxPeers` owner. Outbound connects reserve the expected endpoint before dialing; inbound connects reserve the transport-authenticated endpoint before application authentication. Concurrent claims for one endpoint share one slot, while a new endpoint is rejected once committed runtimes plus distinct pending endpoint IDs reach the limit. A failed claim releases exactly once; a committed slot remains occupied until that runtime's physical and task ownership settles.
 
-The endpoint ID says which key is connected. The principal says which workload or user the application trusts. The session ID says which fresh handshake instance established that relationship. Equality of one does not imply equality of the others.
+## Identity and routing
 
-When reusing or replacing one peer runtime, the endpoint ID and canonical principal tuple—ID, issuer, subject, OAuth client, and tenant—must match. A fresh session ID is always created. A later fresh inbound runtime has no historical comparison; durable endpoint-to-principal ownership must come from token key binding, a directory, or policy.
-
-## Core records
-
-| Record | Important fields | Interpretation |
+| Object | Fields that matter | Invariant |
 |---|---|---|
-| `PeerLocator` | ticket `{ ticket }`, DNS `{ kind }`, or mDNS `{ kind, serviceName? }` | Initial route strategy. DNS/PKARR and mDNS results are untrusted route data for the separately named endpoint; node-enabled DNS may also act as endpoint-wide fallback. |
-| Locator ticket | `version`, `peerId`, direct socket addresses, relay URL, protocol, `issuedAt`, `expiresAt`, signature | Self-signed route bootstrap. It may disclose network topology and is neither enterprise identity nor authorization. |
-| `ConnectOptions` | `locator`, `expectedPeerId`, `expectedPrincipal` | Strict outbound target. It is validated and snapshotted before dialing; its expectations must come from a trusted source independently of route discovery. |
-| `PrincipalMatcher` | optional `id`; required `subject`, `issuer`, `clientId`, `tenantId` | Exact identity-provider-neutral match against the authenticated `SessionPrincipal`. `null` requires an optional field to be absent; optional `id` adds canonical-ID equality. There are no omitted-field wildcards. |
-| `SessionPrincipal` | `id`, `subject`, optional `issuer`/`clientId`/`tenantId`, `expiresAt`, `scopes`, `claims` | Frozen output of the configured authenticator. The OIDC helper derives `id` from `[issuer, subject, clientId ?? null]`; tenant, scopes, claims, and expiry are not part of that ID. |
-| `AuthenticatedSession` | `id`, `establishedAt`, `expiresAt`, `principal` | Local view of the remote party on the current connection. |
-| `PeerContext` | `peer`, `auth`, `request`, `connection` | Frozen context seed for tRPC. Trusted identity and untrusted request data remain separate. |
-| `RpcServerRequest` | `id`, `path`, `type`, `headers`, `signal` | One authorized stream-scoped request. Headers are normalized assertions, not credentials. |
-| `FileManifest` | `transferId`, `name`, `size`, whole digest, chunk geometry, metadata | Validated description of bytes. It is not a signature, ACL, or local path. |
-| `SharedFileHandle` | random token, display expiry | Secret capability normally returned by an authorized tRPC procedure. |
-| Share policy | `allowedPeerIds` unless `allowBearer`, optional `allowedPrincipals`, `expiresAt`, `maxDownloads` | Bounds who may redeem a handle, until when, and for how many logical operations. Principal binding is recommended but explicit. |
-| Share operation | peer, principal binding, negotiated fingerprint, operation ID, state | Server-side replay/reconnect accounting for one logical capability redemption. |
-| Transfer attempt | connection context, manifest, missing chunks, attempt ID, lane token | Ephemeral receiver state used to attach and bound parallel streams. |
+| Protocol identity | wire v4, `applicationId`, `contractVersion` | Produces exact ALPN `p2prpc/4/<application>/<contract>` and domain-separates incompatible applications. |
+| Locator | ticket, DNS, or mDNS selector | Selects reachability only. It never supplies trust expectations. |
+| Expected target | endpoint ID plus exact principal matcher | Validated and copied before dial; reused unchanged on reconnect. |
+| Endpoint identity | Iroh public key / node ID | Authenticated by QUIC; proves possession of the endpoint key. |
+| Principal | stable ID, issuer, subject, client, tenant, expiry, scopes, claims | Produced only by a configured authenticator; deeply bounded and immutable. The built-in OIDC ID hashes issuer, subject, client, and validated tenant as one identity tuple. |
+| Session | ID, establishment/expiry, principal | Derived from the complete mutual transcript and tied to one physical authenticated connection. |
 
-Outbound metadata flows from validated `getRequestHeaders` defaults plus validated `p2pRpcContext` per-call overrides; per-call values win, then the merged record is validated again. The receiving `RpcServerRequest.headers` is an immutable, untrusted string map.
+Optional matcher fields use `null` to require absence. A reconnect cannot replace the principal ID, issuer, subject, OAuth client, or tenant of its retained runtime.
 
-## Data classification
+## RPC objects
 
-| Data | Confidentiality | Trusted after validation? | May authorize work? |
-|---|:---:|:---:|:---:|
-| Locator/route result | Tickets may expose topology; discovery results are network assertions | A ticket is trusted only as its endpoint key's signed route assertion; DNS/mDNS routes remain untrusted | No |
-| Expected endpoint/principal tuple | Deployment-dependent; normally directory data | Only if obtained independently from a trusted bootstrap source | Selects the intended outbound target; does not grant operation permission |
-| Endpoint ID | Public key | As transport key identity, not enterprise ownership | No |
-| Session credential / OAuth token | Secret | Untrusted until the configured authenticator verifies it; confined to the encrypted handshake | Establishes a principal, never sent as RPC metadata |
-| `SessionPrincipal` | May contain sensitive verified identity/claims; no token material | Yes; immutable verified view | Policy input |
-| RPC headers | Application-dependent | No; bounded and immutable only | Never alone |
-| RPC input | Application-dependent | No; requires procedure input parser | Only through business policy |
-| Capability token | Yes | Opaque | Only with an active authorized session and matching policy |
-| Capability ID | No | Hash for audit/policy correlation | No |
-| Transfer, attempt, and lane IDs | Lane token is secret; other IDs are not | Only within matching attempt state | Attach streams, not business permission |
-| Filename, manifest metadata, content | Application-dependent | No | No |
-| Security audit event | Credential-free | Locally generated | No |
+| Object | Meaning |
+|---|---|
+| Request | Exact `{id, path, type, headers, input}` control frame. |
+| Headers | Lowercase string map with count/name/value/total-byte limits and reserved-name rejection. |
+| RPC value | A bounded, acyclic SuperJSON tree using only built-in scalar, collection, date/URL/regexp/error, and typed-array annotations. Class, symbol, custom-transformer, alias, and cycle annotations are not wire types. |
+| `ctx.p2p` | Reserved frozen library context containing peer identity, authenticated session, request, connection stats, and an exact-session file facade. Verified fields are not duplicated at mutable top-level aliases. |
+| Response | Data frames followed by exactly one completion, or one validated error frame. |
 
-## Immutability and snapshots
+The codec owns a private SuperJSON instance, so application-global transformer registration cannot affect remote decoding. Semantic annotation checks run before construction, including typed-array shape checks that prevent a tiny frame from requesting a large allocation. The tRPC type graph is a compile-time contract, not an authorization boundary; runtime input schemas and authorization remain mandatory.
 
-Verified principals and claims, sessions, outbound targets and nested principal matchers, RPC request/header views, manifests, and library context facades are frozen or defensively copied. This prevents application callbacks from changing a value after validation or authorization. Immutability proves consistency, not truth: a frozen remote header is still a remote assertion, and target expectations copied from an untrusted locator are still untrusted.
+## File objects
 
-## Persistent versus transient state
+| Object | Meaning and invariant |
+|---|---|
+| Source | Application-owned bytes; the prepared-source lifecycle pins one validated file descriptor from hashing through sending. |
+| Manifest | Exact name, size, BLAKE3 digest, transfer ID, chunk geometry, and optional schema-validated metadata. |
+| Destination | Stages chunks, records bounded binary resume state, verifies the complete digest, atomically publishes, then explicitly marks the irreversible boundary before cleanup. |
+| Share handle | 256-bit opaque token returned to an authorized caller; only a domain-separated hash is stored. |
+| Share policy | Expiry and logical-download count. The safe peer API adds current endpoint and complete-principal bindings automatically. |
+| Pull operation ID | Optional stable `DownloadFileOptions.operationId`; its hash indexes one capability redemption across reconnect/retry. It is sent as pull `requestId` and becomes that delivery's manifest transfer ID, but the public option remains distinct from push `SendFileOptions.transferId`. |
+| Hard push record | Non-evictable `active` or outcome-ambiguous `committed` record, bound to principal and exact manifest fingerprint. |
+| Replay tombstone | Recent `acknowledged` or `rejected` push outcome. Bounded and evictable; it prevents recent replay but is not correctness-critical after the sender receipted success. |
+| Transfer | Non-constructible handle with immutable manifest, terminal result, cancellation, and independent progress iterators. |
 
-- Endpoint keys should be persistent and managed externally; ephemeral keys break stable peer binding.
-- Peer runtimes, sessions, transfer attempts, and the in-memory capability registry are process-local.
-- Built-in destination resume files persist partial content and verified chunk state, but are content-bound rather than principal- or capability-bound.
-- Durable authorization, transfer history, idempotency, retention, and audit records remain application responsibilities.
+Transfer metadata is rejected unless the node has a Standard Schema v1 runtime schema. Before schema code runs, the wire decoder has already required bounded accessor-free plain data, forbidden prototype-confusing keys, and copied every byte array. Schema output is validated and snapshotted again; a public manifest returns fresh byte-array copies so callers cannot mutate its private canonical state.
+
+## Resource model
+
+Every admitted unit is a vector over handshakes, streams, outbound transfers, inbound transfers, buffered bytes, and callbacks. A request must fit global, per-peer, and—after authentication—per-principal limits before it can enter a bounded fair queue. Transfer admission has independent inbound/outbound capacity. Streams and buffers additionally reserve one path for each of outbound control, inbound control, outbound data, and inbound data at every scope; general work and the other classes cannot borrow them. All file overflow is summed rather than checked pairwise and may spend only the borrowable remainder; one general/RPC stream and one control-frame buffer are never borrowable by file traffic. The minimum stream quota is therefore five. The minimum buffer quota is three maximum control frames plus two data buffers, where each data buffer is `max(maxControlFrameBytes, maxFileChunkSize + 64 KiB)`. Principal limits prevent endpoint-key rotation or multiple devices for one service identity from multiplying workload limits.
+
+Diagnostics report logical admission state. Closing the scheduler rejects new and queued work but deliberately retains active leases until their owners settle; it cannot manufacture a leak-free zero. A connection-terminal event can end logical stream ownership, while native handle return-to-baseline remains a separate production gate.
+
+Receiver-side push reconciliation uses two node-lifetime stores partitioned by peer and keyed by the complete canonical principal plus transfer ID. The hard store contains `active` work and `committed` outcomes whose acknowledgement is ambiguous. Its default caps are 1,024 per peer (`maxFileReconciliationRecords`), 1,024 per canonical principal across endpoint keys (`maxPrincipalFileReconciliationRecords`), and 4,096 node-wide (`maxGlobalFileReconciliationRecords`). Active records never expire; committed records default to a 15-minute TTL. Reaching any hard cap rejects a new operation and never evicts active/ambiguous evidence.
+
+After a valid sender receipt, an acknowledged outcome moves to the replay-tombstone store; rejected terminal outcomes also use it. Its default caps are 1,024 per peer, 2,048 per principal, and 8,192 node-wide (`maxFileReplayTombstones`, `maxPrincipalFileReplayTombstones`, and `maxGlobalFileReplayTombstones`). At capacity, the oldest tombstone in the applicable peer/principal/node scope is evicted, so tombstones never consume hard capacity or block unrelated acknowledged throughput. An indexed minimum-deadline heap removes only expired committed records/tombstones instead of scanning every scope. Both stores survive physical connection replacement and same-process runtime revival. Committed reconciliation lasts until process loss or TTL; acknowledged/rejected replay protection lasts until the earliest of process loss, TTL, or bounded eviction. Node close stops new ledger admission before clearing state only after its owned work settles. Application authorization still runs on every offer.

@@ -3,7 +3,11 @@ import { BlockList, isIP } from 'node:net';
 import { createNode, PublicKey, type IrohNode, type NodeOptions } from '@momics/iroh-http-node';
 import { P2PError } from '../errors.js';
 import { containsUnsafeDisplayCharacters } from '../text.js';
-import { installIrohWriterCleanup } from './iroh-writer-cleanup.js';
+import { createRelaylessIrohNode } from './iroh-relayless-networking.js';
+import {
+  consumeIrohWriterCleanupProof,
+  installIrohWriterCleanup
+} from './iroh-writer-cleanup.js';
 import type {
   ConnectionStats,
   ConnectionPath,
@@ -19,8 +23,6 @@ import type {
   QuicSendStream,
   StreamLifecycleStats
 } from './types.js';
-
-installIrohWriterCleanup(PublicKey);
 
 export type IrohRelayConfiguration =
   | { readonly mode: 'default' }
@@ -56,23 +58,26 @@ export interface IrohEndpointOptions {
   /** Filter local addresses before publishing them in signed tickets. */
   readonly allowAdvertisedAddress?: (address: string) => boolean;
   /**
-   * Optional egress policy for resolved or signed direct-address candidates.
-   * Without one, unsigned mDNS candidates are limited to private, link-local,
-   * and loopback ranges; signed-ticket candidates retain their advertised scope.
+   * Required egress policy for signed-ticket direct-address candidates.
+   * Without one, a ticket containing direct routes is rejected before dial.
+   * Unsigned mDNS candidates default to private, link-local, and loopback
+   * ranges, although enterprise deployments should supply a narrower policy.
    * Cannot be combined with endpoint-wide DNS because the pinned wrapper does
    * not expose DNS-resolved candidates before dialing them.
    */
   readonly allowDirectAddress?: (address: string) => boolean;
   /**
-   * Optional egress policy for configured, resolved, or signed relay candidates.
-   * Custom-relay membership and disabled-relay rejection cannot be overridden;
-   * default-relay mDNS candidates require this callback to explicitly allow them.
+   * Egress policy for untrusted mDNS or signed-ticket relay candidates.
+   * Default-relay signed-ticket hints require it; custom-relay membership is
+   * itself an explicit allowlist. Local/default relay selection and explicit
+   * custom relay configuration are deployment inputs, not remote candidates.
+   * Membership and disabled-relay rejection cannot be overridden.
    */
-  readonly allowRelayUrl?: (url: URL) => boolean;
+  readonly allowRelayUrl?: (origin: string) => boolean;
 }
 
 interface TicketPayload {
-  readonly version: 2;
+  readonly version: 3;
   readonly peerId: string;
   readonly directAddresses: string[];
   readonly relayUrl: string | null;
@@ -90,31 +95,70 @@ type RelayCandidateSource = 'local' | 'ticket' | 'mdns';
 
 type IrohSession = Awaited<ReturnType<IrohNode['dial']>>;
 
-const TICKET_SIGNATURE_DOMAIN = Buffer.from('p2prpc-signed-ticket-v2\0', 'utf8');
+const TICKET_SIGNATURE_DOMAIN = Buffer.from('p2prpc-signed-ticket-v3\0', 'utf8');
+const DISCOVERY_CLEANUP_TIMEOUT_MS = 1_000;
 
-class WebSendStream implements QuicSendStream {
+/** @internal Exported only for transport lifecycle conformance tests. */
+export class WebSendStream implements QuicSendStream {
   private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
+  private readonly lifecycleScope: SendLifecycleScope;
   private terminal?: Promise<void>;
+  private activeWrite: Promise<void> | undefined;
+  private writeFailed = false;
+  private provenWriteFailure: unknown;
+  private hasProvenWriteFailure = false;
 
   constructor(
     stream: WritableStream<Uint8Array>,
-    private readonly lifecycle: MutableStreamLifecycleStats
+    lifecycle: StreamLifecycle
   ) {
     this.writer = stream.getWriter();
-    this.lifecycle.activeSend += 1;
+    this.lifecycleScope = lifecycle.openSend();
   }
 
   async writeAll(data: Uint8Array): Promise<void> {
     if (this.terminal) throw new P2PError('CANCELLED', 'Stream send side is already closed');
-    await this.writer.write(data);
+    if (this.hasProvenWriteFailure) throw this.provenWriteFailure;
+    const writing = this.writer.write(data);
+    this.activeWrite = writing;
+    try {
+      await writing;
+    } catch (cause) {
+      // Once a WHATWG writable is errored, a later abort may fulfill without
+      // invoking the underlying sink. The pinned Iroh compatibility seam tries
+      // native cleanup on write failure, but deliberately cannot claim it
+      // succeeded. Only physical connection closure is proof in that case.
+      this.writeFailed = true;
+      const proof = consumeIrohWriterCleanupProof(cause);
+      if (proof.terminal) {
+        // The pinned adapter synchronously finalized this exact opaque writer
+        // handle before rethrowing. Account terminality now; a later WHATWG
+        // abort is a no-op on an errored stream and carries no proof itself.
+        this.hasProvenWriteFailure = true;
+        this.provenWriteFailure = proof.cause;
+        this.lifecycleScope.settle('reset');
+        try { this.writer.releaseLock(); } catch { /* native terminality is already proven */ }
+      }
+      throw proof.cause;
+    } finally {
+      if (this.activeWrite === writing) this.activeWrite = undefined;
+    }
   }
 
   async finish(): Promise<void> {
+    if (this.hasProvenWriteFailure) throw this.provenWriteFailure;
     this.terminal ??= this.terminalize('finish');
     await this.terminal;
   }
 
   async reset(): Promise<void> {
+    // A cancellation can race the adapter's sendChunk rejection. Wait for the
+    // started native write to expose its terminal proof before asking WHATWG
+    // to abort; otherwise the queued abort can call finishBody a second time
+    // and turn known cleanup into a false quarantine.
+    const writing = this.activeWrite;
+    if (writing) await writing.catch(() => undefined);
+    if (this.hasProvenWriteFailure) return;
     this.terminal ??= this.terminalize('reset');
     await this.terminal;
   }
@@ -128,27 +172,35 @@ class WebSendStream implements QuicSendStream {
     try {
       if (mode === 'finish') await this.writer.close();
       else await this.writer.abort(new P2PError('CANCELLED', 'Stream reset'));
+      if (this.writeFailed && !this.hasProvenWriteFailure) {
+        // WHATWG abort of an already-errored stream may fulfill without calling
+        // the native sink. Propagate uncertainty so ManagedConnection retains
+        // its admission lease and the caller quarantines this connection.
+        throw new P2PError('INTERNAL', 'Native send cleanup requires physical connection closure');
+      }
+      this.lifecycleScope.settle(mode);
     } finally {
-      this.writer.releaseLock();
-      this.lifecycle.activeSend -= 1;
-      if (mode === 'finish') this.lifecycle.sendFinished += 1;
-      else this.lifecycle.sendReset += 1;
+      // Releasing a JS lock is not native terminal proof and must not replace
+      // the close/abort outcome if a defective stream implementation throws.
+      try { this.writer.releaseLock(); } catch { /* diagnostic scope remains fail-closed */ }
     }
   }
 }
 
-class WebRecvStream implements QuicRecvStream {
+/** @internal Exported only for transport lifecycle conformance tests. */
+export class WebRecvStream implements QuicRecvStream {
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
+  private readonly lifecycleScope: RecvLifecycleScope;
   private buffered: Uint8Array<ArrayBufferLike> = new Uint8Array();
   private terminal?: Promise<void>;
   private released = false;
 
   constructor(
     stream: ReadableStream<Uint8Array>,
-    private readonly lifecycle: MutableStreamLifecycleStats
+    lifecycle: StreamLifecycle
   ) {
     this.reader = stream.getReader();
-    this.lifecycle.activeRecv += 1;
+    this.lifecycleScope = lifecycle.openRecv();
   }
 
   async readExact(size: number): Promise<Uint8Array> {
@@ -170,7 +222,11 @@ class WebRecvStream implements QuicRecvStream {
       }
       const count = Math.min(size - offset, this.buffered.byteLength);
       result.set(this.buffered.subarray(0, count), offset);
-      this.buffered = this.buffered.subarray(count);
+      // Do not retain an exhausted native chunk's backing allocation for the
+      // remaining stream lifetime through a zero-length subarray view.
+      this.buffered = count === this.buffered.byteLength
+        ? new Uint8Array()
+        : this.buffered.subarray(count);
       offset += count;
     }
     return result;
@@ -182,6 +238,12 @@ class WebRecvStream implements QuicRecvStream {
   }
 
   async stop(): Promise<void> {
+    // readExact() releases its native reader when it observes premature EOF.
+    // That path is already physically terminal even though it did not begin a
+    // terminal operation. Treat later defensive cleanup as idempotent instead
+    // of cancelling a detached WHATWG reader and quarantining a healthy QUIC
+    // connection on ERR_INVALID_STATE.
+    if (this.released) return;
     this.terminal ??= this.cancel();
     await this.terminal;
   }
@@ -202,8 +264,14 @@ class WebRecvStream implements QuicRecvStream {
         }
       }
     } catch (cause) {
-      await this.reader.cancel(new P2PError('CANCELLED', 'Invalid stream ending')).catch(() => undefined);
-      await this.release('stop');
+      try {
+        await this.reader.cancel(new P2PError('CANCELLED', 'Invalid stream ending'));
+        await this.release('stop');
+      } catch {
+        // Preserve the framing failure. A rejected cancel is not native
+        // terminal proof; connection closure will settle diagnostics.
+        try { this.reader.releaseLock(); } catch { /* best-effort JS cleanup */ }
+      }
       throw cause;
     }
   }
@@ -211,21 +279,18 @@ class WebRecvStream implements QuicRecvStream {
   private async cancel(): Promise<void> {
     try {
       await this.reader.cancel(new P2PError('CANCELLED', 'Stream stopped'));
-    } finally {
       await this.release('stop');
+    } catch (cause) {
+      try { this.reader.releaseLock(); } catch { /* best-effort JS cleanup */ }
+      throw cause;
     }
   }
 
   private async release(mode: 'eof' | 'stop'): Promise<void> {
     if (this.released) return;
     this.released = true;
-    try {
-      this.reader.releaseLock();
-    } finally {
-      this.lifecycle.activeRecv -= 1;
-      if (mode === 'eof') this.lifecycle.recvEof += 1;
-      else this.lifecycle.recvStopped += 1;
-    }
+    try { this.reader.releaseLock(); } catch { /* native terminality is already proven */ }
+    this.lifecycleScope.settle(mode);
   }
 }
 
@@ -240,6 +305,84 @@ interface MutableStreamLifecycleStats {
   sendReset: number;
   recvEof: number;
   recvStopped: number;
+}
+
+interface SendLifecycleScope {
+  settle(mode: 'finish' | 'reset'): void;
+}
+
+interface RecvLifecycleScope {
+  settle(mode: 'eof' | 'stop'): void;
+}
+
+/**
+ * Connection-owned native-half ledger. A rejected stream terminal operation
+ * stays active until fulfilled session closure proves every native half gone.
+ */
+/** @internal Exported only for transport lifecycle conformance tests. */
+export class StreamLifecycle {
+  private readonly counters = emptyStreamStats();
+  private readonly sends = new Set<object>();
+  private readonly recvs = new Set<object>();
+  private physicallyClosed = false;
+
+  recordOpenedBi(): void { this.counters.openedBi += 1; }
+  recordAcceptedBi(): void { this.counters.acceptedBi += 1; }
+  recordOpenedUni(): void { this.counters.openedUni += 1; }
+  recordAcceptedUni(): void { this.counters.acceptedUni += 1; }
+
+  openSend(): SendLifecycleScope {
+    const token = Object.freeze({});
+    if (this.physicallyClosed) {
+      this.counters.sendReset += 1;
+      return Object.freeze({ settle: () => undefined });
+    }
+    this.sends.add(token);
+    this.counters.activeSend += 1;
+    return Object.freeze({
+      settle: (mode: 'finish' | 'reset'): void => {
+        if (!this.sends.delete(token)) return;
+        this.counters.activeSend -= 1;
+        if (mode === 'finish') this.counters.sendFinished += 1;
+        else this.counters.sendReset += 1;
+      }
+    });
+  }
+
+  openRecv(): RecvLifecycleScope {
+    const token = Object.freeze({});
+    if (this.physicallyClosed) {
+      this.counters.recvStopped += 1;
+      return Object.freeze({ settle: () => undefined });
+    }
+    this.recvs.add(token);
+    this.counters.activeRecv += 1;
+    return Object.freeze({
+      settle: (mode: 'eof' | 'stop'): void => {
+        if (!this.recvs.delete(token)) return;
+        this.counters.activeRecv -= 1;
+        if (mode === 'eof') this.counters.recvEof += 1;
+        else this.counters.recvStopped += 1;
+      }
+    });
+  }
+
+  closePhysical(): void {
+    if (this.physicallyClosed) return;
+    this.physicallyClosed = true;
+    const activeSend = this.sends.size;
+    const activeRecv = this.recvs.size;
+    this.sends.clear();
+    this.recvs.clear();
+    this.counters.activeSend -= activeSend;
+    this.counters.activeRecv -= activeRecv;
+    this.counters.sendReset += activeSend;
+    this.counters.recvStopped += activeRecv;
+  }
+
+  snapshot(): StreamLifecycleStats {
+    return Object.freeze({ ...this.counters });
+  }
 }
 
 function emptyStreamStats(): MutableStreamLifecycleStats {
@@ -257,16 +400,14 @@ function emptyStreamStats(): MutableStreamLifecycleStats {
   };
 }
 
-function snapshotStreamStats(value: MutableStreamLifecycleStats): StreamLifecycleStats {
-  return Object.freeze({ ...value });
-}
-
-class WebSessionConnection implements QuicConnection {
+/** @internal Exported only for transport lifecycle conformance tests. */
+export class WebSessionConnection implements QuicConnection {
   readonly remoteId: string;
   readonly connectionId = randomBytes(16).toString('hex');
   private readonly incomingBi: ReadableStreamDefaultReader<Awaited<ReturnType<IrohSession['createBidirectionalStream']>>>;
   private readonly incomingUni: ReadableStreamDefaultReader<ReadableStream<Uint8Array>>;
-  private readonly lifecycle = emptyStreamStats();
+  private readonly lifecycle = new StreamLifecycle();
+  private readonly physicalClosure: IrohSession['closed'];
 
   constructor(
     private readonly session: IrohSession,
@@ -276,11 +417,18 @@ class WebSessionConnection implements QuicConnection {
     this.remoteId = session.remoteId.toString();
     this.incomingBi = session.incomingBidirectionalStreams.getReader();
     this.incomingUni = session.incomingUnidirectionalStreams.getReader();
+    this.physicalClosure = session.closed;
+    // Fulfillment is the only adapter-level proof that every native stream is
+    // terminal. Rejection deliberately leaves diagnostics non-quiescent.
+    void this.physicalClosure.then(
+      () => this.lifecycle.closePhysical(),
+      () => undefined
+    );
   }
 
   async openBi(): Promise<QuicBiStream> {
     const stream = await this.session.createBidirectionalStream();
-    this.lifecycle.openedBi += 1;
+    this.lifecycle.recordOpenedBi();
     return {
       send: new WebSendStream(stream.writable, this.lifecycle),
       recv: new WebRecvStream(stream.readable, this.lifecycle)
@@ -290,7 +438,7 @@ class WebSessionConnection implements QuicConnection {
   async acceptBi(): Promise<QuicBiStream> {
     const result = await this.incomingBi.read();
     if (result.done) throw new P2PError('DISCONNECTED', 'Connection closed while accepting a stream');
-    this.lifecycle.acceptedBi += 1;
+    this.lifecycle.recordAcceptedBi();
     return {
       send: new WebSendStream(result.value.writable, this.lifecycle),
       recv: new WebRecvStream(result.value.readable, this.lifecycle)
@@ -299,19 +447,19 @@ class WebSessionConnection implements QuicConnection {
 
   async openUni(): Promise<QuicSendStream> {
     const stream = await this.session.createUnidirectionalStream();
-    this.lifecycle.openedUni += 1;
+    this.lifecycle.recordOpenedUni();
     return new WebSendStream(stream, this.lifecycle);
   }
 
   async acceptUni(): Promise<QuicRecvStream> {
     const result = await this.incomingUni.read();
     if (result.done) throw new P2PError('DISCONNECTED', 'Connection closed while accepting a stream');
-    this.lifecycle.acceptedUni += 1;
+    this.lifecycle.recordAcceptedUni();
     return new WebRecvStream(result.value, this.lifecycle);
   }
 
   async closed(): Promise<string> {
-    const info = await this.session.closed;
+    const info = await this.physicalClosure;
     return info.reason;
   }
 
@@ -336,20 +484,32 @@ class WebSessionConnection implements QuicConnection {
         address: path.addr,
         active: path.active
       }))),
-      streams: snapshotStreamStats(this.lifecycle)
+      streams: this.lifecycle.snapshot()
     };
   }
 
   async *pathChanges(signal?: AbortSignal): AsyncIterable<ConnectionPath> {
-    for await (const path of this.node.pathChanges(this.remoteId, signal ? { signal } : undefined)) {
-      yield Object.freeze({ relay: path.relay, address: path.addr, active: path.active });
+    const cleanupController = new AbortController();
+    const subscriptionSignal = signal
+      ? AbortSignal.any([signal, cleanupController.signal])
+      : cleanupController.signal;
+    const iterator = this.node.pathChanges(this.remoteId, { signal: subscriptionSignal })[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const path = await abortable(iterator.next(), subscriptionSignal);
+        if (path.done) return;
+        yield Object.freeze({
+          relay: path.value.relay,
+          address: path.value.addr,
+          active: path.value.active
+        });
+      }
+    } finally {
+      cleanupController.abort(new P2PError('CANCELLED', 'Path subscription completed'));
+      await closeAsyncIterator(iterator, DISCOVERY_CLEANUP_TIMEOUT_MS);
     }
   }
 
-  configure(options: { maxBiStreams: bigint; maxUniStreams: bigint; receiveWindow: bigint }): void {
-    // Flow control is managed in the native Iroh session implementation.
-    void options;
-  }
 }
 
 export class IrohEndpoint implements QuicEndpoint {
@@ -369,7 +529,7 @@ export class IrohEndpoint implements QuicEndpoint {
     private readonly relayEgressPolicy: RelayEgressPolicy,
     private readonly allowAdvertisedAddress?: (address: string) => boolean,
     private readonly allowDirectAddress?: (address: string) => boolean,
-    private readonly allowRelayUrl?: (url: URL) => boolean
+    private readonly allowRelayUrl?: (origin: string) => boolean
   ) {
     this.id = node.publicKey.toString();
     this.locator = locator;
@@ -387,12 +547,12 @@ export class IrohEndpoint implements QuicEndpoint {
   async createTicket(): Promise<string> {
     const discovery = await this.node.discoveryInfo();
     const locator = Object.freeze({
-      version: 2,
+      version: 3,
       peerId: this.id,
       directAddresses: filterAdvertisedAddresses(discovery.directAddresses, this.allowAdvertisedAddress),
       relayUrl: discovery.relayUrl === null
         ? null
-        : validateRelayCandidate(discovery.relayUrl, this.relayEgressPolicy, 'local', this.allowRelayUrl),
+        : validateRelayCandidate(discovery.relayUrl, this.relayEgressPolicy, 'local'),
       protocol: this.protocol
     } satisfies Omit<TicketPayload, 'issuedAt' | 'expiresAt'>);
     this.locator = locator;
@@ -409,7 +569,7 @@ export class IrohEndpoint implements QuicEndpoint {
     if (secretKey.byteLength !== 32) throw new P2PError('INVALID_FRAME', 'Iroh secret key must be 32 bytes');
     const relay = resolveRelayConfiguration(options);
     const relayUrls = relay.mode === 'custom'
-      ? normalizeConfiguredRelayUrls(relay.urls, options.allowRelayUrl)
+      ? normalizeConfiguredRelayUrls(relay.urls)
       : undefined;
     const relayEgressPolicy: RelayEgressPolicy = Object.freeze({
       mode: relay.mode,
@@ -418,11 +578,15 @@ export class IrohEndpoint implements QuicEndpoint {
     const discoveryOptions = resolveDiscoveryConfiguration(options.discovery);
     if (
       discoveryOptions.dns !== false &&
-      (options.allowDirectAddress !== undefined || options.allowRelayUrl !== undefined)
+      (
+        relay.mode === 'custom' ||
+        options.allowDirectAddress !== undefined ||
+        options.allowRelayUrl !== undefined
+      )
     ) {
       throw new P2PError(
         'UNAUTHORIZED',
-        'DNS/PKARR discovery cannot satisfy application-level resolved-route egress policy'
+        'DNS/PKARR discovery cannot satisfy restricted resolved-route egress policy'
       );
     }
     const nodeOptions: NodeOptions = {
@@ -439,17 +603,22 @@ export class IrohEndpoint implements QuicEndpoint {
     if (options.bindAddress) nodeOptions.bindAddr = typeof options.bindAddress === 'string'
       ? options.bindAddress
       : [...options.bindAddress];
-    const node = await createNode(nodeOptions);
+    // Keep compatibility hardening at the actual native construction boundary.
+    // This remains effective even when a consumer tree-shakes module side effects.
+    installIrohWriterCleanup(PublicKey);
+    const node = await (relay.mode === 'disabled'
+      ? createRelaylessIrohNode(createNode, PublicKey, nodeOptions)
+      : createNode(nodeOptions));
     try {
       const discovery = await node.discoveryInfo();
       const protocol = Buffer.from(alpn).toString('base64url');
       const locator: Omit<TicketPayload, 'issuedAt' | 'expiresAt'> = {
-        version: 2,
+        version: 3,
         peerId: node.publicKey.toString(),
         directAddresses: filterAdvertisedAddresses(discovery.directAddresses, options.allowAdvertisedAddress),
         relayUrl: discovery.relayUrl === null
           ? null
-          : validateRelayCandidate(discovery.relayUrl, relayEgressPolicy, 'local', options.allowRelayUrl),
+          : validateRelayCandidate(discovery.relayUrl, relayEgressPolicy, 'local'),
         protocol
       };
       const endpoint = new IrohEndpoint(
@@ -498,12 +667,18 @@ export class IrohEndpoint implements QuicEndpoint {
       ...(parsed.directAddresses.length > 0 ? { directAddrs: parsed.directAddresses } : {}),
       ...(parsed.relayUrl ? { relayUrl: parsed.relayUrl } : {})
     });
+    let session: IrohSession | undefined;
     try {
-      const session = await abortable(pending, signal);
+      session = await abortable(pending, signal);
       await abortable(session.ready, signal);
       return new WebSessionConnection(session, this.node, 'client');
     } catch (cause) {
-      void pending.then((session) => session.close({ closeCode: 4, reason: 'Dial cancelled' }), () => undefined);
+      // Do not let this adapter promise settle while a late native dial can
+      // still materialize an unowned session. P2PNode keeps the handshake
+      // admission charged to this promise after its public connect deadline;
+      // settlement therefore proves either dial rejection or physical close.
+      if (session) await closeDialSession(session);
+      else await pending.then(closeDialSession, () => undefined);
       throw cause;
     }
   }
@@ -541,13 +716,17 @@ export class IrohEndpoint implements QuicEndpoint {
     }
     if (!this.mdnsEnabled) throw new P2PError('REJECTED', 'mDNS discovery is not enabled');
     const serviceName = locator.serviceName ?? this.mdnsServiceName ?? 'p2prpc';
+    const cleanupController = new AbortController();
+    const browseSignal = signal
+      ? AbortSignal.any([signal, cleanupController.signal])
+      : cleanupController.signal;
     const iterator = this.node.browsePeers({
       serviceName,
-      ...(signal ? { signal } : {})
+      signal: browseSignal
     })[Symbol.asyncIterator]();
     try {
       while (true) {
-        const event = await abortable(iterator.next(), signal);
+        const event = await abortable(iterator.next(), browseSignal);
         if (event.done) throw new P2PError('NOT_FOUND', `mDNS peer ${expectedPeerId} was not found`);
         if (!event.value.isActive || event.value.nodeId !== expectedPeerId) continue;
         if (event.value.addrs.length > 33) {
@@ -579,7 +758,12 @@ export class IrohEndpoint implements QuicEndpoint {
         return { directAddresses, relayUrl };
       }
     } finally {
-      await iterator.return?.();
+      // Native discovery is a subscription. Abort it before asking the
+      // iterator to return, and never let a broken adapter make connect()
+      // or cancellation wait forever. A timed-out return remains observed;
+      // endpoint shutdown is the final native cleanup boundary.
+      cleanupController.abort(new P2PError('CANCELLED', 'mDNS lookup completed'));
+      await closeAsyncIterator(iterator, DISCOVERY_CLEANUP_TIMEOUT_MS);
     }
   }
 
@@ -590,6 +774,9 @@ export class IrohEndpoint implements QuicEndpoint {
         return result.done ? null : new WebSessionConnection(result.value, this.node, 'server');
       } catch (cause) {
         if (String(cause).includes('accept session: timed out')) {
+          // The wrapper documents this timeout as a refresh signal. Do not let
+          // a defective old iterator block installation of its replacement.
+          void closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
           this.incoming = this.node.incoming()[Symbol.asyncIterator]();
           continue;
         }
@@ -610,15 +797,27 @@ export class IrohEndpoint implements QuicEndpoint {
   async *browse(options: EndpointDiscoveryOptions = {}): AsyncIterable<EndpointDiscoveryEvent> {
     if (!this.mdnsEnabled) throw new P2PError('REJECTED', 'mDNS discovery is not enabled');
     validateDiscoveryOptions(options);
-    for await (const event of this.node.browsePeers({
+    const cleanupController = new AbortController();
+    const browseSignal = options.signal
+      ? AbortSignal.any([options.signal, cleanupController.signal])
+      : cleanupController.signal;
+    const iterator = this.node.browsePeers({
       serviceName: options.serviceName ?? this.mdnsServiceName ?? 'p2prpc',
-      ...(options.signal ? { signal: options.signal } : {})
-    })) {
-      yield Object.freeze({
-        peerId: event.nodeId,
-        addresses: Object.freeze([...event.addrs]),
-        active: event.isActive
-      });
+      signal: browseSignal
+    })[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const event = await abortable(iterator.next(), browseSignal);
+        if (event.done) return;
+        yield Object.freeze({
+          peerId: event.value.nodeId,
+          addresses: Object.freeze([...event.value.addrs]),
+          active: event.value.isActive
+        });
+      }
+    } finally {
+      cleanupController.abort(new P2PError('CANCELLED', 'mDNS browse completed'));
+      await closeAsyncIterator(iterator, DISCOVERY_CLEANUP_TIMEOUT_MS);
     }
   }
 
@@ -628,10 +827,49 @@ export class IrohEndpoint implements QuicEndpoint {
   }
 
   async close(): Promise<void> {
-    const stopIncoming = this.incoming.return?.();
+    const stopIncoming = closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
     await this.node.close();
     await stopIncoming;
   }
+}
+
+async function closeAsyncIterator<T>(iterator: AsyncIterator<T>, timeoutMs: number): Promise<void> {
+  const returned = iterator.return;
+  if (!returned) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const task = Promise.resolve()
+    .then(() => returned.call(iterator))
+    .then(() => undefined, () => undefined);
+  try {
+    await Promise.race([
+      task,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Cancel a dial result without surrendering ownership before native closure is
+ * positively observed. A throwing close() or a rejected/throwing `closed`
+ * observation is adapter failure, not evidence that the QUIC session is gone.
+ */
+async function closeDialSession(opened: IrohSession): Promise<void> {
+  try {
+    opened.close({ closeCode: 4, reason: 'Dial cancelled' });
+  } catch {
+    // Still wait for the independent native closure observation below.
+  }
+  await Promise.resolve()
+    .then(() => opened.closed)
+    .then(
+      () => undefined,
+      () => new Promise<void>(() => undefined)
+    );
 }
 
 function validateIrohOptions(options: IrohEndpointOptions): void {
@@ -822,10 +1060,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function normalizeConfiguredRelayUrls(
-  values: readonly string[],
-  allowRelayUrl?: (url: URL) => boolean
-): string[] {
+function normalizeConfiguredRelayUrls(values: readonly string[]): string[] {
   if (values.length < 1 || values.length > 32) {
     throw new P2PError('RESOURCE_LIMIT', 'Configure between one and 32 Iroh relay URLs');
   }
@@ -833,7 +1068,7 @@ function normalizeConfiguredRelayUrls(
   const seen = new Set<string>();
   for (const value of values) {
     if (typeof value !== 'string') throw new P2PError('INVALID_FRAME', 'Iroh relay URL must be a string');
-    const normalized = validateRelayUrl(value, allowRelayUrl).toString();
+    const normalized = canonicalRelayUrl(value);
     if (seen.has(normalized)) throw new P2PError('INVALID_FRAME', 'Iroh relay URLs must not be duplicated');
     seen.add(normalized);
     output.push(normalized);
@@ -849,17 +1084,17 @@ function encodeTicket(payload: TicketPayload, secretKey: Uint8Array): string {
     type: 'pkcs8'
   });
   const signature = signBytes(null, ticketSignaturePayload(body), privateKey);
-  return `p2prpc2.${body.toString('base64url')}.${signature.toString('base64url')}`;
+  return `p2prpc3.${body.toString('base64url')}.${signature.toString('base64url')}`;
 }
 
 async function decodeTicket(
   ticket: string,
   relayEgressPolicy: RelayEgressPolicy,
   allowDirectAddress?: (address: string) => boolean,
-  allowRelayUrl?: (url: URL) => boolean
+  allowRelayUrl?: (origin: string) => boolean
 ): Promise<TicketPayload> {
   try {
-    if (Buffer.byteLength(ticket) > 64 * 1024 || !ticket.startsWith('p2prpc2.')) throw new Error('Invalid prefix or length');
+    if (Buffer.byteLength(ticket) > 64 * 1024 || !ticket.startsWith('p2prpc3.')) throw new Error('Invalid prefix or length');
     const parts = ticket.split('.');
     if (parts.length !== 3) throw new Error('Invalid ticket segments');
     const encodedBody = parts[1]!;
@@ -878,7 +1113,7 @@ async function decodeTicket(
     );
     const value = decoded as unknown as TicketPayload;
     if (
-      value.version !== 2 ||
+      value.version !== 3 ||
       typeof value.peerId !== 'string' ||
       !Array.isArray(value.directAddresses) ||
       typeof value.protocol !== 'string' ||
@@ -898,6 +1133,12 @@ async function decodeTicket(
     }
     const publicKey = PublicKey.fromString(value.peerId);
     if (!await publicKey.verify(ticketSignaturePayload(body), signature)) throw new Error('Invalid ticket signature');
+    if (value.directAddresses.length > 0 && allowDirectAddress === undefined) {
+      throw new P2PError(
+        'UNAUTHORIZED',
+        'Signed-ticket direct routes require an explicit egress policy'
+      );
+    }
     const directAddresses = validateDirectAddresses(value.directAddresses, allowDirectAddress);
     const relayUrl = value.relayUrl === null
       ? null
@@ -922,8 +1163,14 @@ function validateDirectAddresses(
     if (typeof value !== 'string' || value.length < 3 || value.length > 512 || !validSocketAddress(value)) {
       throw new P2PError('INVALID_FRAME', 'Route contains an invalid direct address');
     }
-    if (allowDirectAddress && allowDirectAddress(value) !== true) {
-      throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
+    if (allowDirectAddress) {
+      try {
+        if (allowDirectAddress(value) !== true) {
+          throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
+        }
+      } catch {
+        throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
+      }
     }
     return value;
   });
@@ -991,8 +1238,28 @@ function allowLanDirectAddress(value: string): boolean {
     : family === 6 && LAN_DIRECT_ADDRESSES.check(host, 'ipv6');
 }
 
-function validateRelayUrl(value: string, allowRelayUrl?: (url: URL) => boolean): URL {
-  if (value.length > 2048) throw new P2PError('INVALID_FRAME', 'Relay URL is too long');
+function canonicalRelayUrl(value: string): string {
+  const url = validateRelayUrl(value);
+  return url.toString();
+}
+
+function validateRelayUrl(value: string): URL {
+  if (
+    value.length < 1 ||
+    value.length > 2048 ||
+    value !== value.trim() ||
+    containsUnsafeDisplayCharacters(value)
+  ) {
+    throw new P2PError('INVALID_FRAME', 'Relay URL is not a bounded safe string');
+  }
+  const originSyntax = /^https:\/\/([^/?#\\]+)\/?$/iu.exec(value);
+  const authority = originSyntax?.[1];
+  if (!authority || authority.includes('@') || authority.includes('%') || authority.endsWith(':')) {
+    throw new P2PError(
+      'INVALID_FRAME',
+      'Relay URL must use an unambiguous credential-free HTTPS origin syntax'
+    );
+  }
   let url: URL;
   try {
     url = new URL(value);
@@ -1003,6 +1270,7 @@ function validateRelayUrl(value: string, allowRelayUrl?: (url: URL) => boolean):
     url.protocol !== 'https:' ||
     url.username ||
     url.password ||
+    url.port === '0' ||
     url.hash ||
     url.search ||
     (url.pathname !== '' && url.pathname !== '/')
@@ -1012,8 +1280,30 @@ function validateRelayUrl(value: string, allowRelayUrl?: (url: URL) => boolean):
       'Relay URL must be an HTTPS origin without credentials, path, query, or fragment'
     );
   }
-  if (allowRelayUrl && allowRelayUrl(url) !== true) {
-    throw new P2PError('UNAUTHORIZED', 'Relay URL was rejected by egress policy');
+  if (!url.hostname.startsWith('[') && url.hostname.endsWith('.')) {
+    if (url.hostname.endsWith('..')) {
+      throw new P2PError('INVALID_FRAME', 'Relay DNS name may contain at most one trailing root dot');
+    }
+    const hostname = url.hostname.slice(0, -1);
+    if (!hostname) throw new P2PError('INVALID_FRAME', 'Relay URL hostname is invalid');
+    url.hostname = hostname;
+    if (url.hostname !== hostname) {
+      throw new P2PError('INVALID_FRAME', 'Relay URL hostname could not be canonicalized');
+    }
+  }
+  const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+  if (isIP(hostname) === 0) {
+    const labels = hostname.split('.');
+    if (
+      hostname.length > 253 ||
+      labels.some((label) =>
+        label.length < 1 ||
+        label.length > 63 ||
+        !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
+      )
+    ) {
+      throw new P2PError('INVALID_FRAME', 'Relay DNS name contains an invalid label');
+    }
   }
   return url;
 }
@@ -1022,7 +1312,7 @@ function validateRelayCandidate(
   value: string,
   policy: RelayEgressPolicy,
   source: RelayCandidateSource,
-  allowRelayUrl?: (url: URL) => boolean
+  allowRelayUrl?: (origin: string) => boolean
 ): string {
   const url = validateRelayUrl(value);
   const normalized = url.toString();
@@ -1035,10 +1325,24 @@ function validateRelayCandidate(
   if (source === 'mdns' && policy.mode === 'default' && allowRelayUrl === undefined) {
     throw new P2PError('UNAUTHORIZED', 'mDNS relay route hints require an explicit egress policy');
   }
-  if (allowRelayUrl && allowRelayUrl(url) !== true) {
+  if (source === 'ticket' && policy.mode === 'default' && allowRelayUrl === undefined) {
+    throw new P2PError('UNAUTHORIZED', 'Signed-ticket relay route hints require an explicit egress policy');
+  }
+  if (source !== 'local') enforceRelayPolicy(normalized, allowRelayUrl);
+  return normalized;
+}
+
+function enforceRelayPolicy(canonical: string, policy?: (origin: string) => boolean): void {
+  if (!policy) return;
+  const origin = new URL(canonical).origin;
+  try {
+    // Strings are immutable and only the canonical origin is exposed.
+    if (policy(origin) !== true) {
+      throw new P2PError('UNAUTHORIZED', 'Relay URL was rejected by egress policy');
+    }
+  } catch {
     throw new P2PError('UNAUTHORIZED', 'Relay URL was rejected by egress policy');
   }
-  return normalized;
 }
 
 async function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

@@ -1,92 +1,87 @@
-# Architecture and security audit guide
+# Audit guide
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Validation](Production-Validation.md)
+This is the shortest useful review order for p2prpc wire/ALPN v4. The credential-handshake and file resume formats independently remain v3.
 
-## Fast audit path
+## 1. Establish the deployed boundary
 
-1. Confirm how the deployment obtains each trusted expected endpoint/principal tuple independently of signed tickets, DNS/PKARR, or mDNS route discovery.
-2. Trace an outbound connection through pre-dial locator binding, post-connect endpoint binding, endpoint admission, authentication, principal binding, and peer installation.
-3. Trace one RPC from frame parsing through `SessionSecurity.authorize` into tRPC middleware.
-4. Trace one capability pull from authorized tRPC issuance through lane attachment and atomic publication.
-5. Review reconnect, expiry, cancellation, revocation, and mutation uncertainty.
-6. Separate library controls from application and infrastructure responsibilities.
+Record the exact package tarball/hash, Node/npm/native targets, Iroh wrapper version, application protocol identity, enabled locators, relay configuration, limits, and whether `/advanced` or `/testing` is present in the production graph. Any custom security, transport, source, destination, schema, or policy callback joins the trusted computing base.
 
-## Control-to-code map
+Verify production imports only from the root unless an exception is documented. Root node creation must use a branded peer-bound security factory. Confirm the immutable packed artifact—not a rebuild—is what the publish job and deployment consume.
 
-| Question | Primary implementation | Evidence |
-|---|---|---|
-| Can a peer ID alone invoke work? | `src/node.ts`, `src/security/handshake.ts` | Native raw-peer negative test in `test/node.integration.test.ts` |
-| Can a locator select a different outbound target? | `src/node.ts`, `src/transport/iroh.ts` | Expected-endpoint and connect-options tests in `test/node-security.test.ts` |
-| Can the expected endpoint authenticate as an unexpected principal and become visible? | `src/node.ts` | Principal-mismatch-before-install/`onPeer` tests in `test/node-security.test.ts` |
-| Are target expectations retained across reconnect without caller mutation? | `src/node.ts` | Target snapshot/freeze and reconnect tests in `test/node-security.test.ts` |
-| How is OAuth verified and key-bound? | `src/security/oidc.ts`, `src/security/types.ts` | `test/security.test.ts` |
-| Does every operation pass policy? | `src/node.ts`, `src/rpc/server.ts`, `src/files/manager.ts` | `test/node-security.test.ts`, `test/files.test.ts` |
-| Can metadata spoof credentials? | `src/rpc/headers.ts`, `src/rpc/link.ts` | `test/headers.test.ts`, `test/rpc-link.test.ts` |
-| Are frames allocation-bounded? | `src/protocol.ts`, `src/files/validation.ts` | `test/protocol.test.ts`, `test/files.test.ts` |
-| Can stale file lanes attach? | `src/files/manager.ts` | transfer connection/attempt tests in `test/files.test.ts` |
-| Are capabilities replay-bounded? | `src/files/share.ts` | share/reconnect/revocation tests in `test/files.test.ts` |
-| Does built-in `fileDestination()` verify before publication? | `src/files/fs.ts` | filesystem, resume, race, and integrity tests in `test/files.test.ts` |
-| Are errors and audit text safe? | `src/rpc/server.ts`, `src/text.ts`, `src/node.ts` | RPC and node security tests |
-| Are dial routes constrained? | `src/transport/iroh.ts` | ticket/discovery/egress tests in `test/node-security.test.ts` and native integration tests |
+## 2. Trace trust establishment
 
-Paths above are relative to `packages/core/`.
+For one outbound connection, identify the trusted source of:
 
-## Deployment questions
+- locator;
+- expected Iroh endpoint ID;
+- expected issuer/subject/client/tenant;
+- token audience/scope and peer binding.
 
-- Are Iroh private keys persistent, non-exportable where possible, rotated, and mapped to managed workloads?
-- Are expected endpoint IDs and complete expected principal tuples distributed by an authenticated directory or enrollment system independently of user-supplied tickets and network discovery?
-- Which explicit locator modes and relay modes are enabled, and does DNS/PKARR fail closed where address-level egress callbacks are required?
-- Does every outbound call provide all principal matcher fields intentionally, using `null` only to require absence and optional `id` only when the authenticator's canonical ID is stable and trusted?
-- Is it understood that an expected-principal mismatch is detected after credential exchange, so credentials are short-lived, audience-limited, preferably endpoint-bound, and protected by pre-credential endpoint admission?
-- Does each environment/trust domain have a distinct OAuth audience and required connection scope?
-- Are access tokens short-lived, `at+jwt`, endpoint-key bound, and free of ID/refresh tokens?
-- Does authorization derive tenant, roles, and membership from the verified principal rather than RPC metadata?
-- Does `createContext` preserve the verified `auth` and untrusted `request` separation required by middleware?
-- Are dangerous mutations durably idempotent across process restarts?
-- Are source object IDs authorized before mapping into service-owned roots?
-- Are shares principal-bound with `allowedPrincipals`, are any `allowBearer` uses deliberate, and is deprecated issuer-ambiguous `allowedSubjects` avoided?
-- Are destinations quarantined in service-owned directories and scanned before release?
-- Do custom destinations independently verify the final digest and publish atomically?
-- Are peer, tenant, CPU, memory, stream, transfer, and aggregate disk quotas suitable for the deployment?
-- Are `onSecurityEvent` records exported to a monitored durable sink without credentials or capability tokens?
-- Is edge or relay rate limiting present for unauthenticated connection attempts?
-- Is the deployment on a published native target, and has it reviewed the pinned Iroh version and [license-artifact caveat](https://github.com/arduano/p2prpc/blob/main/packages/core/THIRD_PARTY_NOTICES.md)?
-- Do production builds/configuration prohibit `dangerouslyAllowInsecureSessions()`?
+Confirm discovery never supplies the expectations. Trace endpoint comparison and `preAuthorizePeer` before credential disclosure, then all six exact v3 frames, transcript construction, expiry cap, expected-principal comparison, and runtime installation. Repeat from the inbound side, where no outbound expectation exists. Verify a same-principal inbound connection can revive a retained disconnected outbound runtime, while a different principal fails and a purely inbound runtime remains non-reconnectable.
 
-## What the library does not guarantee
+Trace initial install, replacement, retained incumbent, duplicate arbitration, and reconnect into the same final admission-success gate. After every synchronous security event, abort listener, expiry action, and transport-close callback, require the node open, runtime slot and live-map entry still owned, exact epoch current, and session unexpired. Verify public promise continuations recheck after their last `await` and queued `onPeer` delivery rechecks its exact captured selection. Deterministically close the node from `session.authenticated`, queue closure before public resolution, close the incumbent while retiring a duplicate, and repeat during outbound reconnect; each acquisition must reject `DISCONNECTED`, return or notify no stale peer, and emit no false authentication rejection.
 
-- Exactly-once RPC or mutation rollback after cancellation.
-- Immediate JWT revocation without short lifetimes or a custom introspection-backed authenticator.
-- That a valid digest means content is safe, authentic, or policy-compliant.
-- Safety when an untrusted local user controls a source/destination parent directory or a custom storage adapter.
-- Durable capability state, audit delivery, transfer history, retention, or cross-process quotas.
-- Network-edge source-IP rate limiting.
-- Browser or React Native transport support in this release.
-- Alpine/musl or glibc older than 2.34; the pinned Iroh dependency's Linux binaries require glibc 2.34 or newer.
-- Effective custom native QUIC ALPN, stream priorities, or configured native stream/window limits through the current Iroh adapter.
+Code anchors: `transport/iroh.ts`, `security/handshake.ts`, `security/oidc.ts`, `security/shared-secret.ts`, `node.ts`.
 
-## Verification commands
+## 3. Trace one RPC
 
-```bash
-npm run typecheck
-npm run lint
-npm test
-npm run test:integration
-npm run test:minimum-runtime
-npm run build
-npm audit --audit-level=low
-```
+Follow stream admission, kind parsing, exact frame validation, header normalization, operation authorization, frozen `ctx.p2p`, tRPC runtime input parsing, procedure execution, validated response/error framing, cancellation, and both-half cleanup.
 
-The native integration suite is security-relevant: it regression-tests that a raw Iroh peer with the signed routes cannot dispatch an RPC mutation without completing application authentication.
+Check that middleware treats headers as assertions and identity as `ctx.p2p.auth.principal`. Verify mutations use durable idempotency and callers handle `OUTCOME_UNKNOWN`. Ensure long procedures/subscriptions cooperate with `AbortSignal`; there is no hidden response heartbeat timeout.
 
-## Review conclusion template
+Code anchors: `runtime/managed-connection.ts`, `rpc/headers.ts`, `rpc/server.ts`, `rpc/link.ts`, `protocol.ts`.
 
-A useful approval should state:
+## 4. Trace push and pull files
 
-- which endpoint and application identities are trusted;
-- how locators, expected identities, tokens, scopes, and key bindings are provisioned;
-- which operation and storage policies were reviewed;
-- which residual risks were accepted or mitigated externally;
-- which limits and revocation/idempotency expectations apply in production.
+For push, trace one prepared source descriptor from stat checks through hash/send/close, then exact offer validation, metadata schema, authorization, destination choice, lane ownership, complete digest, and atomic publication. Verify a custom destination checks its finalize signal immediately before publication and calls `markCommitted()` immediately afterward, before fallible cleanup; returning without the signal must fail closed. At the terminal exchange, verify sender `Complete` leaves its half open; receiver publication precedes `Complete` with a fresh 256-bit challenge; sender echoes that exact token in `Receipt` before FIN; receiver validates receipt and FIN before its FIN. A pre-sent receipt must not work. No path after publication may abort/reject the destination or change receiver success, and no path after the sender validates receiver completion may return uncertainty or retry.
 
-Do not summarize the design as “the ticket authenticates the peer” or “tRPC authorizes the call.” The accurate statement is: the caller independently names its expected endpoint and principal, Iroh authenticates the connected endpoint key, the application handshake authenticates the principal, p2prpc checks both expectations before exposing the peer, p2prpc invokes the configured operation policy before dispatch, and tRPC supplies typed dispatch after those checks.
+For receiver push reconciliation, distinguish hard `active`/acknowledgement-ambiguous `committed` records from evictable `acknowledged`/`rejected` replay tombstones. Verify the ledger is node-scoped across physical replacement and same-process runtime revival, with stable operation-handle identity, principal/manifest fingerprint checks, and authorization on every offer. Independently saturate per-peer, canonical-principal-across-endpoint, and node-wide hard quotas; admission must reject without evicting active/ambiguous state. Saturate the three tombstone quotas and verify oldest-applicable eviction without consuming hard capacity. Confirm deadline-indexed expiry does work proportional to due entries rather than retained peers, and that shutdown stops admission before clearing only after ledger-owning work settles. Treat TTL, tombstone eviction, and process loss—not ordinary physical reconnect—as ends of replay protection; confirm the application handles crash-boundary `OUTCOME_UNKNOWN`.
+
+For pull, start at root `ctx.p2p.files.share()`. Verify exact-session invalidation, automatic current-endpoint/full-principal binding, hashed token/operation indexes, expiry/download budget, atomic reservation, reconnect matching, revocation, process-local completion reconciliation, and bounded cleanup. Confirm retry authority is a private result of the exact current attempt, after current streams drain and the prepared source closes—not an error class, error code, or callback-visible abort reason. Replay attempt 1's abort reason and transport error during healthy attempt 2, and bare-abort the connection signal during preparation: all must settle the current stream, consume the capability terminally, and avoid redial. A genuine current typed transport loss must remain retryable only after drain and source closure. Confirm `DownloadFileOptions.operationId` is the stable capability-redemption ID and that push-only `transferId` is not accepted. Treat remote names and metadata as untrusted.
+
+Code anchors: `files/fs.ts`, `files/validation.ts`, `files/share.ts`, `files/manager.ts`, `files/transfer.ts`.
+
+## 5. Prove bounded ownership
+
+For every asynchronous start, answer:
+
+1. What global, peer, and principal admission was acquired first?
+2. Which object owns the promise, stream half, buffer, descriptor, reservation, or callback?
+3. What abort signal reaches it?
+4. Which success, failure, timeout, cancellation, late-result, and shutdown paths terminate it?
+5. Is release exact-once, and does a timed-out underlying promise remain accounted until settlement?
+
+For outbound BI and UNI opens, test four distinct boundaries: pre-abort performs no native call or admission; cancellation of a never-settling native open rejects promptly and requests physical close; its lease stays visible until fulfilled closure; and a late stream is terminally reset/stopped before the lease disappears. A rejected `closed()` promise must never release the lease.
+
+Inspect requests larger than each per-principal ceiling: they must reject immediately rather than queue forever. Verify fair queues are bounded and active scheduler leases remain visible until their actual logical owners settle.
+
+At global, peer, and principal scopes, saturate general capacity and prove all four file classes remain admissible independently: outbound control, inbound control, outbound data, and inbound data. Trace inbound bidirectional classification: one sequential per-connection loop may read only the one-byte kind before admission; the header deadline bounds that structural slot; the stream must then enter its real class with immediate admission or be load-shed. Prove a queued general request cannot hide an available directional reserve, an overloaded RPC cannot head-of-line block a later file control, and failed classifier cleanup quarantines the connection. Configuration must reject fewer than five stream slots or less than three maximum control frames plus two `max(control frame, maximum chunk + 64 KiB)` data buffers. For a transfer lasting longer than `streamIdleTimeoutMs`, verify sub-timeout lane/chunk/segment/write/FIN progress refreshes the receiver watchdog while a truly stalled operation times out.
+
+Code anchors: `runtime/resources.ts`, `runtime/task-group.ts`, `runtime/managed-connection.ts`, accept loops in `node.ts`.
+
+## 6. Review OAuth policy
+
+Require exact issuers/audiences, the documented RSA/EC/Ed25519 algorithm-key pairs, a configured HTTPS JWKS/static JWKS/single static public key, token `typ`, `iat`/`exp`/max age, connection and exact RPC/file scopes, and tenant/client rules. Confirm arbitrary JOSE key-resolver callbacks and all HTTP JWKS are rejected before unverified `jku`/`x5u` can influence selection. Verify configuration and mutable JWKs are snapshotted; fetched/static sets are bounded to 64 importable public keys/256 KiB; static JWKs require explicit compatible `alg`; fetched keys may omit `alg`, but any present value is compatible/allow-listed and every fetched key has a bounded unique `kid`. Confirm exact `cnf.jkt` binding to the presenter's `localPeerId` thumbprint or an authoritative directory callback only when `cnf` is absent. A malformed/mismatched present `cnf` must never fall back.
+
+Review token acquisition/storage separately; it is application-owned. Verify remote JWKS rejects redirects and uses the fixed 5-second timeout, 30-second success/failure cooldown, and 10-minute cache. Establish removed/new-key and established-session revocation latency from that cache, token/session TTL, and any introspection/directory mechanism.
+
+## 7. Review discovery and egress
+
+Validate signed-ticket expiry/signature/protocol and confirm every remote direct candidate or default-relay origin requires an explicit egress decision before dial. Check canonical HTTPS origins, custom-relay membership, mDNS label/address bounds, and absent/false/throwing callback behavior. DNS plus custom filtering remains unsupported. For relay-less claims, inspect the exact-version normalization seam and require two-host evidence showing non-loopback direct paths, no relay, and both ticket and mDNS discovery.
+
+## Deferred hypotheses, not release findings
+
+The 2026-08-24 follow-up closed the reproduced stale retry-provenance and admission false-success cases above. The scoped review did not establish production failures for forcibly bounding a non-cooperative custom prepared-source `close()` without erasing ownership, compile-time shared-attempt/runtime-claim disposal, replacing the sender commit boolean, the internal runtime-slot `undefined` sentinel, or broader slot-model permutations. These remain optional hardening prompts, not confirmed defects or reasons to expand this pass.
+
+## Release decision checklist
+
+- No unresolved medium-or-higher local architecture/security findings.
+- Unit, native integration, type, lint, docs, package, dependency, and workflow gates pass on the exact commit.
+- Packed public API contains no testing/internal leaks and ATTW/publint/install/tree-shake checks pass.
+- External ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled topology cases pass.
+- Mixed workload, 100-peer, and 10,000-file single-physical-connection gates meet error/fairness/memory/native-baseline criteria. The file gate is exactly 5,000 pushes and 5,000 capability pulls and requires zero active/ambiguous operations, bounded tombstones, and task/share/resource/stream return to baseline.
+- The external lab run is tied to the exact source commit; the immutable publish manifest ties that commit and run ID to the one validated tarball.
+- SBOM, registry signatures, tarball digest, and post-publish registry bytes match; verified provenance names this repository, publish workflow, commit, run, and tarball SHA-512.
+- `main`, the `npm` environment, trusted-publisher identity, and dedicated/ephemeral self-hosted lab runners have independently reviewed protections.
+
+A green local suite creates a release candidate. It does not substitute for the external relay/discovery/native lifecycle evidence. A same-host, loopback, mocked, reduced, reconnecting, or diagnostics-incomplete run cannot qualify the 10,000-file or two-host topology claims; this repository does not claim those artifacts before they exist for the exact candidate.

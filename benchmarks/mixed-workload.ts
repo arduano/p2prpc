@@ -3,12 +3,14 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { initTRPC } from '@trpc/server';
 import {
-  createP2PNode,
-  dangerouslyAllowInsecureSessions,
   fileDestination,
   fileSource,
   type PeerContext
 } from '../packages/core/src/index.js';
+import {
+  createTestingP2PNode as createP2PNode,
+  dangerouslyAllowInsecureSessions
+} from '../packages/core/src/testing.js';
 
 const t = initTRPC.context<PeerContext>().create();
 const router = t.router({ ping: t.procedure.query(() => 1) });
@@ -21,15 +23,15 @@ const receiver = await createP2PNode({
   protocol: { applicationId: 'benchmark', contractVersion: '1' },
   security: dangerouslyAllowInsecureSessions(),
   createContext: (context) => context,
-  onIncomingFile: (offer) => offer.accept(fileDestination(join(directory, 'received.bin'), { overwrite: true })),
-  iroh: { relay: { mode: 'disabled' } }
+  onIncomingFile: () => ({ accept: fileDestination(join(directory, 'received.bin'), { overwrite: true }) }),
+  iroh: { relay: { mode: 'disabled' }, allowDirectAddress: () => true }
 });
 const sender = await createP2PNode({
   router,
   protocol: { applicationId: 'benchmark', contractVersion: '1' },
   security: dangerouslyAllowInsecureSessions(),
   createContext: (context) => context,
-  iroh: { relay: { mode: 'disabled' } }
+  iroh: { relay: { mode: 'disabled' }, allowDirectAddress: () => true }
 });
 
 try {
