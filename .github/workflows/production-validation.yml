@@ -61,18 +61,21 @@ jobs:
           - name: ticket-custom
             locator: ticket
             relay: custom
+          - name: ticket-disabled
+            locator: ticket
+            relay: disabled
           - name: dns-default
             locator: dns
             relay: default
-          - name: dns-custom
-            locator: dns
-            relay: custom
           - name: mdns-default
             locator: mdns
             relay: default
           - name: mdns-custom
             locator: mdns
             relay: custom
+          - name: mdns-disabled
+            locator: mdns
+            relay: disabled
           - name: manual-selection
             locator: ${{ inputs.locator || 'ticket' }}
             relay: ${{ inputs.relay || 'custom' }}
@@ -105,13 +108,17 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install locked dependencies
+      - name: Install locked dependencies without undeclared lifecycle scripts
         if: steps.selection.outputs.selected == 'true'
-        run: npm ci
+        run: npm ci --strict-allow-scripts
       - name: Validate lab inputs
         if: steps.selection.outputs.selected == 'true'
         shell: bash
         run: |
+          if [[ "$LOCATOR" == "dns" && "$RELAY" == "custom" ]]; then
+            echo "DNS/PKARR with custom relays is unavailable until resolved routes can be filtered before dial" >&2
+            exit 1
+          fi
           bash scripts/validate-lab-driver.sh check p2prpc-lab-canary "$LAB_DRIVER_MANIFEST"
           bash scripts/validate-lab-driver.sh check p2prpc-lab-topology-suite "$LAB_DRIVER_MANIFEST"
           relay_count=0
@@ -211,8 +218,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install locked dependencies
-        run: npm ci
+      - name: Install locked dependencies without undeclared lifecycle scripts
+        run: npm ci --strict-allow-scripts
       - name: Validate lab inputs
         shell: bash
         run: |
@@ -269,6 +276,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked dependencies without undeclared lifecycle scripts
+        run: npm ci --strict-allow-scripts
       - name: Validate lab driver
         shell: bash
         run: |
@@ -295,7 +309,9 @@ jobs:
         run: |
           duration=1800
           if [[ "$RELEASE_RUN" == "true" ]]; then duration=14400; fi
-          p2prpc-lab-mixed-suite --peers 100 --rpc-streams 1000 --file-transfers 16 --duration-seconds "$duration" --output benchmark-results/mixed-load.json
+          args=(--locator ticket --relay custom --peers 100 --rpc-streams 1000 --file-transfers 16 --duration-seconds "$duration" --output benchmark-results/mixed-load.json)
+          while IFS= read -r value; do args+=(--relay-url "$value"); done < <(jq -r '.[]' <<< "$LAB_RELAY_URLS")
+          p2prpc-lab-mixed-suite "${args[@]}"
           bash scripts/validate-lab-driver.sh output p2prpc-lab-mixed-suite benchmark-results/mixed-load.json "$LAB_DRIVER_MANIFEST"
           if [[ "$RELEASE_RUN" == "true" ]]; then
             bash scripts/validate-lab-driver.sh evidence p2prpc-lab-mixed-suite benchmark-results/mixed-load.json release

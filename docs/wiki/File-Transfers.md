@@ -1,96 +1,98 @@
 # File transfers
 
-[Home](Home.md) · [Architecture](Architecture.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Audit guide](Audit-Guide.md) · [Validation](Production-Validation.md)
+File bytes never enter tRPC or SuperJSON. tRPC may return a typed `SharedFileHandle`; the same authenticated peer then uses a separate binary transfer protocol on parallel QUIC streams.
 
-## Control plane versus data plane
-
-tRPC is the recommended typed application authorization and capability-issuance plane: it answers questions such as “may this principal download document 42?” and returns a typed `SharedFileHandle`.
-
-The file protocol has its own QUIC control stream: it presents that handle, obtains operation authorization, and negotiates the attempt. It then stripes raw chunks across independent data streams. Neither file control messages nor bytes are serialized through tRPC, so unrelated RPC/subscription streams can continue concurrently.
-
-```text
-tRPC: requestDownload({ documentId }) ──> SharedFileHandle
-                                                │
-file control: Pull(handle, options) ─────────────┘
-file lanes:   chunk 0, 4, 8 ...
-              chunk 1, 5, 9 ...       in parallel
-              chunk 2, 6, 10 ...
-              chunk 3, 7, 11 ...
-```
-
-## Capability pull
-
-1. An authorized tRPC procedure maps an opaque application object ID to a service-owned `FileSource`.
-2. It creates a short-lived capability bound to `ctx.peer.id` and preferably `ctx.auth.principal`.
-3. The caller receives the typed handle and calls `peer.files.download(handle, destination)`.
-4. The source peer authorizes `file.pull` using the capability hash, then atomically reserves the matching capability operation.
-5. The source creates/offers a manifest. The destination reports already verified chunks and creates fresh attempt credentials.
-6. Missing bytes move over bounded lanes. The destination verifies, publishes, and acknowledges completion.
-
-Capability tokens are 256-bit opaque secrets; the registry stores only a domain-separated SHA-256 hash. By default a share must name allowed endpoint IDs, expires after five minutes, and permits one logical download. `allowBearer: true` deliberately permits omitting endpoint binding; it never removes session or file authorization. Principal binding is recommended but must be configured explicitly.
-
-Use `allowedPrincipals` for principal binding. `allowedSubjects` is deprecated because a subject is only unique within its issuer.
-
-Recommended policy binds both dimensions:
+## Push API
 
 ```ts
-node.files.share(source, {
-  allowedPeerIds: [ctx.peer.id],
-  allowedPrincipals: [ctx.auth.principal],
-  expiresAt: Math.min(Date.now() + 60_000, ctx.auth.expiresAt),
-  maxDownloads: 1
+const receiver = await createP2PNode({
+  // router, protocol, security, createContext...
+  onIncomingFile: async (offer) => {
+    if (offer.principal.tenantId !== 'tenant-a') {
+      return { reject: 'tenant policy' };
+    }
+    // offer.manifest.name is untrusted and is never used as this path.
+    return { accept: fileDestination('/srv/quarantine/incoming.bin') };
+  }
 });
+
+const transfer = await peer.files.sendFile(await fileSource('/srv/export/report.pdf'));
+for await (const progress of transfer.progress()) updateUi(progress);
+await transfer.result;
 ```
 
-Do not log the handle or place it in RPC metadata.
+The offer contains a verified principal/session ID and a signal tied to this authenticated attempt. Its manifest remains untrusted until exact-field/accessor checks, geometry and digest bounds, a detached plain-data metadata snapshot, and the optional metadata schema all pass. The schema never receives a live decoder-owned or peer-accessor object.
 
-## Push
+## Pull capability API
 
-`peer.files.sendFile(source)` sends a manifest on a control stream. The receiver validates it, authorizes `file.push`, and invokes `onIncomingFile` with the verified principal/session and an abort signal. The handler must choose a local destination from server policy. The remote filename is display data and is never a path.
+```ts
+// Inside an authorized tRPC procedure on the serving peer:
+const handle = ctx.p2p.files.share(
+  await fileSource('/srv/export/report.pdf'),
+  { expiresAt: Date.now() + 60_000, maxDownloads: 1 }
+);
 
-Push has no capability because the receiver makes the admission and destination decision directly. Session and per-operation authorization are still mandatory.
+// Send `handle` as an ordinary typed tRPC result. On the requester:
+const transfer = await peer.files.download(
+  handle,
+  fileDestination('/home/service/downloads/report.pdf'),
+  { operationId: durableRedemptionId }
+);
+await transfer.result;
+```
 
-## Attempt and lane binding
+The request facade closes over the exact authenticated session and rejects after replacement or expiry. It automatically binds the handle to `ctx.p2p.peer.id` and the complete principal tuple; it does not accept arbitrary bindings or a bearer flag. `peer.files.share()` provides the same safe derivation for local code already holding a peer. Advanced registry policy is available only through `/advanced` and becomes part of the application security review.
 
-The receiver returns:
+Omit `operationId` to generate a fresh random capability redemption. Supply and persist it only when the same logical download must reconnect or be reconciled; reusing it with another endpoint, principal, token, chunk size, or lane count fails. This pull option is deliberately distinct from `SendFileOptions.transferId`, which is the manifest ID for a push and may be reused only for the exact same push manifest.
 
-- `transferId`: stable logical content-transfer identifier; not secret.
-- `attemptId`: fresh per-attempt identifier.
-- `laneToken`: fresh 256-bit secret shared only on the authenticated control stream.
-- missing chunk ranges and maximum lane count.
+## Source integrity
 
-Every data lane must match the exact in-memory authenticated connection context, all three identifiers, an unused lane number, and the announced chunk budget. A stale stream from a replaced connection cannot attach even if it knows a transfer ID or old lane token.
+`fileSource()` rejects non-regular files and symlinks, captures device/inode/size/timestamps, and later opens one no-follow descriptor for the prepared lifecycle. The same validated handle stays open for manifest hashing and every transmitted read. Identity is rechecked so path replacement or mutation cannot swap bytes between authorization/hash/send.
 
-A lane is not independently OIDC-authenticated. It inherits the exact physical connection that completed mutual application authentication, then proves attempt membership with the receiver-issued lane token and identifiers.
+A fresh transfer deliberately makes one sequential hash pass before sending its offer, then reads the chunks the receiver reports missing. This gives authorization, resume, and final verification one stable content identity, at the cost of O(file size) time-to-offer and roughly two source reads when no chunks are already present. It is an explicit integrity/resume tradeoff, not a claim of single-pass transfer startup.
 
-## Integrity and publication
+Custom sources must honor abort, return the exact requested chunk, and close prepared resources promptly.
 
-The source first reads the full file to create a BLAKE3 manifest, then reads chunks for transfer. Each chunk carries its own BLAKE3 digest. The receiver checks chunk geometry and digest before writing; the built-in destination re-reads the complete staged file and compares the manifest digest immediately before atomic publication.
+## Destination integrity
 
-The sender reports success only after the receiver has finalized and acknowledged the same attempt. Digests prove transfer consistency, not authorship, authorization, content type, or malware safety.
+`fileDestination()` never derives its path from a remote name. It owns explicit `.part`, `.state`, and `.lock` files using no-follow checks and stable file identities. Resume state is a bounded binary v3 format, not attacker-controlled JSON. Chunks are range-checked, digest-checked, written with bounded segments, and durably recorded.
 
-## Built-in filesystem adapters
+Before publication, the destination recomputes the complete BLAKE3 digest over staged bytes. Publication is atomic and defaults to durable sync. Existing targets are not overwritten unless explicitly requested. Integrity/policy failures discard unsafe state; transport failures may retain securely validated resume state. Descriptor, staging, resume, lock, or post-commit sync failures are surfaced; a failure after publication is `OUTCOME_UNKNOWN`, never a false success with silently abandoned cleanup.
 
-`fileSource()` rejects leaf symlinks and detects inode, size, and timestamp changes around reads. The application must still resolve an authorized object ID inside a service-owned source root; never pass a remote path directly.
+Custom destinations must perform equivalent complete verification immediately before atomic publication, check `context.signal` immediately before committing, and call `context.markCommitted()` synchronously just after publication and before any fallible cleanup. That explicit boundary lets p2prpc distinguish a safe pre-commit rejection from post-commit cleanup uncertainty; omitting it fails closed without acknowledging the transfer.
 
-`fileDestination()` uses:
+## Streams and backpressure
 
-- a private exclusive `.p2prpc.part` staging file;
-- bounded `.p2prpc.state.json` verified resume state;
-- an exclusive `.p2prpc.lock` with no automatic stale-lock breaking;
-- no-follow and identity checks;
-- full-file digest verification;
-- staged-file sync by default, best-effort parent-directory sync where supported, and atomic publication.
+One control stream negotiates the exact manifest, resume bitmap/ranges, transfer fingerprint, and terminal result. A bounded lane plan assigns missing chunks without a per-chunk promise array. Each data lane owns its unidirectional stream through finish or reset, including a stream that resolves after cancellation. Reads, writes, hashes, and stream buffer leases are chunk-bounded.
 
-Parent directories must be service-owned. Leaf checks cannot defeat a local attacker who can replace a parent path component.
+At global, peer, and principal scopes, the scheduler has four non-borrowable stream/buffer reserves: outbound control, inbound control, outbound data, and inbound data. A class uses its own reserve first; excess control/lanes share only the general remainder with RPC and all other excess. A valid configuration admits those four paths plus one general/RPC stream, so every stream ceiling is at least five. Its buffer ceiling admits three maximum control frames plus both data buffers; each data buffer is the larger of a control frame or one maximum chunk plus 64 KiB. These invariants keep symmetric peers from consuming one another's only control or lane progress path.
 
-Custom `FileSource` and `FileDestination` objects are trusted storage adapters. They must cooperate with abort, keep source bytes stable, independently verify final staged content, and publish atomically.
+`streamIdleTimeoutMs` is a no-progress deadline, not a maximum transfer duration. The receiver reads control concurrently and refreshes its session watchdog for lane admission, every chunk header, each 64 KiB body segment, a completed destination write, lane FIN, and terminal progress. Healthy large or slow transfers may therefore run longer than the idle interval; a stalled segment, callback, lane, or terminal exchange still times out.
 
-## Resume, retry, expiry, and revocation
+Progress delivery is independent and conflated for every iterator. A slow consumer retains at most the newest snapshot and cannot delay or fail the transfer. Node-level progress hooks are also best effort.
 
-- Transport disconnects retry with backoff up to five times; other failures are terminal.
-- Pull retry keeps one operation ID and must match the original endpoint, full principal binding, and chunk/lane fingerprint.
-- The reconnect lease is fixed when disconnection first occurs and is 30 seconds by default.
-- Capability expiry prevents new or reconnecting reservations; it is not an exact timer for already active work.
-- `node.files.revoke(handle)` removes the capability and immediately aborts active reservations.
-- Filesystem resume state, including for push, matches whole-file digest, size, and chunk size, then re-hashes every recorded chunk. It is not bound to name, metadata, transfer ID, peer, principal, session, or capability. Every new attempt still requires session authentication, operation authorization, and receiver admission; pull reconnect adds its peer, principal, capability-operation, and fingerprint constraints separately.
+## Logical operations and retries
+
+`maxDownloads` counts distinct pull operation IDs, not network attempts. The capability registry stores hashed IDs in a bounded global table. A disconnected reservation receives a fixed, bounded reconnect lease and attempt limit; reconnect requires the same endpoint, complete principal, operation ID, chunk/lane fingerprint, and fresh file authorization.
+
+Every delivery has private retry provenance scoped to its exact connection attempt. Only a typed transport-loss event observed by that current attempt, before a possible commit, can become a retry candidate. Application callbacks see ordinary sanitized `P2PError` reasons rather than retry markers: retaining and rethrowing an earlier attempt's reason, constructing a `DISCONNECTED` error, or triggering an untyped connection abort is terminal and cannot cause redial.
+
+For a shared pull, a candidate becomes a retry result only after every current-attempt stream has drained and its prepared source has closed; the reservation remains active while cleanup is pending. The retry coordinator consumes that explicit result and never derives authority from a later thrown error. Failed stream/source cleanup consumes the capability terminally, with source-cleanup uncertainty reported as `OUTCOME_UNKNOWN`. Policy, shape, integrity, local I/O, and application errors are also terminal. Every file delivery in wire v4 closes with this receipt exchange:
+
+1. The sender sends `Complete` but keeps its send half open.
+2. The receiver drains every lane through FIN, verifies, and atomically finalizes the destination.
+3. The receiver records the committed outcome, then sends `Complete` with a fresh 256-bit `receiptToken`.
+4. The sender validates that completion, making success permanent, echoes the token in `Receipt`, and sends FIN.
+5. The receiver validates the receipt and sender FIN, then sends FIN.
+
+For a push, loss after the sender begins step 1 but before step 4 produces sender `OUTCOME_UNKNOWN`; the application must reconcile rather than blindly retry. A retry with the same authenticated principal, `transferId`, and exact manifest can replay the completion exchange without invoking destination callbacks. After either side knows local/remote publication succeeded, later receipt or stream-cleanup failure cannot turn success into failure; the physical connection is quarantined if cleanup cannot be proved.
+
+Receiver-side push state lives in a node-lifetime ledger. Hard `active` and acknowledgement-ambiguous `committed` state defaults to 1,024 records per peer, 1,024 per canonical principal across endpoint keys, and 4,096 node-wide. These are `maxFileReconciliationRecords`, `maxPrincipalFileReconciliationRecords`, and `maxGlobalFileReconciliationRecords`; a full applicable scope rejects new work and never evicts hard state. Active entries do not expire, while committed entries use `fileReconciliationTtlMs` (default 15 minutes).
+
+A valid receipt moves success to the replay-tombstone store; terminal rejection also uses it. `maxFileReplayTombstones`, `maxPrincipalFileReplayTombstones`, and `maxGlobalFileReplayTombstones` default to 1,024, 2,048, and 8,192 respectively. Tombstones evict oldest-first at an applicable bound and never consume hard capacity, so acknowledged throughput is not limited to the hard-record TTL. Expiry processes only due entries through a deadline index. The ledger survives physical connection replacement and same-process runtime revival, allowing an exact principal/manifest/`transferId` replay to reconcile on a new connection. Node shutdown rejects new ledger admission and retains existing evidence until owned transfers settle. Protection ends at the earliest of process loss, TTL, or—only for acknowledged/rejected state—bounded tombstone eviction. Authorization still runs on every offer. This is process-local reconciliation, not crash-durable exactly-once delivery.
+
+## The 10,000-file invariant
+
+The required production gate sends 5,000 pushes and 5,000 peer/principal-bound capability pulls over one authenticated physical QUIC connection, split between sequential and concurrency-16 phases. Qualifying evidence must checkpoint stream halves, scheduler leases/queues, transfer/reconciliation/share/task state, native handles, file descriptors, memory, event-loop delay, and RPC canaries; fault phases must cover cancellation, rejection, I/O failure, timeout, reconnect ambiguity, and lost receipt.
+
+The checked-in driver validates p2prpc ownership and protocol integration, not Iroh throughput. Its eligibility flag covers the exact count/profile and required diagnostics, but the current driver does not automate every required fault or mixed-load measurement. A local, loopback, mocked, reduced, reconnecting, or diagnostics-incomplete run is not production evidence. The first npm release remains blocked until the exact candidate produces the remaining protected external evidence and the separate two-host discovery/relay matrix in [Production Validation](Production-Validation.md); this repository does not claim that evidence has already been obtained.

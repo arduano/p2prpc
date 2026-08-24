@@ -1,14 +1,17 @@
 import { initTRPC } from '@trpc/server';
 import { describe, expect, it } from 'vitest';
 import {
-  createP2PNode,
   P2PError,
   type AuthenticatedSession,
   type ConnectOptions,
-  type P2PNodeOptions,
   type SecurityAuditEvent
 } from '../src/index.js';
-import { StreamKind, writeFrame, writeStreamKind } from '../src/protocol.js';
+import {
+  createAdvancedP2PNode as createP2PNode,
+  type AdvancedP2PNodeOptions as P2PNodeOptions
+} from '../src/node.js';
+import { StreamKind, TransferFrameKind, readFrame, writeFrame, writeStreamKind } from '../src/protocol.js';
+import type { ShareRegistry } from '../src/files/share.js';
 import type {
   ConnectionStats,
   QuicBiStream,
@@ -24,6 +27,7 @@ const t = initTRPC.create();
 const router = t.router({
   ping: t.procedure.query(() => 'pong')
 });
+const DEFAULT_MINIMUM_FILE_BUFFER = 3 * 1024 * 1024 + 2 * (4 * 1024 * 1024 + 64 * 1024);
 
 describe('node security boundaries', () => {
   it('passes a signal to peer admission and aborts it at the handshake deadline', async () => {
@@ -31,6 +35,7 @@ describe('node security boundaries', () => {
     const endpoint = new AdmissionEndpoint(connection);
     let admissionSignal: AbortSignal | undefined;
     let admissionPeerFrozen = false;
+    const admission = deferred<boolean>();
     const node = await createP2PNode({
       router,
       protocol: { applicationId: 'node-security-test', contractVersion: '1' },
@@ -39,11 +44,14 @@ describe('node security boundaries', () => {
       preAuthorizePeer: (peer, signal) => {
         admissionPeerFrozen = Object.isFrozen(peer);
         admissionSignal = signal;
-        return new Promise<boolean>(() => undefined);
+        return admission.promise;
       },
       limits: { handshakeTimeoutMs: 100 },
       endpointFactory: async () => endpoint
     });
+    const internals = node as unknown as {
+      resources: { snapshot(): { active: { handshakes: number; callbacks: number } } };
+    };
 
     try {
       await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'TIMEOUT' });
@@ -51,6 +59,9 @@ describe('node security boundaries', () => {
       expect(admissionSignal?.aborted).toBe(true);
       expect(admissionPeerFrozen).toBe(true);
       expect(connection.closeCalls).toBe(1);
+      expect(internals.resources.snapshot().active).toMatchObject({ handshakes: 1, callbacks: 1 });
+      admission.resolve(false);
+      await expect.poll(() => internals.resources.snapshot().active).toMatchObject({ handshakes: 0, callbacks: 0 });
     } finally {
       await node.close();
     }
@@ -59,6 +70,56 @@ describe('node security boundaries', () => {
   it('keeps existing one-argument peer admission callbacks source compatible', () => {
     const admission: NonNullable<P2PNodeOptions<typeof router>['preAuthorizePeer']> = () => true;
     expect(admission({ id: 'remote', direction: 'inbound' }, new AbortController().signal)).toBe(true);
+  });
+
+  it('bounds rate-limited native close drains before accepting another connection', async () => {
+    const endpoint = new InboundEndpoint();
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: {
+        maxPendingHandshakes: 1,
+        handshakeGlobalBurst: 4,
+        handshakeGlobalRatePerSecond: 1,
+        handshakePeerBurst: 1,
+        handshakePeerRatePerSecond: 1
+      },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      rejectedConnections: Set<Promise<void>>;
+    };
+    internals.authenticate = async () => {
+      throw new P2PError('UNAUTHORIZED', 'reject the admitted test connection');
+    };
+    const admitted = new AdmissionConnection(false, 'remote', 'server');
+    const stalledRejection = new AdmissionConnection(false, 'remote', 'server', false);
+    const queued = new AdmissionConnection(false, 'remote', 'server');
+
+    try {
+      endpoint.queue(admitted);
+      await expect.poll(() => admitted.closeCalls).toBe(1);
+
+      endpoint.queue(stalledRejection);
+      await expect.poll(() => stalledRejection.closeCalls).toBe(1);
+      expect(internals.rejectedConnections.size).toBe(1);
+
+      endpoint.queue(queued);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(endpoint.acceptCalls).toBe(2);
+      expect(queued.closeCalls).toBe(0);
+
+      stalledRejection.resolveClosed();
+      await expect.poll(() => queued.closeCalls).toBe(1);
+      expect(endpoint.acceptCalls).toBeGreaterThanOrEqual(3);
+    } finally {
+      stalledRejection.resolveClosed();
+      await node.close();
+    }
   });
 
   it('rejects an unexpected outbound endpoint before admission or credential disclosure', async () => {
@@ -170,7 +231,7 @@ describe('node security boundaries', () => {
     const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
     internals.authenticate = async () => sharedSecretSession('shared-secret-session', 'remote');
     const target: ConnectOptions = {
-      ticket: endpoint.address.ticket,
+      locator: { kind: 'ticket', ticket: endpoint.address.ticket },
       expectedPeerId: 'remote',
       expectedPrincipal: {
         id: 'remote',
@@ -193,6 +254,35 @@ describe('node security boundaries', () => {
       expect(saved.expectedPrincipal.subject).toBe('remote');
       expect(Object.isFrozen(saved)).toBe(true);
       expect(Object.isFrozen(saved.expectedPrincipal)).toBe(true);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('reuses an already authenticated runtime instead of dialing a duplicate connection', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    let authenticationCalls = 0;
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => {
+      authenticationCalls += 1;
+      return authenticatedSession('stable-session', 'oauth-client-a');
+    };
+
+    try {
+      const first = await node.connect(connectTarget(endpoint.address.ticket));
+      const second = await node.connect(connectTarget(endpoint.address.ticket));
+      expect(endpoint.connectCalls).toBe(1);
+      expect(authenticationCalls).toBe(1);
+      expect(second.session.id).toBe(first.session.id);
+      expect(node.peersSnapshot()).toHaveLength(1);
     } finally {
       await node.close();
     }
@@ -228,7 +318,8 @@ describe('node security boundaries', () => {
       } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
       await expect(node.connect({
         ...connectTarget(endpoint.address.ticket),
-        locator: { kind: 'dns' }
+        locator: { kind: 'dns' },
+        ticket: endpoint.address.ticket
       } as never)).rejects.toMatchObject({ code: 'INVALID_FRAME' });
       expect(endpoint.connectCalls).toBe(0);
     } finally {
@@ -391,7 +482,12 @@ describe('node security boundaries', () => {
       { relayUrls: null },
       { relayUrls: [] },
       { relayUrls: ['http://relay.example'] },
-      { relayUrls: ['https://relay.example'], allowRelayUrl: () => undefined }
+      { relayUrls: [' https://relay.example'] },
+      { relayUrls: ['https://relay.example/segment/..'] },
+      { relayUrls: ['https://@relay.example'] },
+      { relayUrls: ['https://relay.example:'] },
+      { relayUrls: ['https://.'] },
+      { relayUrls: ['https://relay.example:0'] }
     ]) {
       await expect(IrohEndpoint.create(alpn, options as never)).rejects.toBeInstanceOf(P2PError);
     }
@@ -411,13 +507,124 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('retains a cancelled late Iroh dial until native session closure is proven', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/late-dial-ownership/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { dns: true }
+    });
+    const dialStarted = deferred<void>();
+    const dialResult = deferred<unknown>();
+    const physicallyClosed = deferred<void>();
+    let closeCalls = 0;
+    const internal = endpoint as unknown as {
+      node: { dial(peerId: string, options: unknown): Promise<unknown> };
+    };
+    internal.node.dial = () => {
+      dialStarted.resolve(undefined);
+      return dialResult.promise;
+    };
+    const session = {
+      ready: Promise.resolve(undefined),
+      close: () => {
+        closeCalls += 1;
+        // A broken adapter close must not be mistaken for physical closure.
+        throw new Error('synchronous close failure');
+      },
+      closed: physicallyClosed.promise.then(() => ({ closeCode: 4, reason: 'closed' }))
+    };
+    const controller = new AbortController();
+    const connecting = endpoint.connectLocator(
+      { kind: 'dns' },
+      alpn,
+      endpoint.id,
+      controller.signal
+    );
+    let settled = false;
+    void connecting.then(
+      () => { settled = true; },
+      () => { settled = true; }
+    );
+
+    try {
+      await dialStarted.promise;
+      controller.abort(new P2PError('CANCELLED', 'test cancellation'));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      dialResult.resolve(session);
+      await expect.poll(() => closeCalls).toBe(1);
+      expect(settled).toBe(false);
+
+      physicallyClosed.resolve(undefined);
+      await expect(connecting).rejects.toMatchObject({ code: 'CANCELLED' });
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  it('does not treat a rejected Iroh closed observation as physical proof', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/rejected-close-observation/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      discovery: { dns: true }
+    });
+    const dialStarted = deferred<void>();
+    const dialResult = deferred<unknown>();
+    const internal = endpoint as unknown as {
+      node: { dial(peerId: string, options: unknown): Promise<unknown> };
+    };
+    internal.node.dial = () => {
+      dialStarted.resolve(undefined);
+      return dialResult.promise;
+    };
+    const controller = new AbortController();
+    const connecting = endpoint.connectLocator(
+      { kind: 'dns' },
+      alpn,
+      endpoint.id,
+      controller.signal
+    );
+    let settled = false;
+    void connecting.then(
+      () => { settled = true; },
+      () => { settled = true; }
+    );
+
+    try {
+      await dialStarted.promise;
+      controller.abort(new P2PError('CANCELLED', 'test cancellation'));
+      dialResult.resolve({
+        ready: Promise.resolve(undefined),
+        close: () => undefined,
+        closed: Promise.reject(new Error('native close observation failed'))
+      });
+      for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+      expect(settled).toBe(false);
+    } finally {
+      await endpoint.close();
+    }
+  });
+
   it('fails DNS discovery closed when resolved routes cannot be checked by application egress policy', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/dns-policy/1');
-    await expect(IrohEndpoint.create(alpn, {
-      relay: { mode: 'disabled' },
-      discovery: { dns: true },
-      allowDirectAddress: () => true
-    })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    for (const options of [
+      {
+        relay: { mode: 'disabled' },
+        discovery: { dns: true },
+        allowDirectAddress: () => true
+      },
+      {
+        relay: { mode: 'custom', urls: ['https://relay.example'] },
+        discovery: { dns: true }
+      },
+      {
+        relay: { mode: 'custom', urls: ['https://relay.example'] },
+        discovery: { dns: { serverUrl: 'https://dns.example' } }
+      }
+    ] as const) {
+      await expect(IrohEndpoint.create(alpn, options)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    }
   });
 
   it('enforces relay mode on signed ticket route hints', { timeout: 30_000 }, async () => {
@@ -473,12 +680,157 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('applies relay callbacks only to untrusted remote candidates, not local relay configuration', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/3/relay-policy-source-separation/1');
+    const localCandidates: string[] = [];
+    const customCandidates: string[] = [];
+    const local = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      allowRelayUrl: (origin) => {
+        localCandidates.push(origin);
+        return true;
+      }
+    });
+    const custom = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'custom', urls: ['https://RELAY.example:443'] },
+      allowRelayUrl: (origin) => {
+        customCandidates.push(origin);
+        return true;
+      }
+    });
+    const issuer = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
+    const issuerInternal = issuer as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    const customResolver = custom as unknown as {
+      resolveLocator(locator: EndpointLocator, expectedPeerId: string): Promise<{ relayUrl: string | null }>;
+    };
+
+    try {
+      // Default-network relay selection and configured custom origins are
+      // trusted deployment inputs, so neither invokes the remote-candidate hook.
+      await local.createTicket();
+      expect(localCandidates).toEqual([]);
+      expect(customCandidates).toEqual([]);
+
+      issuerInternal.node.discoveryInfo = async () => ({
+        nodeId: issuer.id,
+        directAddress: null,
+        directAddresses: [],
+        relayUrl: 'https://relay.example/'
+      });
+      await expect(customResolver.resolveLocator(
+        { kind: 'ticket', ticket: await issuer.createTicket() },
+        issuer.id
+      )).resolves.toMatchObject({ relayUrl: 'https://relay.example/' });
+      expect(customCandidates).toEqual(['https://relay.example']);
+    } finally {
+      await Promise.all([local.close(), custom.close(), issuer.close()]);
+    }
+  });
+
+  it('requires explicit egress policy for every remote signed-ticket route', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/3/ticket-route-policy/1');
+    const issuer = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
+    const implicitReceiver = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
+    const explicitReceiver = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      allowDirectAddress: () => true,
+      allowRelayUrl: () => true
+    });
+    const issuerInternal = issuer as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    type Resolver = {
+      resolveLocator(
+        locator: EndpointLocator,
+        expectedPeerId: string
+      ): Promise<{ directAddresses: string[]; relayUrl: string | null }>;
+    };
+    const implicit = implicitReceiver as unknown as Resolver;
+    const explicit = explicitReceiver as unknown as Resolver;
+
+    try {
+      issuerInternal.node.discoveryInfo = async () => ({
+        nodeId: issuer.id,
+        directAddress: '10.20.30.40:4433',
+        directAddresses: ['10.20.30.40:4433'],
+        relayUrl: null
+      });
+      const directTicket = await issuer.createTicket();
+      await expect(implicit.resolveLocator(
+        { kind: 'ticket', ticket: directTicket },
+        issuer.id
+      )).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      await expect(explicit.resolveLocator(
+        { kind: 'ticket', ticket: directTicket },
+        issuer.id
+      )).resolves.toMatchObject({ directAddresses: ['10.20.30.40:4433'], relayUrl: null });
+
+      issuerInternal.node.discoveryInfo = async () => ({
+        nodeId: issuer.id,
+        directAddress: null,
+        directAddresses: [],
+        relayUrl: 'https://remote-ticket-relay.example/'
+      });
+      const relayTicket = await issuer.createTicket();
+      await expect(implicit.resolveLocator(
+        { kind: 'ticket', ticket: relayTicket },
+        issuer.id
+      )).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      await expect(explicit.resolveLocator(
+        { kind: 'ticket', ticket: relayTicket },
+        issuer.id
+      )).resolves.toMatchObject({ directAddresses: [], relayUrl: 'https://remote-ticket-relay.example/' });
+    } finally {
+      await Promise.all([issuer.close(), implicitReceiver.close(), explicitReceiver.close()]);
+    }
+  });
+
+  it('fails signed-ticket direct-address policy exceptions closed', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/3/ticket-route-policy-throw/1');
+    const issuer = await IrohEndpoint.create(alpn, { relay: { mode: 'disabled' } });
+    const receiver = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      allowDirectAddress: () => { throw new Error('policy backend detail'); }
+    });
+    const resolver = receiver as unknown as {
+      resolveLocator(locator: EndpointLocator, expectedPeerId: string): Promise<unknown>;
+    };
+
+    try {
+      await expect(resolver.resolveLocator(
+        { kind: 'ticket', ticket: await issuer.createTicket() },
+        issuer.id
+      )).rejects.toMatchObject({
+        code: 'UNAUTHORIZED',
+        message: 'Route direct address was rejected by egress policy'
+      });
+    } finally {
+      await Promise.all([issuer.close(), receiver.close()]);
+    }
+  });
+
   it('canonicalizes custom relay origins and rejects equivalent duplicates before startup', async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/relay-origin-canonicalization/1');
     await expect(IrohEndpoint.create(alpn, {
       relay: {
         mode: 'custom',
-        urls: ['https://RELAY.example:443', 'https://relay.example/']
+        urls: ['https://RELAY.example.:443', 'https://relay.example/']
       }
     })).rejects.toMatchObject({ code: 'INVALID_FRAME' });
   });
@@ -699,7 +1051,7 @@ describe('node security boundaries', () => {
     }
   });
 
-  it('audits only installed sessions and rejects an OAuth client identity swap', async () => {
+  it('audits installed reconnect sessions and rejects an OAuth client identity swap', async () => {
     const first = new AdmissionConnection(false);
     const duplicate = new AdmissionConnection(false);
     const swapped = new AdmissionConnection(false);
@@ -729,15 +1081,137 @@ describe('node security boundaries', () => {
 
     try {
       await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
+      first.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
       await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
+      duplicate.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
       await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
       expect(events.filter((event) => event.type === 'session.authenticated')).toMatchObject([
-        { type: 'session.authenticated', sessionId: 'session-a' }
+        { type: 'session.authenticated', sessionId: 'session-a' },
+        { type: 'session.authenticated', sessionId: 'session-duplicate' }
       ]);
       expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(1);
-      expect(duplicate.closeCalls).toBe(1);
       expect(swapped.closeCalls).toBe(1);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects connect when the authenticated audit callback synchronously closes the node', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const events: SecurityAuditEvent[] = [];
+    let peerNotifications = 0;
+    const closeNode: { current?: () => Promise<void> } = {};
+    let reentrantClose: Promise<void> | undefined;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => {
+        events.push(event);
+        if (event.type === 'session.authenticated') reentrantClose = closeNode.current?.();
+      },
+      onPeer: () => { peerNotifications += 1; },
+      endpointFactory: async () => endpoint
+    });
+    closeNode.current = () => node.close();
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+    };
+    internals.authenticate = async () => authenticatedSession('closing-audit', 'oauth-client-a');
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(reentrantClose).toBeDefined();
+      await reentrantClose;
+      await Promise.resolve();
+      expect(node.peersSnapshot()).toHaveLength(0);
+      expect(peerNotifications).toBe(0);
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects connect when authenticated audit schedules closure before public resolution', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const events: SecurityAuditEvent[] = [];
+    let peerNotifications = 0;
+    const closePeer: { current?: () => Promise<void> | undefined } = {};
+    let reentrantClose: Promise<void> | undefined;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => {
+        events.push(event);
+        if (event.type === 'session.authenticated') {
+          queueMicrotask(() => { reentrantClose = closePeer.current?.(); });
+        }
+      },
+      onPeer: () => { peerNotifications += 1; },
+      endpointFactory: async () => endpoint
+    });
+    closePeer.current = () => node.getPeer('remote')?.close('Closed from queued authentication audit callback');
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+    };
+    internals.authenticate = async () => authenticatedSession('queued-closing-audit', 'oauth-client-a');
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(reentrantClose).toBeDefined();
+      await reentrantClose;
+      expect(node.peersSnapshot()).toHaveLength(0);
+      expect(peerNotifications).toBe(0);
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects a losing duplicate when its synchronous close callback closes the incumbent', async () => {
+    const incumbentConnection = new AdmissionConnection(false, 'remote', 'client');
+    const duplicate = new ReentrantCloseConnection('remote', 'server');
+    const endpoint = new AdmissionEndpoint(incumbentConnection);
+    const events: SecurityAuditEvent[] = [];
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => events.push(event),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('incumbent-session', 'oauth-client-a'),
+      authenticatedSession('duplicate-session', 'oauth-client-a')
+    ];
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    let incumbentClose: Promise<void> | undefined;
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      duplicate.onClose = () => {
+        incumbentClose = peer.close('Closed synchronously by duplicate retirement');
+      };
+
+      await expect(internals.registerInboundConnection(duplicate)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(duplicate.closeCalls).toBe(1);
+      expect(incumbentClose).toBeDefined();
+      await incumbentClose;
+      expect(node.getPeer('remote')).toBeUndefined();
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(0);
     } finally {
       await node.close();
     }
@@ -792,7 +1266,7 @@ describe('node security boundaries', () => {
         }
       },
       onSecurityEvent: (event) => events.push(event),
-      limits: { streamHeaderTimeoutMs: 100 },
+      limits: { streamHeaderTimeoutMs: 100, shutdownTimeoutMs: 100 },
       endpointFactory: async () => endpoint
     });
     const session = authenticatedSession('file-session', 'oauth-client-a');
@@ -818,7 +1292,7 @@ describe('node security boundaries', () => {
         reason: 'Authorization evaluation failed'
       }]);
     } finally {
-      await node.close();
+      await expect(node.close()).rejects.toMatchObject({ code: 'TIMEOUT' });
     }
   });
 
@@ -861,7 +1335,7 @@ describe('node security boundaries', () => {
         runtime: { alive: boolean; connection(): Promise<QuicConnection> };
       }).runtime;
       runtime = connectedRuntime;
-      connectedRuntime.alive = false;
+      disconnectRuntimeForTest(connectedRuntime);
       internals.peers.delete('remote');
 
       const reconnecting = connectedRuntime.connection();
@@ -875,6 +1349,190 @@ describe('node security boundaries', () => {
       expect(reconnectConnection.closeCalls).toBe(1);
     } finally {
       if (runtime) internals.peers.set('remote', runtime);
+      await node.close();
+    }
+  });
+
+  it('uses deterministic arbitration when a live connection appears during reconnect', async () => {
+    const original = new AdmissionConnection(false, 'aaa', 'client');
+    const reconnectCandidate = new ThrowingCloseConnection('aaa', 'client');
+    // local > aaa, so the server-side connection is the deterministic winner.
+    const inboundWinner = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original, reconnectCandidate);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const reconnectAuthentication = deferred<AuthenticatedSession>();
+    let authenticateCalls = 0;
+    let markReconnectStarted: (() => void) | undefined;
+    const reconnectStarted = new Promise<void>((resolve) => { markReconnectStarted = resolve; });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      installConnection(
+        runtime: unknown,
+        connection: QuicConnection,
+        identity: { readonly id: string; readonly direction: 'inbound' | 'outbound' },
+        session: AuthenticatedSession
+      ): void;
+      peers: Map<string, unknown>;
+    };
+    internals.authenticate = async () => {
+      authenticateCalls += 1;
+      if (authenticateCalls === 1) return authenticatedSession('original-session', 'oauth-client-a');
+      markReconnectStarted?.();
+      return reconnectAuthentication.promise;
+    };
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket, 'aaa'));
+      const runtime = (peer as unknown as {
+        runtime: {
+          alive: boolean;
+          current: QuicConnection;
+          connection(): Promise<QuicConnection>;
+        };
+      }).runtime;
+      disconnectRuntimeForTest(runtime);
+      internals.peers.delete('aaa');
+
+      const reconnecting = runtime.connection();
+      await reconnectStarted;
+      original.close(0n, new TextEncoder().encode('Replaced by test incumbent'));
+      internals.installConnection(
+        runtime,
+        inboundWinner,
+        Object.freeze({ id: 'aaa', direction: 'inbound' }),
+        authenticatedSession('inbound-session', 'oauth-client-a')
+      );
+      internals.peers.set('aaa', runtime);
+      const incumbent = runtime.current;
+
+      reconnectAuthentication.resolve(authenticatedSession('reconnect-session', 'oauth-client-a'));
+      await expect(reconnecting).resolves.toBe(incumbent);
+      expect(runtime.current).toBe(incumbent);
+      expect(peer.identity.direction).toBe('inbound');
+      expect(reconnectCandidate.closeCalls).toBe(1);
+      expect(inboundWinner.closeCalls).toBe(0);
+      reconnectCandidate.resolveClosed();
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects a reconnect loser when duplicate retirement synchronously closes the incumbent', async () => {
+    const original = new AdmissionConnection(false, 'aaa', 'client');
+    const reconnectCandidate = new ReentrantCloseConnection('aaa', 'client');
+    // local > aaa, so the synchronously installed server-side connection wins.
+    const inboundWinner = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original, reconnectCandidate);
+    const events: SecurityAuditEvent[] = [];
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => events.push(event),
+      endpointFactory: async () => endpoint
+    });
+    const reconnectAuthentication = deferred<AuthenticatedSession>();
+    let authenticateCalls = 0;
+    let markReconnectStarted: (() => void) | undefined;
+    const reconnectStarted = new Promise<void>((resolve) => { markReconnectStarted = resolve; });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      installConnection(
+        runtime: unknown,
+        connection: QuicConnection,
+        identity: { readonly id: string; readonly direction: 'inbound' },
+        session: AuthenticatedSession
+      ): unknown;
+    };
+    internals.authenticate = async () => {
+      authenticateCalls += 1;
+      if (authenticateCalls === 1) return authenticatedSession('original-session', 'oauth-client-a');
+      markReconnectStarted?.();
+      return reconnectAuthentication.promise;
+    };
+
+    let incumbentClose: Promise<void> | undefined;
+    try {
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket, 'aaa'));
+      const runtime = (peer as unknown as {
+        runtime: { connection(): Promise<QuicConnection> };
+      }).runtime;
+      original.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
+
+      const reconnecting = runtime.connection();
+      await reconnectStarted;
+      internals.installConnection(
+        runtime,
+        inboundWinner,
+        Object.freeze({ id: 'aaa', direction: 'inbound' as const }),
+        authenticatedSession('inbound-session', 'oauth-client-a')
+      );
+      reconnectCandidate.onClose = () => {
+        incumbentClose = peer.close('Closed synchronously by reconnect duplicate retirement');
+      };
+
+      reconnectAuthentication.resolve(authenticatedSession('reconnect-session', 'oauth-client-a'));
+      await expect(reconnecting).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(reconnectCandidate.closeCalls).toBe(1);
+      expect(incumbentClose).toBeDefined();
+      await incumbentClose;
+      expect(node.getPeer('aaa')).toBeUndefined();
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('rejects reconnect when authenticated audit schedules peer closure before public resolution', async () => {
+    const original = new AdmissionConnection(false);
+    const reconnectCandidate = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(original, reconnectCandidate);
+    const events: SecurityAuditEvent[] = [];
+    const closePeer: { current?: () => Promise<void> } = {};
+    let reentrantClose: Promise<void> | undefined;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => {
+        events.push(event);
+        if (event.type === 'session.authenticated' && event.sessionId === 'queued-reconnect-session') {
+          queueMicrotask(() => { reentrantClose = closePeer.current?.(); });
+        }
+      },
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('queued-reconnect-session', 'oauth-client-a')
+    ];
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      closePeer.current = () => peer.close('Closed from queued reconnect audit callback');
+      const runtime = (peer as unknown as {
+        runtime: { connection(): Promise<QuicConnection> };
+      }).runtime;
+      original.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
+
+      await expect(runtime.connection()).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(reentrantClose).toBeDefined();
+      await reentrantClose;
+      expect(node.getPeer('remote')).toBeUndefined();
+      expect(events.filter((event) => event.type === 'session.rejected')).toHaveLength(0);
+    } finally {
       await node.close();
     }
   });
@@ -905,7 +1563,7 @@ describe('node security boundaries', () => {
       const runtime = (peer as unknown as {
         runtime: { alive: boolean; connection(): Promise<QuicConnection> };
       }).runtime;
-      runtime.alive = false;
+      disconnectRuntimeForTest(runtime);
       internals.peers.delete('remote-a');
 
       await expect(runtime.connection()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
@@ -943,7 +1601,7 @@ describe('node security boundaries', () => {
       const runtime = (peer as unknown as {
         runtime: { alive: boolean; connection(): Promise<QuicConnection> };
       }).runtime;
-      runtime.alive = false;
+      disconnectRuntimeForTest(runtime);
       internals.peers.delete('remote');
 
       await expect(runtime.connection()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
@@ -973,6 +1631,67 @@ describe('node security boundaries', () => {
     expect(endpointCreated).toBe(false);
   });
 
+  it('validates file metadata schemas before creating an endpoint', async () => {
+    let endpointCreated = false;
+    await expect(createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      fileMetadataSchema: {
+        '~standard': {
+          version: 1,
+          vendor: 'test',
+          validate: (value: unknown) => ({ value }),
+          smuggled: true
+        }
+      } as never,
+      endpointFactory: async () => {
+        endpointCreated = true;
+        return new AdmissionEndpoint();
+      }
+    })).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    expect(endpointCreated).toBe(false);
+  });
+
+  it('snapshots the file metadata schema and preserves its validator receiver', async () => {
+    const endpoint = new AdmissionEndpoint();
+    const prefixes = new WeakMap<object, string>();
+    const descriptor = {
+      version: 1 as const,
+      vendor: 'schema-vendor',
+      validate(this: object, value: unknown) {
+        return { value: `${prefixes.get(this)}:${String(value)}` };
+      }
+    };
+    prefixes.set(descriptor, 'trusted');
+    const schema = { '~standard': descriptor };
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      fileMetadataSchema: schema as never,
+      endpointFactory: async () => endpoint
+    });
+
+    try {
+      descriptor.vendor = 'mutated';
+      descriptor.validate = () => ({ value: 'mutated' });
+      const saved = (node as unknown as {
+        options: { fileMetadataSchema: typeof schema };
+      }).options.fileMetadataSchema;
+      expect(saved).not.toBe(schema);
+      expect(saved['~standard']).not.toBe(descriptor);
+      expect(saved['~standard'].vendor).toBe('schema-vendor');
+      expect(Object.isFrozen(saved)).toBe(true);
+      expect(Object.isFrozen(saved['~standard'])).toBe(true);
+      expect(await saved['~standard'].validate('metadata')).toEqual({ value: 'trusted:metadata' });
+    } finally {
+      await node.close();
+    }
+  });
+
   it('exposes cancellation to node-level request-header providers', async () => {
     let received: AbortSignal | undefined;
     const provider: NonNullable<P2PNodeOptions<typeof router>['getRequestHeaders']> = ({ signal }) => {
@@ -986,7 +1705,7 @@ describe('node security boundaries', () => {
 
   it('bounds endpoint dialing and closes a connection which resolves after the deadline', async () => {
     const pendingConnection = deferred<QuicConnection>();
-    const late = new AdmissionConnection(false);
+    const late = new ThrowingCloseConnection();
     const endpoint = new AdmissionEndpoint(pendingConnection.promise);
     const node = await createP2PNode({
       router,
@@ -996,11 +1715,167 @@ describe('node security boundaries', () => {
       limits: { connectTimeoutMs: 100 },
       endpointFactory: async () => endpoint
     });
+    const internals = node as unknown as {
+      resources: { snapshot(): { active: { handshakes: number } } };
+    };
 
     try {
       await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'TIMEOUT' });
+      expect(internals.resources.snapshot().active.handshakes).toBe(1);
       pendingConnection.resolve(late);
       await expect.poll(() => late.closeCalls).toBe(1);
+      expect(internals.resources.snapshot().active.handshakes).toBe(1);
+      late.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot().active.handshakes).toBe(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('retains a failed handshake cleanup lease until physical connection closure', async () => {
+    const connection = new FailingHandshakeCleanupConnection();
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { handshakeTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      resources: { snapshot(): { active: { handshakes: number; bufferedBytes: number } } };
+    };
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket)))
+        .rejects.toMatchObject({ code: 'TIMEOUT' });
+      await expect.poll(() => ({
+        reset: connection.send.resetCalls,
+        stop: connection.recv.stopCalls
+      })).toEqual({ reset: 1, stop: 1 });
+      expect(connection.closeCalls).toBeGreaterThan(0);
+      // Both terminal methods rejected, so their settlement is not proof of
+      // cleanup. The pre-authentication allocation remains owned even though
+      // the public timeout and the underlying handshake task have settled.
+      expect(internals.resources.snapshot().active).toMatchObject({
+        handshakes: 1,
+        bufferedBytes: 64 * 1024
+      });
+
+      connection.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot().active).toMatchObject({
+        handshakes: 0,
+        bufferedBytes: 0
+      });
+    } finally {
+      connection.resolveClosed();
+      await node.close();
+    }
+  });
+
+  it('retains rejected pre-session admission until physical connection closure', async () => {
+    const connection = new ThrowingCloseConnection();
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: { snapshot(): { active: { handshakes: number } } };
+    };
+    internals.authenticate = async () => {
+      throw new P2PError('UNAUTHORIZED', 'rejected test credential');
+    };
+
+    try {
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({
+        code: 'UNAUTHORIZED',
+        message: 'rejected test credential'
+      });
+      expect(connection.closeCalls).toBe(1);
+      expect(internals.resources.snapshot().active.handshakes).toBe(1);
+      connection.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot().active.handshakes).toBe(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('retains failed reconnect admission until physical connection closure', async () => {
+    const original = new AdmissionConnection(false);
+    const rejectedReconnect = new AdmissionConnection(false, 'remote', 'client', false);
+    const endpoint = new AdmissionEndpoint(original, rejectedReconnect);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    let authenticationCalls = 0;
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: { snapshot(): { active: { handshakes: number } } };
+    };
+    internals.authenticate = async () => {
+      authenticationCalls += 1;
+      if (authenticationCalls === 1) return authenticatedSession('original-session', 'oauth-client-a');
+      throw new P2PError('UNAUTHORIZED', 'reconnect credential rejected');
+    };
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const runtime = (peer as unknown as {
+        runtime: { alive: boolean; connection(): Promise<QuicConnection> };
+      }).runtime;
+      original.resolveClosed();
+      await expect.poll(() => runtime.alive).toBe(false);
+
+      await expect(runtime.connection()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(rejectedReconnect.closeCalls).toBe(1);
+      expect(internals.resources.snapshot().active.handshakes).toBe(1);
+      rejectedReconnect.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot().active.handshakes).toBe(0);
+    } finally {
+      rejectedReconnect.resolveClosed();
+      await node.close();
+    }
+  });
+
+  it('cancels a locator reconnect when its peer handle closes', async () => {
+    const original = new AdmissionConnection(false);
+    const endpoint = new CancelableReconnectEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { connectTimeoutMs: 30_000, shutdownTimeoutMs: 1_000 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const runtime = (peer as unknown as {
+        runtime: { alive: boolean; connection(): Promise<QuicConnection> };
+      }).runtime;
+      original.resolveClosed();
+      await expect.poll(() => runtime.alive).toBe(false);
+
+      const reconnecting = runtime.connection();
+      await expect.poll(() => endpoint.connectCalls).toBe(2);
+      expect(endpoint.reconnectSignal?.aborted).toBe(false);
+
+      await peer.close();
+      await expect(reconnecting).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(endpoint.reconnectSignal?.aborted).toBe(true);
     } finally {
       await node.close();
     }
@@ -1015,18 +1890,40 @@ describe('node security boundaries', () => {
       protocol: { applicationId: 'node-security-test', contractVersion: '1' },
       createContext: () => ({}),
       security: unusedSecurity(),
+      limits: { shutdownTimeoutMs: 100 },
       endpointFactory: async () => endpoint
     });
 
     const connecting = node.connect(connectTarget(endpoint.address.ticket));
     const rejection = expect(connecting).rejects.toMatchObject({ code: 'DISCONNECTED' });
     await expect.poll(() => endpoint.connectCalls).toBe(1);
-    await node.close();
+    const closing = node.close();
+    expect(node.close()).toBe(closing);
+    await expect(closing).rejects.toMatchObject({ code: 'TIMEOUT' });
     await rejection;
     pendingConnection.resolve(late);
     await expect.poll(() => late.closeCalls).toBe(1);
     await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'DISCONNECTED' });
     expect(endpoint.connectCalls).toBe(1);
+  });
+
+  it.each([
+    ['shutdownTimeoutMs', 99],
+    ['shutdownTimeoutMs', 600_001]
+  ] as const)('rejects invalid %s before creating an endpoint', async (name, value) => {
+    let endpointCreated = false;
+    await expect(createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { [name]: value },
+      endpointFactory: async () => {
+        endpointCreated = true;
+        return new AdmissionEndpoint();
+      }
+    })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+    expect(endpointCreated).toBe(false);
   });
 
   it('makes Peer.close terminal for that handle and removes it from the active peer set', async () => {
@@ -1040,7 +1937,11 @@ describe('node security boundaries', () => {
       security: unusedSecurity(),
       endpointFactory: async () => endpoint
     });
-    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      runtimes: Map<string, unknown>;
+      resources: { snapshot(): { active: Record<string, number>; queued: number } };
+    };
     const sessions = [
       authenticatedSession('closed-peer', 'oauth-client-a'),
       authenticatedSession('explicit-replacement', 'oauth-client-a')
@@ -1050,11 +1951,26 @@ describe('node security boundaries', () => {
     try {
       const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket));
       expect(node.peersSnapshot()).toHaveLength(1);
+      expect(Object.isFrozen(node.peersSnapshot())).toBe(true);
+      expect(node.getPeer<typeof router>('remote')?.session.id).toBe('closed-peer');
 
-      peer.close();
-      peer.close();
+      const closed = peer.close();
+      await Promise.all([closed, peer.close()]);
 
       expect(node.peersSnapshot()).toHaveLength(0);
+      expect(node.getPeer<typeof router>('remote')).toBeUndefined();
+      expect(internals.runtimes.size).toBe(0);
+      expect(internals.resources.snapshot()).toMatchObject({
+        queued: 0,
+        active: {
+          handshakes: 0,
+          streams: 0,
+          outboundTransfers: 0,
+          inboundTransfers: 0,
+          bufferedBytes: 0,
+          callbacks: 0
+        }
+      });
       expect(connection.closeCalls).toBe(1);
       await expect(peer.rpc.ping.query()).rejects.toThrow(/Peer is closed/);
       expect(endpoint.connectCalls).toBe(1);
@@ -1067,6 +1983,360 @@ describe('node security boundaries', () => {
       expect(node.peersSnapshot()).toHaveLength(1);
     } finally {
       await node.close();
+    }
+  });
+
+  it('keeps a peer tombstone after close throws until physical closure and blocks reconnect', async () => {
+    const connection = new ThrowingCloseConnection();
+    const replacement = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection, replacement);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { shutdownTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      runtimes: Map<string, unknown>;
+      resources: {
+        tryAcquire(owner: { peerId: string; principalId: string }, request: { callbacks: number }): {
+          release(): void;
+        } | undefined;
+      };
+    };
+    const sessions = [
+      authenticatedSession('closing-session', 'oauth-client-a'),
+      authenticatedSession('replacement-session', 'oauth-client-a')
+    ];
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const retained = internals.resources.tryAcquire(
+        { peerId: 'remote', principalId: 'principal' },
+        { callbacks: 1 }
+      )!;
+      const closing = peer.close();
+      expect(peer.close()).toBe(closing);
+      await expect(closing).rejects.toMatchObject({ code: 'TIMEOUT' });
+      expect(internals.runtimes.has('remote')).toBe(true);
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(endpoint.connectCalls).toBe(1);
+
+      connection.resolveClosed();
+      await Promise.resolve();
+      expect(internals.runtimes.has('remote')).toBe(true);
+      retained.release();
+      await expect.poll(() => internals.runtimes.has('remote')).toBe(false);
+      await expect(node.connect(connectTarget(endpoint.address.ticket))).resolves.toBeDefined();
+      expect(endpoint.connectCalls).toBe(2);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('retains superseded physical connections when close throws until shutdown can prove closure', async () => {
+    const original = new ThrowingCloseConnection('remote', 'server');
+    const replacement = new AdmissionConnection(false, 'remote', 'client');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { shutdownTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      runtimes: Map<string, unknown>;
+    };
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('replacement-session', 'oauth-client-a')
+    ];
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      expect(peer.identity.direction).toBe('outbound');
+      await internals.registerInboundConnection(replacement);
+      expect(original.closeCalls).toBe(1);
+      expect(peer.identity.direction).toBe('inbound');
+
+      await expect(peer.close()).rejects.toMatchObject({ code: 'TIMEOUT' });
+      expect(internals.runtimes.has('remote')).toBe(true);
+
+      original.resolveClosed();
+      await expect.poll(() => internals.runtimes.has('remote')).toBe(false);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('publishes the replacement epoch before a superseded-session listener closes the peer', async () => {
+    const original = new AdmissionConnection(false, 'aaa', 'client');
+    const replacement = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('replacement-session', 'oauth-client-a')
+    ];
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      runtimes: { has(peerId: string): boolean };
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    let reentrantClose: Promise<void> | undefined;
+    let observedDirection: 'inbound' | 'outbound' | undefined;
+    try {
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket, 'aaa'));
+      const runtime = (peer as unknown as {
+        runtime: { connectionController: AbortController };
+      }).runtime;
+      runtime.connectionController.signal.addEventListener('abort', () => {
+        observedDirection = peer.identity.direction;
+        reentrantClose = peer.close('Closed synchronously from the superseded epoch');
+      }, { once: true });
+
+      await expect(internals.registerInboundConnection(replacement)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(observedDirection).toBe('inbound');
+      expect(node.getPeer('aaa')).toBeUndefined();
+      expect(replacement.closeCalls).toBeGreaterThanOrEqual(1);
+      await reentrantClose;
+      expect(internals.runtimes.has('aaa')).toBe(false);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('does not resurrect a replacement when superseded-session cancellation closes the node', async () => {
+    const original = new AdmissionConnection(false, 'aaa', 'client');
+    const replacement = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('replacement-session', 'oauth-client-a')
+    ];
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      runtimes: { readonly size: number };
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    let reentrantNodeClose: Promise<void> | undefined;
+    const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket, 'aaa'));
+    const runtime = (peer as unknown as {
+      runtime: { connectionController: AbortController };
+    }).runtime;
+    runtime.connectionController.signal.addEventListener('abort', () => {
+      reentrantNodeClose = node.close();
+    }, { once: true });
+
+    await expect(internals.registerInboundConnection(replacement)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+    await reentrantNodeClose;
+    expect(node.peersSnapshot()).toHaveLength(0);
+    expect(node.getPeer('aaa')).toBeUndefined();
+    expect(internals.runtimes.size).toBe(0);
+    expect(replacement.closeCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it('keeps a synchronously installed newer epoch when an outer replacement resumes', async () => {
+    const original = new AdmissionConnection(false, 'aaa', 'client');
+    const outerCandidate = new AdmissionConnection(false, 'aaa', 'server');
+    const newerCandidate = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('outer-session', 'oauth-client-a')
+    ];
+    const newerSession = authenticatedSession('newer-session', 'oauth-client-a');
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      installConnection(
+        runtime: unknown,
+        connection: QuicConnection,
+        identity: { readonly id: string; readonly direction: 'inbound' },
+        session: AuthenticatedSession
+      ): unknown;
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket, 'aaa'));
+      const runtime = (peer as unknown as {
+        runtime: { connectionController: AbortController };
+      }).runtime;
+      runtime.connectionController.signal.addEventListener('abort', () => {
+        internals.installConnection(
+          runtime,
+          newerCandidate,
+          Object.freeze({ id: 'aaa', direction: 'inbound' as const }),
+          newerSession
+        );
+      }, { once: true });
+
+      await expect(internals.registerInboundConnection(outerCandidate)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(node.getPeer<typeof router>('aaa')?.session.id).toBe('newer-session');
+      expect(peer.session.id).toBe('newer-session');
+      expect(outerCandidate.closeCalls).toBe(1);
+      expect(newerCandidate.closeCalls).toBe(0);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('does not resurrect a replacement after the superseded transport close callback closes the peer', async () => {
+    const original = new ReentrantCloseConnection('aaa', 'client');
+    const replacement = new AdmissionConnection(false, 'aaa', 'server');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('original-session', 'oauth-client-a'),
+      authenticatedSession('replacement-session', 'oauth-client-a')
+    ];
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      runtimes: { has(peerId: string): boolean };
+    };
+    internals.authenticate = async () => sessions.shift()!;
+
+    let reentrantClose: Promise<void> | undefined;
+    try {
+      const peer = await node.connect<typeof router>(connectTarget(endpoint.address.ticket, 'aaa'));
+      original.onClose = () => {
+        reentrantClose = peer.close('Closed synchronously from the transport callback');
+      };
+
+      await expect(internals.registerInboundConnection(replacement)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      await reentrantClose;
+      expect(node.getPeer('aaa')).toBeUndefined();
+      expect(internals.runtimes.has('aaa')).toBe(false);
+      expect(replacement.closeCalls).toBe(1);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('restores live membership when an inbound connection revives a disconnected outbound runtime', async () => {
+    const original = new AdmissionConnection(false, 'remote', 'client');
+    const inbound = new AdmissionConnection(false, 'remote', 'server');
+    const endpoint = new AdmissionEndpoint(original);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+    };
+    const sessions = [
+      authenticatedSession('outbound-session', 'oauth-client-a'),
+      authenticatedSession('inbound-session', 'oauth-client-a')
+    ];
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      const retained = await node.connect<typeof router>(connectTarget(endpoint.address.ticket));
+      const runtime = (retained as unknown as {
+        runtime: { connection(): Promise<QuicConnection> };
+      }).runtime;
+      original.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
+
+      await internals.registerInboundConnection(inbound);
+
+      expect(node.peersSnapshot()).toEqual([{ id: 'remote', direction: 'inbound' }]);
+      expect(node.getPeer<typeof router>('remote')?.session.id).toBe('inbound-session');
+      await expect(runtime.connection()).resolves.toMatchObject({ remoteId: 'remote', side: 'server' });
+      expect(endpoint.connectCalls).toBe(1);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('starts endpoint teardown immediately and node close waits underlying peer settlement', async () => {
+    const connection = new AdmissionConnection(false, 'remote', 'client', false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { shutdownTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('closing-session', 'oauth-client-a');
+
+    const peer = await node.connect(connectTarget(endpoint.address.ticket));
+    await expect(peer.close()).rejects.toMatchObject({ code: 'TIMEOUT' });
+    const closing = node.close();
+    expect(endpoint.closeCalls).toBe(1);
+    await expect(closing).rejects.toMatchObject({ code: 'TIMEOUT' });
+    connection.resolveClosed();
+  });
+
+  it('observes a synchronous endpoint close failure without skipping other shutdown work', async () => {
+    const endpoint = new ThrowingCloseEndpoint();
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      endpointFactory: async () => endpoint
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (cause: unknown): void => { unhandled.push(cause); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const closing = node.close();
+      expect(endpoint.closeCalls).toBe(1);
+      await expect(closing).rejects.toMatchObject({ code: 'INTERNAL' });
+      expect(node.close()).toBe(closing);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener('unhandledRejection', onUnhandled);
     }
   });
 
@@ -1131,12 +2401,14 @@ describe('node security boundaries', () => {
       expect(Object.isFrozen(firstContext)).toBe(true);
       expect(firstContext.signal.aborted).toBe(false);
 
-      await node.connect(connectTarget(endpoint.address.ticket));
+      original.resolveClosed();
+      await expect.poll(() => firstContext.signal.aborted).toBe(true);
+      // A file operation itself must be able to trigger reconnection and see
+      // the managed connection, without a preceding node.connect() call.
       const secondContext = await runtime.fileConnection() as { signal: AbortSignal };
       expect(secondContext).not.toBe(firstContext);
       expect(firstContext.signal.aborted).toBe(true);
       expect(secondContext.signal.aborted).toBe(false);
-      expect(original.closeCalls).toBe(1);
 
       await node.close();
       expect(secondContext.signal.aborted).toBe(true);
@@ -1169,20 +2441,28 @@ describe('node security boundaries', () => {
           queuedTransfers: 0,
           incomingSessions: 0,
           reservedSessions: 0,
-          activeLanes: 0
-        }
+          activeLanes: 0,
+          activeOperations: 0,
+          ambiguousOperations: 0,
+          operationRecords: 0
+        },
+        resources: { queued: 0, active: { streams: 0, bufferedBytes: 0 } },
+        shares: { activeShares: 0, operationRecords: 0, activeReservations: 0, closed: false },
+        tasks: { peer: expect.any(Number), node: expect.any(Number) }
       });
       expect(Object.isFrozen(diagnostics)).toBe(true);
       expect(Object.isFrozen(diagnostics.files)).toBe(true);
+      expect(Object.isFrozen(diagnostics.resources)).toBe(true);
+      expect(Object.isFrozen(diagnostics.shares)).toBe(true);
+      expect(Object.isFrozen(diagnostics.tasks)).toBe(true);
     } finally {
       await node.close();
     }
   });
 
-  it('aborts the exact file context on connection closure and session expiry', async () => {
-    const closedConnection = new AdmissionConnection(false, 'remote-closed');
-    const expiringConnection = new AdmissionConnection(false, 'remote-expiring');
-    const endpoint = new AdmissionEndpoint(closedConnection, expiringConnection);
+  it('binds safe peer file shares to the current endpoint and complete principal', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
     const node = await createP2PNode({
       router,
       protocol: { applicationId: 'node-security-test', contractVersion: '1' },
@@ -1190,9 +2470,76 @@ describe('node security boundaries', () => {
       security: unusedSecurity(),
       endpointFactory: async () => endpoint
     });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      shares: ShareRegistry;
+    };
+    internals.authenticate = async () => authenticatedSession('share-session', 'oauth-client-a');
+    const source = Object.freeze({
+      name: 'bound.bin',
+      size: 1,
+      readChunk: async () => Uint8Array.of(1)
+    });
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const handle = peer.files.share(source, { maxDownloads: 1 });
+      expect(Object.isFrozen(handle)).toBe(true);
+      expect(() => peer.files.share(source, { allowedPeerIds: ['attacker'] } as never))
+        .toThrow(/unknown field/);
+      const request = {
+        peerId: 'remote',
+        principalId: 'principal',
+        subject: 'subject',
+        issuer: 'https://identity.example',
+        clientId: 'oauth-client-a',
+        tenantId: 'tenant',
+        fingerprint: 'chunk-plan-v3',
+        operationId: 'operation-1'
+      };
+      expect(() => internals.shares.reserve(handle.token, { ...request, peerId: 'attacker' }))
+        .toThrowError(P2PError);
+      expect(() => internals.shares.reserve(handle.token, { ...request, tenantId: 'other' }))
+        .toThrowError(P2PError);
+      const reservation = internals.shares.reserve(handle.token, request);
+      expect(reservation.source).toBe(source);
+      reservation.complete();
+      expect(() => internals.shares.reserve(handle.token, { ...request, operationId: 'operation-2' }))
+        .toThrowError(P2PError);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('aborts the exact file context on connection closure and session expiry', async () => {
+    const closedConnection = new AdmissionConnection(false, 'remote-closed');
+    const expiringConnection = new ThrowingCloseConnection('remote-expiring');
+    const endpoint = new AdmissionEndpoint(closedConnection, expiringConnection);
+    let inspectExpiryVisibility = (): { readonly peerCount: number; readonly hasPeer: boolean } => ({
+      peerCount: -1,
+      hasPeer: true
+    });
+    let expiryVisibility: { readonly peerCount: number; readonly hasPeer: boolean } | undefined;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      onSecurityEvent: (event) => {
+        if (event.type === 'session.expired' && event.peerId === 'remote-expiring') {
+          expiryVisibility = inspectExpiryVisibility();
+        }
+      },
+      endpointFactory: async () => endpoint
+    });
+    inspectExpiryVisibility = () => ({
+      peerCount: node.peersSnapshot().length,
+      hasPeer: node.getPeer('remote-expiring') !== undefined
+    });
     const sessions = [
       authenticatedSession('session-closed', 'oauth-client-a'),
-      authenticatedSession('session-expiring', 'oauth-client-a', 30)
+      // Leave enough time for admission finalization before exercising expiry.
+      authenticatedSession('session-expiring', 'oauth-client-a', 250)
     ];
     const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
     internals.authenticate = async () => sessions.shift()!;
@@ -1209,6 +2556,13 @@ describe('node security boundaries', () => {
         .currentFiles.signal;
       await expect.poll(() => expiringSignal.aborted, { timeout: 1_000 }).toBe(true);
       expect(expiringConnection.closeCalls).toBeGreaterThan(0);
+      // Session expiry is immediately absent from the public live-peer API,
+      // even when the transport close throws and physical closure has not yet
+      // settled.
+      expect(node.peersSnapshot()).toHaveLength(0);
+      expect(node.getPeer<typeof router>('remote-expiring')).toBeUndefined();
+      expect(expiryVisibility).toEqual({ peerCount: 0, hasPeer: false });
+      expiringConnection.resolveClosed();
     } finally {
       await node.close();
     }
@@ -1242,8 +2596,66 @@ describe('node security boundaries', () => {
       expect(transferLimits.maxChunkSize).toBe(128 * 1024);
       await expect(node.connect(connectTarget(endpoint.address.ticket, 'remote-b'))).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
       expect(node.peersSnapshot()).toHaveLength(1);
-      expect(rejected.closeCalls).toBe(1);
+      expect(endpoint.connectCalls).toBe(1);
+      expect(rejected.closeCalls).toBe(0);
     } finally {
+      await node.close();
+    }
+  });
+
+  it('reserves maxPeers capacity across concurrent authentication and disconnected runtimes', async () => {
+    const retainedConnection = new AdmissionConnection(false, 'retained', 'client');
+    const candidateB = new AdmissionConnection(false, 'candidate-b', 'server');
+    const candidateC = new AdmissionConnection(false, 'candidate-c', 'server');
+    const endpoint = new AdmissionEndpoint(retainedConnection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { maxPeers: 2 },
+      endpointFactory: async () => endpoint
+    });
+    const candidateAuthentication = deferred<AuthenticatedSession>();
+    const authenticationStarted = deferred<void>();
+    let authenticationCalls = 0;
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      registerInboundConnection(connection: QuicConnection): Promise<unknown>;
+      runtimes: { readonly size: number; readonly occupied: number; has(peerId: string): boolean };
+    };
+    internals.authenticate = async () => {
+      authenticationCalls += 1;
+      if (authenticationCalls === 1) return authenticatedSession('retained-session', 'oauth-client-a');
+      if (authenticationCalls === 2) {
+        authenticationStarted.resolve();
+        return candidateAuthentication.promise;
+      }
+      throw new Error('Capacity rejection must happen before authenticating candidate C');
+    };
+
+    try {
+      await node.connect(connectTarget(endpoint.address.ticket, 'retained'));
+      retainedConnection.resolveClosed();
+      await expect.poll(() => node.peersSnapshot()).toHaveLength(0);
+      expect(internals.runtimes.size).toBe(1);
+
+      const admittingB = internals.registerInboundConnection(candidateB);
+      await authenticationStarted.promise;
+      expect(internals.runtimes.occupied).toBe(2);
+
+      await expect(internals.registerInboundConnection(candidateC)).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+      expect(authenticationCalls).toBe(2);
+      expect(candidateC.closeCalls).toBe(1);
+      expect(internals.runtimes.occupied).toBe(2);
+
+      candidateAuthentication.resolve(authenticatedSession('candidate-b-session', 'oauth-client-a'));
+      await admittingB;
+      expect(internals.runtimes.size).toBe(2);
+      expect(internals.runtimes.has('retained')).toBe(true);
+      expect(internals.runtimes.has('candidate-b')).toBe(true);
+    } finally {
+      candidateAuthentication.resolve(authenticatedSession('candidate-b-session', 'oauth-client-a'));
       await node.close();
     }
   });
@@ -1272,6 +2684,38 @@ describe('node security boundaries', () => {
       createContext: () => ({}),
       security: unusedSecurity(),
       limits: { maxFileSize: 0 },
+      endpointFactory: async () => {
+        endpointCreated = true;
+        return new AdmissionEndpoint();
+      }
+    })).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+    expect(endpointCreated).toBe(false);
+  });
+
+  it.each([
+    { maxInboundStreams: 1 },
+    { maxInboundStreams: 2 },
+    { maxInboundStreams: 3 },
+    { maxInboundStreams: 4 },
+    { maxGlobalInboundStreams: 1 },
+    { maxGlobalInboundStreams: 2 },
+    { maxGlobalInboundStreams: 3 },
+    { maxGlobalInboundStreams: 4 },
+    { maxPrincipalInboundStreams: 1 },
+    { maxPrincipalInboundStreams: 2 },
+    { maxPrincipalInboundStreams: 3 },
+    { maxPrincipalInboundStreams: 4 },
+    { maxPeerBufferedBytes: DEFAULT_MINIMUM_FILE_BUFFER - 1 },
+    { maxPrincipalBufferedBytes: DEFAULT_MINIMUM_FILE_BUFFER - 1 },
+    { maxBufferedBytes: DEFAULT_MINIMUM_FILE_BUFFER - 1 }
+  ])('rejects quotas which cannot reserve bidirectional file-lane progress: %j', async (limits) => {
+    let endpointCreated = false;
+    await expect(createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits,
       endpointFactory: async () => {
         endpointCreated = true;
         return new AdmissionEndpoint();
@@ -1356,17 +2800,265 @@ describe('node security boundaries', () => {
 
     try {
       await node.connect(connectTarget(endpoint.address.ticket));
+
+      const malformed = duplexPair();
+      await writeStreamKind(malformed.right.send, 255 as StreamKind);
+      connection.queueBi(malformed.left);
+      await expect.poll(() => errors.some(
+        (error) => error.code === 'INVALID_FRAME' && error.message.includes('Unknown stream kind')
+      )).toBe(true);
+
+      // A safely terminated pre-admission classifier must not kill the
+      // per-connection accept loop. The next correctly classified stream is
+      // dispatched and reports its own independent frame error.
       const stream = duplexPair();
       await writeStreamKind(stream.right.send, StreamKind.TransferControl);
       await writeFrame(stream.right.send, 99, {});
       connection.queueBi(stream.left);
-      await expect.poll(() => errors.some((error) => error.code === 'INVALID_FRAME')).toBe(true);
+      await expect.poll(() => errors.filter((error) => error.code === 'INVALID_FRAME')).toHaveLength(2);
     } finally {
       await node.close();
     }
   });
 
-  it('enforces a separate global admission limit for active file controls', async () => {
+  it('keeps inbound file-control admission reachable when general RPC capacity is saturated', async () => {
+    const controlBytes = 64 * 1024;
+    const fileDataBytes = 2 * controlBytes;
+    const minimumBuffers = 3 * controlBytes + 2 * fileDataBytes;
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const errors: P2PError[] = [];
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: {
+        maxControlFrameBytes: controlBytes,
+        fileChunkSize: controlBytes,
+        maxFileChunkSize: controlBytes,
+        maxInboundStreams: 5,
+        maxGlobalInboundStreams: 5,
+        maxPrincipalInboundStreams: 5,
+        maxFileTransfers: 1,
+        maxGlobalFileTransfers: 1,
+        maxPrincipalFileTransfers: 1,
+        maxBufferedBytes: minimumBuffers,
+        maxPeerBufferedBytes: minimumBuffers,
+        maxPrincipalBufferedBytes: minimumBuffers
+      },
+      onError: (error) => errors.push(error),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: {
+        tryAcquire(
+          owner: { peerId: string; principalId: string },
+          request: { streams: number; bufferedBytes: number }
+        ): { release(): void } | undefined;
+      };
+    };
+    internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
+
+    let general: { release(): void } | undefined;
+    try {
+      await node.connect(connectTarget(endpoint.address.ticket));
+      general = internals.resources.tryAcquire(
+        { peerId: 'remote', principalId: 'principal' },
+        { streams: 1, bufferedBytes: controlBytes }
+      );
+      expect(general).toBeDefined();
+
+      const overloadedRpc = duplexPair();
+      await writeStreamKind(overloadedRpc.right.send, StreamKind.Rpc);
+      connection.queueBi(overloadedRpc.left);
+      await expect.poll(() => errors.some(
+        (error) => error.message === 'Inbound RPC capacity is unavailable'
+      )).toBe(true);
+
+      const stream = duplexPair();
+      await writeStreamKind(stream.right.send, StreamKind.TransferControl);
+      await writeFrame(stream.right.send, 99, {});
+      connection.queueBi(stream.left);
+
+      await expect.poll(() => errors.some((error) => error.code === 'INVALID_FRAME')).toBe(true);
+    } finally {
+      general?.release();
+      await node.close();
+    }
+  });
+
+  it('retains unadmitted bidirectional stream ownership until physical closure', async () => {
+    const connection = new ThrowingCloseConnection();
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { streamHeaderTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: { snapshot(): { active: { streams: number; bufferedBytes: number }; peers: number; principals: number } };
+    };
+    internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
+
+    try {
+      await node.connect(connectTarget(endpoint.address.ticket));
+      const stream = new RejectingCleanupPipe();
+      await writeStreamKind(stream, 255 as StreamKind);
+      connection.queueBi({ send: stream, recv: stream });
+
+      await expect.poll(() => connection.closeCalls).toBe(1);
+      // The one-byte classifier is deliberately outside quota admission, so a
+      // malformed stream cannot consume a directional progress reserve. The
+      // physical connection task, rather than a scheduler lease, owns it.
+      expect(internals.resources.snapshot()).toMatchObject({
+        active: { streams: 0, bufferedBytes: 0 },
+        peers: 0,
+        principals: 0
+      });
+
+      let closed = false;
+      const closing = node.close().then(() => { closed = true; });
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      connection.resolveClosed();
+      await closing;
+      expect(closed).toBe(true);
+    } finally {
+      connection.resolveClosed();
+      await node.close();
+    }
+  });
+
+  it('retains an inbound unidirectional stream lease when stop stalls until physical closure', async () => {
+    const connection = new AdmissionConnection(false, 'remote', 'client', false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { streamHeaderTimeoutMs: 100 },
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: { snapshot(): { active: { streams: number; bufferedBytes: number }; peers: number; principals: number } };
+    };
+    internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
+
+    try {
+      await node.connect(connectTarget(endpoint.address.ticket));
+      const stream = new StalledStopPipe();
+      await writeStreamKind(stream, StreamKind.Rpc);
+      connection.queueUni(stream);
+
+      await expect.poll(() => connection.closeCalls, { timeout: 1_000 }).toBe(1);
+      expect(internals.resources.snapshot()).toMatchObject({
+        active: { streams: 1, bufferedBytes: 4 * 1024 * 1024 + 64 * 1024 },
+        peers: 1,
+        principals: 1
+      });
+
+      connection.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot()).toMatchObject({
+        active: { streams: 0, bufferedBytes: 0 },
+        peers: 0,
+        principals: 0
+      });
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('retains committed inbound file-control admission until physical closure after cleanup failure', async () => {
+    const connection = new AdmissionConnection(false, 'remote', 'client', false);
+    const endpoint = new AdmissionEndpoint(connection);
+    let finalizes = 0;
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: { ...unusedSecurity(), authorize: () => true },
+      onIncomingFile: () => ({
+        accept: {
+          prepare: async () => new Set<number>(),
+          writeChunk: async () => undefined,
+          finalize: async (_manifest, context) => {
+            finalizes += 1;
+            context.markCommitted();
+          },
+          abort: async () => undefined
+        }
+      }),
+      endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as {
+      authenticate(): Promise<AuthenticatedSession>;
+      resources: { snapshot(): { active: { streams: number; bufferedBytes: number }; peers: number; principals: number } };
+    };
+    internals.authenticate = async () => authenticatedSession('session', 'oauth-client-a');
+
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const sessionSignal = (peer as unknown as {
+        runtime: { currentFiles: { signal: AbortSignal } };
+      }).runtime.currentFiles.signal;
+      const localToRemote = new CleanupRejectingPipe();
+      const remoteToLocal = new CleanupRejectingPipe();
+      const local = { send: localToRemote, recv: remoteToLocal };
+      const remote = { send: remoteToLocal, recv: localToRemote };
+      await writeStreamKind(remote.send, StreamKind.TransferControl);
+      await writeFrame(remote.send, TransferFrameKind.Offer, {
+        transferId: 'committed-control-ownership',
+        name: 'empty.bin',
+        size: 0,
+        digest: '0'.repeat(64),
+        chunkSize: 1024 * 1024,
+        chunkCount: 0
+      });
+      connection.queueBi(local);
+
+      const acceptance = await readFrame<Record<string, unknown>>(remote.recv);
+      expect(acceptance).toMatchObject({ kind: TransferFrameKind.Accept });
+      await writeFrame(remote.send, TransferFrameKind.Complete, {
+        transferId: 'committed-control-ownership',
+        attemptId: acceptance.value.attemptId
+      });
+      const terminal = await readFrame(remote.recv);
+      expect(terminal.kind).toBe(TransferFrameKind.Complete);
+      // Omit the receipt after publication, then make both local terminal
+      // operations reject. The transfer result remains success, but its native
+      // stream lease must remain visible until closed() fulfills.
+      await remote.send.finish();
+
+      await expect.poll(() => finalizes).toBe(1);
+      await expect.poll(() => connection.closeCalls).toBeGreaterThanOrEqual(1);
+      expect(sessionSignal.aborted).toBe(true);
+      expect(internals.resources.snapshot()).toMatchObject({
+        active: { streams: 1, bufferedBytes: 1024 * 1024 },
+        peers: 1,
+        principals: 1
+      });
+
+      connection.resolveClosed();
+      await expect.poll(() => internals.resources.snapshot()).toMatchObject({
+        active: { streams: 0, bufferedBytes: 0 },
+        peers: 0,
+        principals: 0
+      });
+    } finally {
+      connection.resolveClosed();
+      await node.close();
+    }
+  });
+
+  it('backpressures file controls at the global admission limit', async () => {
     const firstConnection = new AdmissionConnection(false, 'remote-a');
     const secondConnection = new AdmissionConnection(false, 'remote-b');
     const endpoint = new AdmissionEndpoint(firstConnection, secondConnection);
@@ -1385,7 +3077,7 @@ describe('node security boundaries', () => {
 
     try {
       await node.connect(connectTarget(endpoint.address.ticket, 'remote-a'));
-      await node.connect(connectTarget(endpoint.address.ticket, 'remote-b'));
+      const secondPeer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-b'));
 
       const stalled = duplexPair();
       await writeStreamKind(stalled.right.send, StreamKind.TransferControl);
@@ -1395,9 +3087,45 @@ describe('node security boundaries', () => {
       const rejected = duplexPair();
       await writeStreamKind(rejected.right.send, StreamKind.TransferControl);
       secondConnection.queueBi(rejected.left);
-      await expect.poll(() => errors.some((error) => (
-        error.code === 'RESOURCE_LIMIT' && error.message.includes('Global inbound file transfer')
-      ))).toBe(true);
+      await expect.poll(async () => (await secondPeer.diagnostics()).resources.queued).toBe(1);
+      expect(errors).toEqual([]);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('enforces one file-transfer quota across endpoint keys for the same principal', async () => {
+    const firstConnection = new AdmissionConnection(false, 'remote-a');
+    const secondConnection = new AdmissionConnection(false, 'remote-b');
+    const endpoint = new AdmissionEndpoint(firstConnection, secondConnection);
+    const node = await createP2PNode({
+      router,
+      protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}),
+      security: unusedSecurity(),
+      limits: { maxGlobalFileTransfers: 2, maxPrincipalFileTransfers: 1 },
+      endpointFactory: async () => endpoint
+    });
+    const sessions = [
+      authenticatedSession('session-a', 'oauth-client-a'),
+      authenticatedSession('session-b', 'oauth-client-a')
+    ];
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => sessions.shift()!;
+
+    try {
+      await node.connect(connectTarget(endpoint.address.ticket, 'remote-a'));
+      const secondPeer = await node.connect(connectTarget(endpoint.address.ticket, 'remote-b'));
+      const first = duplexPair();
+      await writeStreamKind(first.right.send, StreamKind.TransferControl);
+      firstConnection.queueBi(first.left);
+      await (first.left.recv as AsyncPipe).waitingForBytes;
+
+      const second = duplexPair();
+      await writeStreamKind(second.right.send, StreamKind.TransferControl);
+      secondConnection.queueBi(second.left);
+      await expect.poll(async () => (await secondPeer.diagnostics()).resources.queued).toBe(1);
+      expect((await secondPeer.diagnostics()).resources.active.inboundTransfers).toBe(1);
     } finally {
       await node.close();
     }
@@ -1453,7 +3181,7 @@ function sharedSecretSession(id: string, peerId: string): AuthenticatedSession {
 
 function connectTarget(ticket: string, expectedPeerId = 'remote'): ConnectOptions {
   return {
-    ticket,
+    locator: { kind: 'ticket', ticket },
     expectedPeerId,
     expectedPrincipal: {
       subject: 'subject',
@@ -1512,10 +3240,82 @@ class LocatorEndpoint implements QuicEndpoint {
   async close(): Promise<void> {}
 }
 
+class InboundEndpoint implements QuicEndpoint {
+  readonly id = 'local';
+  readonly address = { id: this.id, ticket: 'inbound-ticket' };
+  acceptCalls = 0;
+  private readonly queued: QuicConnection[] = [];
+  private waiter: ((connection: QuicConnection | null) => void) | undefined;
+  private closed = false;
+
+  async connect(): Promise<QuicConnection> {
+    throw new Error('Inbound test endpoint cannot dial');
+  }
+
+  accept(): Promise<QuicConnection | null> {
+    this.acceptCalls += 1;
+    const connection = this.queued.shift();
+    if (connection) return Promise.resolve(connection);
+    if (this.closed) return Promise.resolve(null);
+    return new Promise<QuicConnection | null>((resolve) => { this.waiter = resolve; });
+  }
+
+  queue(connection: QuicConnection): void {
+    const waiter = this.waiter;
+    if (waiter) {
+      this.waiter = undefined;
+      waiter(connection);
+    } else {
+      this.queued.push(connection);
+    }
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    this.waiter?.(null);
+    this.waiter = undefined;
+  }
+}
+
+class CancelableReconnectEndpoint implements QuicEndpoint {
+  readonly id = 'local';
+  readonly address = { id: this.id, ticket: 'reconnect-ticket' };
+  connectCalls = 0;
+  reconnectSignal: AbortSignal | undefined;
+
+  constructor(private readonly initial: QuicConnection) {}
+
+  async connect(): Promise<QuicConnection> {
+    throw new Error('Locator dialing is required');
+  }
+
+  connectLocator(
+    _locator: EndpointLocator,
+    _alpn: Uint8Array,
+    _expectedPeerId: string,
+    signal?: AbortSignal
+  ): Promise<QuicConnection> {
+    this.connectCalls += 1;
+    if (this.connectCalls === 1) return Promise.resolve(this.initial);
+    this.reconnectSignal = signal;
+    return new Promise<QuicConnection>((_resolve, reject) => {
+      const onAbort = (): void => reject(
+        signal?.reason ?? new P2PError('CANCELLED', 'Reconnect cancelled')
+      );
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  async accept(): Promise<null> { return null; }
+  async close(): Promise<void> {}
+}
+
 class AdmissionEndpoint implements QuicEndpoint {
   readonly id = 'local';
   readonly address = { id: this.id, ticket: 'admission-ticket' };
   connectCalls = 0;
+  closeCalls = 0;
   readonly expectedPeerIds: string[] = [];
   private readonly connections: Array<QuicConnection | Promise<QuicConnection>>;
 
@@ -1535,7 +3335,16 @@ class AdmissionEndpoint implements QuicEndpoint {
     return null;
   }
 
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+  }
+}
+
+class ThrowingCloseEndpoint extends AdmissionEndpoint {
+  override close(): Promise<void> {
+    this.closeCalls += 1;
+    throw new Error('synchronous endpoint close failure');
+  }
 }
 
 class AdmissionConnection implements QuicConnection {
@@ -1543,12 +3352,15 @@ class AdmissionConnection implements QuicConnection {
   readonly closeRequests: Array<{ readonly code: bigint; readonly reason: Uint8Array }> = [];
   private readonly incomingBi: QuicBiStream[] = [];
   private readonly biWaiters: Array<(stream: QuicBiStream) => void> = [];
+  private readonly incomingUni: QuicRecvStream[] = [];
+  private readonly uniWaiters: Array<(stream: QuicRecvStream) => void> = [];
   private readonly closedState = deferred<string>();
 
   constructor(
     private readonly rejectConfiguration = true,
     readonly remoteId = 'remote',
-    readonly side: 'client' | 'server' = 'client'
+    readonly side: 'client' | 'server' = 'client',
+    private readonly confirmLocalClose = true
   ) {}
 
   async openBi(): Promise<QuicBiStream> {
@@ -1566,7 +3378,9 @@ class AdmissionConnection implements QuicConnection {
   }
 
   async acceptUni(): Promise<QuicRecvStream> {
-    return pending();
+    const queued = this.incomingUni.shift();
+    if (queued) return queued;
+    return new Promise<QuicRecvStream>((resolve) => this.uniWaiters.push(resolve));
   }
 
   async closed(): Promise<string> {
@@ -1576,6 +3390,7 @@ class AdmissionConnection implements QuicConnection {
   close(code: bigint, reason: Uint8Array): void {
     this.closeCalls += 1;
     this.closeRequests.push({ code, reason: Uint8Array.from(reason) });
+    if (this.confirmLocalClose) this.closedState.resolve('locally closed');
   }
 
   async stats(): Promise<ConnectionStats> {
@@ -1592,8 +3407,52 @@ class AdmissionConnection implements QuicConnection {
     else this.incomingBi.push(stream);
   }
 
+  queueUni(stream: QuicRecvStream): void {
+    const waiter = this.uniWaiters.shift();
+    if (waiter) waiter(stream);
+    else this.incomingUni.push(stream);
+  }
+
   resolveClosed(reason = 'closed'): void {
     this.closedState.resolve(reason);
+  }
+}
+
+class FailingHandshakeCleanupConnection extends AdmissionConnection {
+  readonly send = new TerminalRejectingCleanupPipe();
+  readonly recv = new TerminalRejectingCleanupPipe();
+
+  constructor() {
+    super(false, 'remote', 'client', false);
+  }
+
+  override async openBi(): Promise<QuicBiStream> {
+    return { send: this.send, recv: this.recv };
+  }
+}
+
+class ThrowingCloseConnection extends AdmissionConnection {
+  constructor(remoteId = 'remote', side: 'client' | 'server' = 'client') {
+    super(false, remoteId, side, false);
+  }
+
+  override close(code: bigint, reason: Uint8Array): void {
+    this.closeCalls += 1;
+    this.closeRequests.push({ code, reason: Uint8Array.from(reason) });
+    throw new Error('synchronous transport close failure');
+  }
+}
+
+class ReentrantCloseConnection extends AdmissionConnection {
+  onClose: (() => void) | undefined;
+
+  constructor(remoteId: string, side: 'client' | 'server') {
+    super(false, remoteId, side);
+  }
+
+  override close(code: bigint, reason: Uint8Array): void {
+    super.close(code, reason);
+    this.onClose?.();
   }
 }
 
@@ -1654,6 +3513,51 @@ class AsyncPipe implements QuicSendStream, QuicRecvStream {
   async setPriority(): Promise<void> {}
 }
 
+class RejectingCleanupPipe extends AsyncPipe {
+  override async reset(): Promise<void> {
+    throw new Error('reset failed');
+  }
+
+  override async stop(): Promise<void> {
+    throw new Error('stop failed');
+  }
+}
+
+class CleanupRejectingPipe extends AsyncPipe {
+  override async reset(): Promise<void> {
+    await super.reset();
+    throw new Error('reset rejected after cleanup');
+  }
+
+  override async stop(): Promise<void> {
+    await super.stop();
+    throw new Error('stop rejected after cleanup');
+  }
+}
+
+class TerminalRejectingCleanupPipe extends AsyncPipe {
+  resetCalls = 0;
+  stopCalls = 0;
+
+  override async reset(): Promise<void> {
+    this.resetCalls += 1;
+    await super.reset();
+    throw new Error('reset rejected after terminal cleanup');
+  }
+
+  override async stop(): Promise<void> {
+    this.stopCalls += 1;
+    await super.stop();
+    throw new Error('stop rejected after terminal cleanup');
+  }
+}
+
+class StalledStopPipe extends AsyncPipe {
+  override stop(): Promise<void> {
+    return pending();
+  }
+}
+
 function pending<T>(): Promise<T> {
   return new Promise<T>(() => undefined);
 }
@@ -1662,4 +3566,23 @@ function deferred<T>(): { readonly promise: Promise<T>; resolve(value: T): void 
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
+}
+
+function disconnectRuntimeForTest(value: unknown): void {
+  const runtime = value as {
+    lifecycle: {
+      readonly state: string;
+      readonly epoch: unknown;
+      readonly outboundTarget?: unknown;
+    };
+  };
+  const lifecycle = runtime.lifecycle;
+  if (lifecycle.state !== 'live' || lifecycle.outboundTarget === undefined) {
+    throw new Error('Test runtime is not a reconnectable live epoch');
+  }
+  runtime.lifecycle = Object.freeze({
+    state: 'disconnected',
+    epoch: lifecycle.epoch,
+    outboundTarget: lifecycle.outboundTarget
+  });
 }

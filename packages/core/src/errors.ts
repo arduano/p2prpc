@@ -8,6 +8,7 @@ export type P2PErrorCode =
   | 'INVALID_FRAME'
   | 'RESOURCE_LIMIT'
   | 'INTEGRITY_FAILED'
+  | 'OUTCOME_UNKNOWN'
   | 'NOT_FOUND'
   | 'INTERNAL';
 

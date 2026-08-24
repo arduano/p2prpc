@@ -50,7 +50,8 @@ for (const value of values) {
   if (
     url.protocol !== 'https:' ||
     url.username ||
-    url.password
+    url.password ||
+    url.port === '0'
   ) {
     throw new Error('Relay URL must be a credential-free HTTPS origin without path, query, or fragment');
   }
@@ -61,7 +62,10 @@ for (const value of values) {
     if (url.hostname.endsWith('..')) {
       throw new Error('Relay DNS names may contain at most one trailing root dot');
     }
-    url.hostname = url.hostname.slice(0, -1);
+    const hostname = url.hostname.slice(0, -1);
+    if (!hostname) throw new Error('Relay URL hostname is invalid');
+    url.hostname = hostname;
+    if (url.hostname !== hostname) throw new Error('Relay URL hostname could not be canonicalized');
   }
   const origin = url.origin;
   if (seen.has(origin)) {

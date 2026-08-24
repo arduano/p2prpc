@@ -1,5 +1,6 @@
 {
   "name": "p2prpc-workspace",
+  "version": "0.0.0",
   "private": true,
   "description": "Type-safe peer-to-peer tRPC and parallel resumable file transfer over Iroh QUIC",
   "license": "MIT",
@@ -23,8 +24,15 @@
     "test": "npm run test -w @p2prpc/core",
     "test:integration": "npm run test:integration -w @p2prpc/core",
     "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
+    "test:packed": "node scripts/packed-install-smoke.mjs",
+    "test:tree-shaken-native": "node scripts/tree-shaken-native-smoke.mjs",
     "lint": "eslint .",
     "check:docs": "node scripts/check-docs.mjs",
+    "check:package-content": "node scripts/check-package-content.mjs",
+    "check:package-publint": "publint --strict --pack=false",
+    "check:package-types": "attw --profile esm-only --no-definitely-typed",
+    "generate:release-sbom": "node scripts/generate-release-sbom.mjs",
+    "pack:artifact": "node scripts/create-package-artifact.mjs",
     "docs:dev": "vitepress dev docs/wiki",
     "docs:build": "vitepress build docs/wiki",
     "docs:preview": "vitepress preview docs/wiki",
@@ -33,13 +41,16 @@
     "stress:files:help": "node --import tsx benchmarks/file-stream-lifecycle.ts --help",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "npm run build && changeset publish"
+    "release": "node scripts/require-release-workflow.mjs"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@changesets/cli": "^3.0.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
     "eslint": "^10.8.1",
+    "publint": "^0.3.24",
     "tsx": "^4.23.12",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.67.0",
@@ -61,6 +72,7 @@
   "allowScripts": {
     "esbuild@0.28.2": true,
     "esbuild@0.25.12": true,
-    "msgpackr-extract@3.0.4": true
+    "msgpackr-extract@3.0.4": true,
+    "fsevents@2.3.3": false
   }
 }

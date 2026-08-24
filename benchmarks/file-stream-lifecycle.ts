@@ -24,10 +24,12 @@ import {
   type ConnectionStats,
   type EndpointDiagnostics,
   type FileTransferDiagnostics,
+  type FileMetadataSchema,
   type IrohEndpointOptions,
   type P2PNode,
   type Peer,
   type PeerContext,
+  type PeerDiagnostics,
   type PeerLocator,
   type SecurityAuditEvent,
   type SharedFileHandle,
@@ -39,13 +41,21 @@ const DEFAULT_BATCH_SIZE = 100;
 const DEFAULT_CONCURRENCY = 16;
 const CHUNK_SIZE = 64 * 1024;
 const LANES = 4;
+// The single-connection cancellation case deliberately waits until its sole
+// data lane has emitted progress. Cancelling while native stream opening is
+// still pending is a different fail-closed test: ManagedConnection must
+// quarantine that physical connection because JavaScript cannot revoke the
+// hidden native open. Unit tests cover that race directly.
+const CANCELLATION_LANES = 1;
 const LARGE_FILE_BYTES = 256 * 1024;
 const SESSION_TTL_MS = 4 * 60 * 60_000;
 const MIB = 1024 * 1024;
+const CONTROL_FRAME_BYTES = MIB;
+const FILE_DATA_SEGMENT_BYTES = 64 * 1024;
 
 const t = initTRPC.context<PeerContext>().create();
 const router = t.router({
-  ping: t.procedure.query(({ ctx }) => ({ peerId: ctx.peer.id, sessionId: ctx.auth.id }))
+  ping: t.procedure.query(({ ctx }) => ({ peerId: ctx.p2p.peer.id, sessionId: ctx.p2p.auth.id }))
 });
 type Router = typeof router;
 
@@ -56,6 +66,20 @@ interface StressFileMetadata {
   readonly index: number;
   readonly sha256: string;
 }
+
+const stressFileMetadataSchema: FileMetadataSchema<StressFileMetadata> = {
+  '~standard': {
+    version: 1,
+    vendor: 'p2prpc-stress',
+    validate(value) {
+      try {
+        return { value: validateMetadata(value) };
+      } catch {
+        return { issues: [{ message: 'Invalid stress metadata' }] };
+      }
+    }
+  }
+};
 
 interface FileRecord {
   readonly index: number;
@@ -135,6 +159,12 @@ interface ResourceSnapshot {
   readonly receiverConnection: SanitizedConnectionStats;
   readonly senderFiles: FileTransferDiagnostics | null;
   readonly receiverFiles: FileTransferDiagnostics | null;
+  readonly senderScheduler: PeerDiagnostics['resources'] | null;
+  readonly receiverScheduler: PeerDiagnostics['resources'] | null;
+  readonly senderShares: PeerDiagnostics['shares'] | null;
+  readonly receiverShares: PeerDiagnostics['shares'] | null;
+  readonly senderTasks: PeerDiagnostics['tasks'] | null;
+  readonly receiverTasks: PeerDiagnostics['tasks'] | null;
   readonly senderEndpoint: EndpointDiagnostics | null;
   readonly receiverEndpoint: EndpointDiagnostics | null;
 }
@@ -173,7 +203,7 @@ interface ControlAttemptEvidence {
 }
 
 interface Evidence {
-  schemaVersion: 1;
+  schemaVersion: 3;
   runId: string;
   status: 'running' | 'passed' | 'failed';
   startedAt: string;
@@ -183,6 +213,7 @@ interface Evidence {
     diagnosticsAvailable: boolean;
     connectionDiagnosticsAvailable: boolean;
     fileDiagnosticsAvailable: boolean;
+    runtimeDiagnosticsAvailable: boolean;
     fileDescriptorTelemetryAvailable: boolean;
     productionGateEligible: boolean;
     notes: string[];
@@ -209,6 +240,18 @@ interface Evidence {
     mdnsServiceNameFingerprint: string | null;
     checkpointTimeoutMs: number;
   };
+  relayEvidence: {
+    /** Canonical configured origins; values are full SHA-256 digests only. */
+    configured: string[];
+    /** Relay candidates evaluated by p2prpc while the outbound dial was active. */
+    attempted: string[];
+    /** Relay origins observed on an established connection. */
+    connected: string[];
+    /** Relay candidates denied by the application egress callback. */
+    denied: string[];
+    /** DNS/native fallback attempts are opaque in the pinned wrapper. */
+    attemptVisibility: 'explicit-candidates' | 'opaque-native-dns';
+  };
   environment: {
     platform: NodeJS.Platform;
     architecture: string;
@@ -231,6 +274,8 @@ interface Evidence {
     rejectedPushes: number;
     revokedPulls: number;
     senderCancellations: number;
+    senderCancellationLanes: number;
+    senderCancellationTrigger: 'first-data-progress';
     destinationFailures: number;
     controlAttempts: {
       rejectedPushes: ControlAttemptEvidence;
@@ -281,9 +326,17 @@ interface HarnessContext {
   readonly unexpectedErrors: string[];
   readonly baseline: ResourceSnapshot;
   readonly sampler: ProcessSampler;
+  readonly relayEvidence: RelayEvidenceTracker;
   readonly pendingCapabilityCleanup: SharedFileHandle[];
   readonly successfulTransferIds: Set<string>;
   completedFiles: number;
+}
+
+interface RelayEvidenceTracker {
+  readonly allowRelayUrl?: (origin: string) => boolean;
+  beginDial(): void;
+  endDial(): void;
+  observe(snapshot: ResourceSnapshot): void;
 }
 
 class ArtifactWriter {
@@ -377,7 +430,7 @@ async function main(options: Options): Promise<void> {
   const runId = `${new Date(started).toISOString().replaceAll(/[:.]/g, '-')}-${process.pid}`;
   const requestedProductionProfile = isProductionProfile(options);
   const evidence: Evidence = {
-    schemaVersion: 1,
+    schemaVersion: 3,
     runId,
     status: 'running',
     startedAt: new Date(started).toISOString(),
@@ -386,6 +439,7 @@ async function main(options: Options): Promise<void> {
       diagnosticsAvailable: false,
       connectionDiagnosticsAvailable: false,
       fileDiagnosticsAvailable: false,
+      runtimeDiagnosticsAvailable: false,
       fileDescriptorTelemetryAvailable: false,
       productionGateEligible: false,
       notes: []
@@ -406,11 +460,18 @@ async function main(options: Options): Promise<void> {
       errorCasesPerClass: options.errorCases,
       locator: options.locator,
       relay: options.relay,
-      relayUrlFingerprints: options.relayUrls.map(fingerprint),
+      relayUrlFingerprints: options.relayUrls.map(relayFingerprint),
       bindAddressFingerprints: options.bindAddresses.map(fingerprint),
       dnsServerUrlFingerprint: options.dnsServerUrl ? fingerprint(options.dnsServerUrl) : null,
       mdnsServiceNameFingerprint: options.locator === 'mdns' ? fingerprint(options.mdnsServiceName) : null,
       checkpointTimeoutMs: options.checkpointTimeoutMs
+    },
+    relayEvidence: {
+      configured: options.relayUrls.map(relayFingerprint).sort(),
+      attempted: [],
+      connected: [],
+      denied: [],
+      attemptVisibility: options.locator === 'dns' ? 'opaque-native-dns' : 'explicit-candidates'
     },
     environment: {
       platform: process.platform,
@@ -458,12 +519,14 @@ async function main(options: Options): Promise<void> {
       sessionTtlMs: SESSION_TTL_MS,
       authorize: () => true
     });
-    const nodeOptions = commonNodeOptions(options);
+    const relayEvidence = createRelayEvidenceTracker(options, evidence.relayEvidence);
+    const nodeOptions = commonNodeOptions(options, relayEvidence.allowRelayUrl);
     receiver = await createP2PNode<Router, StressFileMetadata>({
       router,
       protocol: { applicationId: 'p2prpc-file-stream-lifecycle', contractVersion: '1' },
       security,
       createContext: (context) => context,
+      fileMetadataSchema: stressFileMetadataSchema,
       onSecurityEvent: (event) => observeAudit(receiverAudit, event),
       onError: (error) => {
         if (!acceptingNegativeCases) unexpectedErrors.push(`${error.code}: ${error.message}`);
@@ -472,28 +535,23 @@ async function main(options: Options): Promise<void> {
       onIncomingFile: (offer) => {
         const metadata = validateMetadata(offer.manifest.metadata);
         if (expectedSession.id !== undefined && offer.sessionId !== expectedSession.id) {
-          offer.reject('Authenticated session changed');
-          return;
+          return { reject: 'Authenticated session changed' };
         }
         if (metadata.kind === 'rejected') {
-          offer.reject('Intentional lifecycle rejection');
-          return;
+          return { reject: 'Intentional lifecycle rejection' };
         }
         if (metadata.kind === 'destination-failure') {
           destinationFailureAttempts.set(
             metadata.index,
             (destinationFailureAttempts.get(metadata.index) ?? 0) + 1
           );
-          offer.accept(failingDestination());
-          return;
+          return { accept: failingDestination() };
         }
         if (metadata.kind === 'cancelled') {
-          offer.accept(slowDestination());
-          return;
+          return { accept: slowDestination() };
         }
         if (metadata.kind !== 'push') {
-          offer.reject('Unexpected incoming file class');
-          return;
+          return { reject: 'Unexpected incoming file class' };
         }
         const record = pushByName.get(offer.manifest.name);
         if (
@@ -503,11 +561,10 @@ async function main(options: Options): Promise<void> {
           record.sha256 !== metadata.sha256 ||
           positiveOffers.has(record.name)
         ) {
-          offer.reject('Unexpected or duplicate stress manifest');
-          return;
+          return { reject: 'Unexpected or duplicate stress manifest' };
         }
         positiveOffers.add(record.name);
-        offer.accept(fileDestination(record.destinationPath, { durable: false }));
+        return { accept: fileDestination(record.destinationPath, { durable: false }) };
       },
       ...nodeOptions
     });
@@ -516,6 +573,7 @@ async function main(options: Options): Promise<void> {
       protocol: { applicationId: 'p2prpc-file-stream-lifecycle', contractVersion: '1' },
       security,
       createContext: (context) => context,
+      fileMetadataSchema: stressFileMetadataSchema,
       onSecurityEvent: (event) => observeAudit(senderAudit, event),
       onError: (error) => {
         if (!acceptingNegativeCases) unexpectedErrors.push(`${error.code}: ${error.message}`);
@@ -529,7 +587,13 @@ async function main(options: Options): Promise<void> {
       expectedPeerId: receiver.id,
       expectedPrincipal: absentOptionalPrincipal(receiver.id)
     };
-    const outboundPeer = await sender.connect<Router>(target);
+    relayEvidence.beginDial();
+    let outboundPeer: Peer<Router, StressFileMetadata>;
+    try {
+      outboundPeer = await sender.connect<Router>(target);
+    } finally {
+      relayEvidence.endDial();
+    }
     const inboundPeer = await withTimeout(inboundPeerPromise, options.checkpointTimeoutMs, 'Inbound peer callback timed out');
     expectedSession.id = outboundPeer.session.id;
     assert(inboundPeer.session.id === expectedSession.id, 'Both endpoints derived different authenticated session IDs');
@@ -538,9 +602,16 @@ async function main(options: Options): Promise<void> {
 
     await settleRuntime();
     const baseline = await resourceSnapshot(sender, receiver, outboundPeer, inboundPeer);
+    relayEvidence.observe(baseline);
     evidence.baseline = baseline;
     assertConnectionQuiescent(baseline.senderConnection, 'sender baseline');
     assertConnectionQuiescent(baseline.receiverConnection, 'receiver baseline');
+    assertFileDiagnosticsQuiescent(baseline.senderFiles, 'sender baseline');
+    assertFileDiagnosticsQuiescent(baseline.receiverFiles, 'receiver baseline');
+    assertSchedulerQuiescent(baseline.senderScheduler, 'sender baseline');
+    assertSchedulerQuiescent(baseline.receiverScheduler, 'receiver baseline');
+    assertSharesQuiescent(baseline.senderShares, 'sender baseline');
+    assertSharesQuiescent(baseline.receiverShares, 'receiver baseline');
     assertEndpointSingleConnection(baseline.senderEndpoint, 'sender baseline');
     assertEndpointSingleConnection(baseline.receiverEndpoint, 'receiver baseline');
     evidence.identities = {
@@ -555,6 +626,13 @@ async function main(options: Options): Promise<void> {
       && baseline.senderConnection.streams !== null
       && baseline.receiverConnection.streams !== null;
     evidence.qualification.fileDiagnosticsAvailable = baseline.senderFiles !== null && baseline.receiverFiles !== null;
+    evidence.qualification.runtimeDiagnosticsAvailable =
+      baseline.senderScheduler !== null
+      && baseline.receiverScheduler !== null
+      && baseline.senderShares !== null
+      && baseline.receiverShares !== null
+      && baseline.senderTasks !== null
+      && baseline.receiverTasks !== null;
     evidence.qualification.fileDescriptorTelemetryAvailable = baseline.process.fileDescriptors !== null;
     if (!evidence.qualification.diagnosticsAvailable) {
       evidence.qualification.notes.push('Endpoint diagnostics are unavailable; native handle cleanup is reported as unqualified.');
@@ -565,6 +643,9 @@ async function main(options: Options): Promise<void> {
     if (!evidence.qualification.fileDiagnosticsAvailable) {
       evidence.qualification.notes.push('Peer file diagnostics are unavailable; transfer queue and lane cleanup is reported as unqualified.');
     }
+    if (!evidence.qualification.runtimeDiagnosticsAvailable) {
+      evidence.qualification.notes.push('Scheduler, task, or capability diagnostics are unavailable; exact runtime quiescence is unqualified.');
+    }
     if (baseline.senderEndpoint?.activeConnections !== 1 || baseline.receiverEndpoint?.activeConnections !== 1) {
       evidence.qualification.notes.push(
         'The native activeConnections gauge does not count raw session-mode QUIC; activeSessions and p2prpc connection IDs are authoritative.'
@@ -574,7 +655,9 @@ async function main(options: Options): Promise<void> {
       evidence.qualification.notes.push('File-descriptor telemetry is unavailable on this platform.');
     }
     if (options.relay === 'disabled') {
-      evidence.qualification.notes.push('iroh-http-node 0.6 relay-disabled mode is loopback-only; this run does not qualify relay-less production support.');
+      evidence.qualification.notes.push(
+        'Relay-less topology qualification additionally requires companion two-host evidence with non-loopback direct paths; this lifecycle run alone proves only p2prpc workload behavior.'
+      );
     }
     if (!requestedProductionProfile) {
       evidence.qualification.notes.push('Non-production counts or scheduling were requested; this is a harness smoke run only.');
@@ -603,6 +686,7 @@ async function main(options: Options): Promise<void> {
       unexpectedErrors,
       baseline,
       sampler,
+      relayEvidence,
       pendingCapabilityCleanup: [],
       successfulTransferIds: new Set(),
       completedFiles: 0
@@ -682,6 +766,7 @@ async function main(options: Options): Promise<void> {
     await assertNoTransferDebris(directory);
 
     const final = await resourceSnapshot(sender, receiver, outboundPeer, inboundPeer);
+    relayEvidence.observe(final);
     assertResourceReturn(context, final, false);
     assert(final.process.rssBytes <= baseline.process.rssBytes + options.maxRssGrowthBytes,
       `RSS grew by more than ${options.maxRssGrowthBytes / MIB} MiB`);
@@ -712,9 +797,9 @@ async function main(options: Options): Promise<void> {
       && evidence.qualification.diagnosticsAvailable
       && evidence.qualification.connectionDiagnosticsAvailable
       && evidence.qualification.fileDiagnosticsAvailable
+      && evidence.qualification.runtimeDiagnosticsAvailable
       && evidence.qualification.fileDescriptorTelemetryAvailable
-      && negativeControlAttemptsExact
-      && options.relay !== 'disabled';
+      && negativeControlAttemptsExact;
     evidence.status = 'passed';
     evidence.finishedAt = new Date().toISOString();
     await artifact.write(evidence);
@@ -798,11 +883,7 @@ async function transferOne(context: HarnessContext, record: FileRecord): Promise
     recordTransferId(context, result.manifest.transferId);
   } else {
     const source = await fileSource(record.sourcePath, metadata);
-    const handle = context.receiver.files.share(source, {
-      allowedPeerIds: [context.sender.id],
-      allowedPrincipals: [{ id: context.sender.id, subject: context.sender.id }],
-      maxDownloads: 1
-    });
+    const handle = context.inboundPeer.files.share(source, { maxDownloads: 1 });
     const transfer = await context.outboundPeer.files.download(
       handle,
       fileDestination(record.destinationPath, { durable: false }),
@@ -829,10 +910,11 @@ async function checkpoint(
   forceGc();
   await settleRuntime();
   for (const handle of context.pendingCapabilityCleanup.splice(0)) {
-    assert(context.receiver.files.revoke(handle), 'Completed pull capability cleanup failed');
+    assert(context.inboundPeer.files.revoke(handle), 'Completed pull capability cleanup failed');
   }
   await settleRuntime();
   const resources = await waitForResourceReturn(context);
+  context.relayEvidence.observe(resources);
   context.sampler.observe(resources.process);
   context.evidence.checkpoints.push({
     sequence: context.evidence.checkpoints.length + 1,
@@ -870,6 +952,12 @@ async function waitForResourceReturn(context: HarnessContext): Promise<ResourceS
 function resourcesAtBaseline(baseline: ResourceSnapshot, current: ResourceSnapshot): boolean {
   if (!connectionQuiescent(current.senderConnection) || !connectionQuiescent(current.receiverConnection)) return false;
   if (!fileDiagnosticsQuiescent(current.senderFiles) || !fileDiagnosticsQuiescent(current.receiverFiles)) return false;
+  if (!sameSchedulerGauges(baseline.senderScheduler, current.senderScheduler)) return false;
+  if (!sameSchedulerGauges(baseline.receiverScheduler, current.receiverScheduler)) return false;
+  if (!sameShareGauges(baseline.senderShares, current.senderShares)) return false;
+  if (!sameShareGauges(baseline.receiverShares, current.receiverShares)) return false;
+  if (!sameTaskGauges(baseline.senderTasks, current.senderTasks)) return false;
+  if (!sameTaskGauges(baseline.receiverTasks, current.receiverTasks)) return false;
   if (baseline.senderEndpoint && current.senderEndpoint && !sameEndpointGauges(baseline.senderEndpoint, current.senderEndpoint)) return false;
   if (baseline.receiverEndpoint && current.receiverEndpoint && !sameEndpointGauges(baseline.receiverEndpoint, current.receiverEndpoint)) return false;
   return true;
@@ -880,6 +968,12 @@ function assertResourceReturn(context: HarnessContext, current: ResourceSnapshot
   assertConnectionQuiescent(current.receiverConnection, 'receiver');
   assertFileDiagnosticsQuiescent(current.senderFiles, 'sender');
   assertFileDiagnosticsQuiescent(current.receiverFiles, 'receiver');
+  assertSameSchedulerGauges(context.baseline.senderScheduler, current.senderScheduler, 'sender');
+  assertSameSchedulerGauges(context.baseline.receiverScheduler, current.receiverScheduler, 'receiver');
+  assertSameShareGauges(context.baseline.senderShares, current.senderShares, 'sender');
+  assertSameShareGauges(context.baseline.receiverShares, current.receiverShares, 'receiver');
+  assertSameTaskGauges(context.baseline.senderTasks, current.senderTasks, 'sender');
+  assertSameTaskGauges(context.baseline.receiverTasks, current.receiverTasks, 'receiver');
   assert(current.senderConnection.connectionFingerprint === context.senderConnectionId, 'Sender physical connection changed');
   assert(current.receiverConnection.connectionFingerprint === context.receiverConnectionId, 'Receiver physical connection changed');
   if (context.baseline.senderEndpoint && current.senderEndpoint) {
@@ -956,12 +1050,8 @@ async function runNegativeCases(
   before = after;
   await runBounded(Array.from({ length: count }, (_, index) => index), context.options.concurrency, async (index) => {
     const source = await fileSource<StressFileMetadata>(sourcePath, { kind: 'pull', index, sha256 });
-    const handle = context.receiver.files.share(source, {
-      allowedPeerIds: [context.sender.id],
-      allowedPrincipals: [{ id: context.sender.id, subject: context.sender.id }],
-      maxDownloads: 1
-    });
-    assert(context.receiver.files.revoke(handle), 'Capability revocation failed');
+    const handle = context.inboundPeer.files.share(source, { maxDownloads: 1 });
+    assert(context.inboundPeer.files.revoke(handle), 'Capability revocation failed');
     await expectFailure(async () => {
       const transfer = await context.outboundPeer.files.download(
         handle,
@@ -981,11 +1071,21 @@ async function runNegativeCases(
       const source = await fileSource<StressFileMetadata>(sourcePath, { kind: 'cancelled', index, sha256 });
       const transfer = await context.outboundPeer.files.sendFile(source, {
         chunkSize: CHUNK_SIZE,
-        lanes: LANES,
+        lanes: CANCELLATION_LANES,
         transferId: `negative-cancel-${index}`
       });
-      await delay(10);
+      const progress = transfer.progress()[Symbol.asyncIterator]();
+      const first = await withTimeout(
+        progress.next(),
+        context.options.checkpointTimeoutMs,
+        'Cancelled push did not reach an established data lane'
+      );
+      assert(
+        !first.done && first.value.transferredBytes > 0,
+        'Cancelled push settled before its established data lane made progress'
+      );
       transfer.cancel(new Error('Intentional stress cancellation'));
+      await progress.return?.();
       await transfer.result;
     }, 'Cancelled push');
   });
@@ -1023,6 +1123,8 @@ async function runNegativeCases(
     rejectedPushes: count,
     revokedPulls: count,
     senderCancellations: count,
+    senderCancellationLanes: CANCELLATION_LANES,
+    senderCancellationTrigger: 'first-data-progress',
     destinationFailures: count,
     controlAttempts: {
       rejectedPushes: rejectedPushAttempts,
@@ -1136,17 +1238,22 @@ function deterministicContent(index: number, size: number): Buffer {
   return content;
 }
 
-function commonNodeOptions(options: Options): {
+function commonNodeOptions(options: Options, allowRelayUrl?: (origin: string) => boolean): {
   iroh: IrohEndpointOptions;
   limits: {
     maxFileTransfers: number;
     maxGlobalFileTransfers: number;
+    maxPrincipalFileTransfers: number;
     fileChunkSize: number;
     maxFileChunkSize: number;
     fileLanes: number;
     maxFileLanes: number;
-    maxBiStreams: bigint;
-    maxUniStreams: bigint;
+    maxInboundStreams: number;
+    maxGlobalInboundStreams: number;
+    maxPrincipalInboundStreams: number;
+    maxBufferedBytes: number;
+    maxPeerBufferedBytes: number;
+    maxPrincipalBufferedBytes: number;
     maxSessionTtlMs: number;
     connectTimeoutMs: number;
   };
@@ -1159,21 +1266,37 @@ function commonNodeOptions(options: Options): {
     : options.locator === 'mdns'
       ? { mdns: { serviceName: options.mdnsServiceName, advertise: true } }
       : { dns: false, mdns: false };
+  const admittedStreams = options.concurrency * (LANES + 1);
+  const fileDataBuffer = Math.max(CONTROL_FRAME_BYTES, CHUNK_SIZE + FILE_DATA_SEGMENT_BYTES);
+  const admittedBuffers = options.concurrency * (CONTROL_FRAME_BYTES + LANES * fileDataBuffer);
   return {
     iroh: {
       relay,
       discovery,
+      // This is a controlled topology harness. Production applications should
+      // use a real address allowlist instead of admitting every ticket hint.
+      ...(options.locator === 'dns' ? {} : { allowDirectAddress: () => true }),
+      ...(allowRelayUrl ? { allowRelayUrl } : {}),
       ...(options.bindAddresses.length > 0 ? { bindAddress: options.bindAddresses } : {})
     },
     limits: {
       maxFileTransfers: options.concurrency,
       maxGlobalFileTransfers: options.concurrency * 2,
+      maxPrincipalFileTransfers: options.concurrency,
       fileChunkSize: CHUNK_SIZE,
       maxFileChunkSize: CHUNK_SIZE,
       fileLanes: LANES,
       maxFileLanes: LANES,
-      maxBiStreams: 512n,
-      maxUniStreams: 512n,
+      // The runtime owns logical admission; native QUIC stream limits are
+      // deliberately not part of the public node API. Admit one control plus
+      // every data lane for each scheduled transfer so the harness measures
+      // lifecycle cleanup rather than an unrelated queue ceiling.
+      maxInboundStreams: admittedStreams,
+      maxGlobalInboundStreams: admittedStreams,
+      maxPrincipalInboundStreams: admittedStreams,
+      maxBufferedBytes: admittedBuffers,
+      maxPeerBufferedBytes: admittedBuffers,
+      maxPrincipalBufferedBytes: admittedBuffers,
       maxSessionTtlMs: SESSION_TTL_MS,
       connectTimeoutMs: 60_000
     }
@@ -1205,6 +1328,12 @@ async function resourceSnapshot(
     receiverConnection: sanitizeConnectionStats(receiverPeer.connection),
     senderFiles: senderPeer.files,
     receiverFiles: receiverPeer.files,
+    senderScheduler: senderPeer.resources,
+    receiverScheduler: receiverPeer.resources,
+    senderShares: senderPeer.shares,
+    receiverShares: receiverPeer.shares,
+    senderTasks: senderPeer.tasks,
+    receiverTasks: receiverPeer.tasks,
     senderEndpoint,
     receiverEndpoint
   };
@@ -1213,15 +1342,30 @@ async function resourceSnapshot(
 async function optionalPeerDiagnostics(peer: Peer<Router, StressFileMetadata>): Promise<{
   connection: ConnectionStats;
   files: FileTransferDiagnostics | null;
+  resources: PeerDiagnostics['resources'] | null;
+  shares: PeerDiagnostics['shares'] | null;
+  tasks: PeerDiagnostics['tasks'] | null;
 }> {
   const candidate = peer as Peer<Router, StressFileMetadata> & {
-    diagnostics?: () => Promise<{ connection: ConnectionStats; files: FileTransferDiagnostics }>;
+    diagnostics?: () => Promise<PeerDiagnostics>;
   };
   if (typeof candidate.diagnostics === 'function') {
     const diagnostics = await candidate.diagnostics();
-    return { connection: diagnostics.connection, files: diagnostics.files };
+    return {
+      connection: diagnostics.connection,
+      files: diagnostics.files,
+      resources: diagnostics.resources,
+      shares: diagnostics.shares,
+      tasks: diagnostics.tasks
+    };
   }
-  return { connection: await peer.stats(), files: null };
+  return {
+    connection: await peer.stats(),
+    files: null,
+    resources: null,
+    shares: null,
+    tasks: null
+  };
 }
 
 async function optionalDiagnostics(node: P2PNode<Router, StressFileMetadata>): Promise<EndpointDiagnostics | null> {
@@ -1255,7 +1399,9 @@ function sanitizeConnectionStats(stats: ConnectionStats): SanitizedConnectionSta
     sentPackets: extended.sentPackets ?? null,
     congestionWindow: extended.congestionWindow ?? null,
     relay: extended.relay ?? null,
-    relayUrlFingerprint: extended.relayUrl ? fingerprint(extended.relayUrl) : null,
+    relayUrlFingerprint: extended.relayUrl
+      ? relayFingerprint(canonicalRelayOrigin(extended.relayUrl))
+      : null,
     paths: (extended.paths ?? []).map((path) => ({
       relay: path.relay,
       active: path.active,
@@ -1314,11 +1460,95 @@ function fileDiagnosticsQuiescent(stats: FileTransferDiagnostics | null): boolea
     && stats.incomingSessions === 0
     && stats.reservedSessions === 0
     && stats.activeLanes === 0
+    && stats.activeOperations === 0
+    && stats.ambiguousOperations === 0
+    && stats.operationRecords === 0
+    && stats.replayTombstones <= stats.maxReplayTombstones
   );
 }
 
 function assertFileDiagnosticsQuiescent(stats: FileTransferDiagnostics | null, label: string): void {
-  assert(fileDiagnosticsQuiescent(stats), `${label} still owns file transfers, queues, sessions, or lanes`);
+  assert(
+    fileDiagnosticsQuiescent(stats),
+    `${label} still owns file transfers, queues, sessions, lanes, or ambiguous operation records`
+  );
+}
+
+function assertSchedulerQuiescent(stats: PeerDiagnostics['resources'] | null, label: string): void {
+  if (!stats) return;
+  assert(stats.queued === 0, `${label} scheduler still has queued work`);
+  assert(stats.peers === 0 && stats.principals === 0, `${label} scheduler still owns peer/principal state`);
+  assert(Object.values(stats.active).every((value) => value === 0), `${label} scheduler still owns active resources`);
+  assert(!stats.closed, `${label} scheduler closed unexpectedly`);
+}
+
+function assertSharesQuiescent(stats: PeerDiagnostics['shares'] | null, label: string): void {
+  if (!stats) return;
+  assert(stats.activeShares === 0, `${label} still owns file capabilities`);
+  assert(stats.operationRecords === 0, `${label} still owns capability operation records`);
+  assert(stats.activeReservations === 0, `${label} still owns active capability reservations`);
+  assert(stats.expiryRecords === 0, `${label} still owns capability expiry records`);
+  assert(!stats.closed, `${label} share registry closed unexpectedly`);
+}
+
+function sameSchedulerGauges(
+  baseline: PeerDiagnostics['resources'] | null,
+  current: PeerDiagnostics['resources'] | null
+): boolean {
+  if (!baseline || !current) return baseline === current;
+  return baseline.queued === current.queued
+    && baseline.peers === current.peers
+    && baseline.principals === current.principals
+    && baseline.closed === current.closed
+    && Object.entries(baseline.active).every(([name, value]) =>
+      current.active[name as keyof typeof current.active] === value
+    );
+}
+
+function assertSameSchedulerGauges(
+  baseline: PeerDiagnostics['resources'] | null,
+  current: PeerDiagnostics['resources'] | null,
+  label: string
+): void {
+  assert(sameSchedulerGauges(baseline, current), `${label} scheduler resources did not return to baseline`);
+}
+
+function sameShareGauges(
+  baseline: PeerDiagnostics['shares'] | null,
+  current: PeerDiagnostics['shares'] | null
+): boolean {
+  if (!baseline || !current) return baseline === current;
+  return baseline.activeShares === current.activeShares
+    && baseline.operationRecords === current.operationRecords
+    && baseline.activeReservations === current.activeReservations
+    && baseline.expiryRecords === current.expiryRecords
+    && baseline.maxShares === current.maxShares
+    && baseline.maxOperationRecords === current.maxOperationRecords
+    && baseline.closed === current.closed;
+}
+
+function assertSameShareGauges(
+  baseline: PeerDiagnostics['shares'] | null,
+  current: PeerDiagnostics['shares'] | null,
+  label: string
+): void {
+  assert(sameShareGauges(baseline, current), `${label} capability registry did not return to baseline`);
+}
+
+function sameTaskGauges(
+  baseline: PeerDiagnostics['tasks'] | null,
+  current: PeerDiagnostics['tasks'] | null
+): boolean {
+  if (!baseline || !current) return baseline === current;
+  return baseline.peer === current.peer && baseline.node === current.node;
+}
+
+function assertSameTaskGauges(
+  baseline: PeerDiagnostics['tasks'] | null,
+  current: PeerDiagnostics['tasks'] | null,
+  label: string
+): void {
+  assert(sameTaskGauges(baseline, current), `${label} owned task counts did not return to baseline`);
 }
 
 function sameEndpointGauges(left: EndpointDiagnostics, right: EndpointDiagnostics): boolean {
@@ -1467,7 +1697,9 @@ function slowDestination() {
     writeChunk: async (_manifest: unknown, _index: number, _data: Uint8Array, signal?: AbortSignal) => {
       await delay(100, undefined, signal ? { signal } : undefined);
     },
-    finalize: async () => undefined,
+    finalize: async (_manifest: unknown, context: { readonly markCommitted: () => void }) => {
+      context.markCommitted();
+    },
     abort: async () => undefined
   };
 }
@@ -1510,7 +1742,49 @@ function sha256Bytes(value: Uint8Array): string {
 }
 
 function fingerprint(value: string): string {
-  return sha256Bytes(Buffer.from(value, 'utf8')).slice(0, 16);
+  return sha256Bytes(Buffer.from(value, 'utf8'));
+}
+
+/** Full digest: release evidence must make relay-set collision substitution impractical. */
+function relayFingerprint(value: string): string {
+  return sha256Bytes(Buffer.from(value, 'utf8'));
+}
+
+function createRelayEvidenceTracker(
+  options: Options,
+  evidence: Evidence['relayEvidence']
+): RelayEvidenceTracker {
+  const configuredOrigins = new Set(options.relayUrls.map((value) => new URL(value).origin));
+  const attempted = new Set(evidence.attempted);
+  const connected = new Set(evidence.connected);
+  const denied = new Set(evidence.denied);
+  let dialing = false;
+  const sync = (): void => {
+    evidence.attempted = [...attempted].sort();
+    evidence.connected = [...connected].sort();
+    evidence.denied = [...denied].sort();
+  };
+  const allowRelayUrl = options.locator === 'dns' || options.relay === 'disabled'
+    ? undefined
+    : (origin: string): boolean => {
+      const digest = relayFingerprint(origin);
+      if (dialing) attempted.add(digest);
+      const allowed = options.relay !== 'custom' || configuredOrigins.has(origin);
+      if (!allowed) denied.add(digest);
+      sync();
+      return allowed;
+    };
+  return {
+    ...(allowRelayUrl ? { allowRelayUrl } : {}),
+    beginDial() { dialing = true; },
+    endDial() { dialing = false; },
+    observe(snapshot) {
+      for (const stats of [snapshot.senderConnection, snapshot.receiverConnection]) {
+        if (stats.relayUrlFingerprint) connected.add(stats.relayUrlFingerprint);
+      }
+      sync();
+    }
+  };
 }
 
 function absentOptionalPrincipal(id: string) {
@@ -1580,10 +1854,16 @@ function isProductionProfile(options: Options): boolean {
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return Promise.race([
-    promise,
-    delay(timeoutMs).then(() => { throw new Error(message); })
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function serializeError(cause: unknown): NonNullable<Evidence['failure']> {
@@ -1599,6 +1879,38 @@ function serializeError(cause: unknown): NonNullable<Evidence['failure']> {
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+function canonicalRelayOrigin(value: string): string {
+  assert(
+    value.length > 0 &&
+    value.length <= 2_048 &&
+    value === value.trim() &&
+    ![...value].some((character) => {
+      const code = character.codePointAt(0)!;
+      return code <= 0x1f || code === 0x7f;
+    }),
+    'Relay URLs must be bounded strings without surrounding whitespace or controls'
+  );
+  const originSyntax = /^https:\/\/([^/?#\\]+)\/?$/iu.exec(value);
+  const authority = originSyntax?.[1];
+  assert(
+    authority !== undefined && !authority.includes('@') && !authority.endsWith(':'),
+    'Relay URLs must use unambiguous credential-free HTTPS origin syntax'
+  );
+  const url = new URL(value);
+  assert(
+    url.protocol === 'https:' && !url.username && !url.password && url.port !== '0',
+    'Relay URLs must be credential-free HTTPS origins with a nonzero port'
+  );
+  if (!url.hostname.startsWith('[') && url.hostname.endsWith('.')) {
+    assert(!url.hostname.endsWith('..'), 'Relay DNS names may contain at most one trailing root dot');
+    const hostname = url.hostname.slice(0, -1);
+    assert(hostname.length > 0, 'Relay URL hostname is invalid');
+    url.hostname = hostname;
+    assert(url.hostname === hostname, 'Relay URL hostname could not be canonicalized');
+  }
+  return url.origin;
 }
 
 function parseArguments(argv: readonly string[]): Options | 'help' {
@@ -1645,12 +1957,14 @@ function parseArguments(argv: readonly string[]): Options | 'help' {
   assert(locatorValue === 'ticket' || locatorValue === 'dns' || locatorValue === 'mdns', '--locator must be ticket, dns, or mdns');
   const relayValue = one(values, '--relay') ?? 'disabled';
   assert(relayValue === 'disabled' || relayValue === 'default' || relayValue === 'custom', '--relay must be disabled, default, or custom');
-  const relayUrls = values['--relay-url'] ?? [];
+  const relayUrls = (values['--relay-url'] ?? []).map(canonicalRelayOrigin);
   assert((relayValue === 'custom') === (relayUrls.length > 0), 'Custom relay mode requires --relay-url; other modes reject it');
-  for (const relayUrl of relayUrls) {
-    const parsed = new URL(relayUrl);
-    assert(parsed.protocol === 'https:' && !parsed.username && !parsed.password, 'Relay URLs must be credential-free HTTPS URLs');
-  }
+  assert(relayUrls.length <= 32, 'At most 32 custom relay origins may be supplied');
+  assert(new Set(relayUrls).size === relayUrls.length, 'Custom relay URLs must be distinct canonical HTTPS origins');
+  assert(
+    locatorValue !== 'dns' || relayValue !== 'custom',
+    'DNS/PKARR with custom relays is unavailable until resolved routes can be filtered before dial'
+  );
   const dnsServerUrl = one(values, '--dns-server-url');
   assert(dnsServerUrl === undefined || locatorValue === 'dns', '--dns-server-url requires --locator dns');
   if (dnsServerUrl) {
@@ -1748,7 +2062,7 @@ Diagnostics:
   --help                            Show this help without executing anything
 
 Use --files 4 --batch-size 1 for a quick harness smoke. Such a run is explicitly
-marked non-production in its evidence. relay-disabled on iroh-http-node 0.6 is
-also marked loopback-only and cannot qualify relay-less production support.
+marked non-production in its evidence. A relay-disabled run must be paired with
+two-host topology evidence proving non-loopback direct paths and no relay use.
 `);
 }

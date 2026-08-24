@@ -394,11 +394,12 @@ describe('RPC server security boundaries', () => {
   it('cancels a non-cooperative procedure and rejects an invalid cancellation frame', async () => {
     const t = initTRPC.create();
     let markStarted: (() => void) | undefined;
+    let releaseProcedure: ((value: string) => void) | undefined;
     const started = new Promise<void>((resolve) => { markStarted = resolve; });
     const router = t.router({
       hang: t.procedure.query(() => {
         markStarted?.();
-        return new Promise(() => undefined);
+        return new Promise<string>((resolve) => { releaseProcedure = resolve; });
       })
     });
     const request = await requestBytes({
@@ -419,13 +420,24 @@ describe('RPC server security boundaries', () => {
       setupTimeoutMs: 100,
       ioTimeoutMs: 100
     });
-    const handling = server.handle({ send: output, recv: input });
+    const ownedWork = new Set<Promise<unknown>>();
+    const handling = server.handle(
+      { send: output, recv: input },
+      (work) => ownedWork.add(work)
+    );
     await started;
     input.push(await frameBytes(RpcFrameKind.Cancel, { id: 12 }));
     await handling;
     expect(output.bytes).toEqual([]);
     expect(output.resetCalls).toBe(1);
     expect(input.stopCalls).toBe(1);
+    let ownershipSettled = false;
+    const settlement = Promise.allSettled([...ownedWork]).then(() => { ownershipSettled = true; });
+    await Promise.resolve();
+    expect(ownershipSettled).toBe(false);
+    releaseProcedure?.('late result');
+    await settlement;
+    expect(ownershipSettled).toBe(true);
 
     const invalidInput = new AsyncByteRecv(request);
     const invalidOutput = new RecordingSend();
@@ -471,6 +483,44 @@ describe('RPC server security boundaries', () => {
     await handling;
 
     expect(output.bytes).toEqual([]);
+    expect(output.resetCalls).toBe(1);
+    expect(input.stopCalls).toBe(1);
+  });
+
+  it('closes a subscription iterator when a response write fails before cancellation', async () => {
+    const t = initTRPC.create();
+    let finalized = false;
+    const router = t.router({
+      values: t.procedure.subscription(async function *() {
+        try {
+          yield 'first';
+          await new Promise(() => undefined);
+        } finally {
+          finalized = true;
+        }
+      })
+    });
+    const input = new BufferedRecv(await requestBytes({
+      id: 14,
+      path: 'values',
+      type: 'subscription',
+      headers: {},
+      input: serializeValue(undefined)
+    }), true);
+    const output = new StalledWriteSend();
+    const server = new RpcServer({
+      router,
+      createContext: () => ({}),
+      authorize: () => undefined,
+      headerLimits: { maxCount: 8, maxBytes: 1024 },
+      maxPathBytes: 256,
+      setupTimeoutMs: 20,
+      ioTimeoutMs: 20
+    });
+
+    await server.handle({ send: output, recv: input });
+
+    await expect.poll(() => finalized).toBe(true);
     expect(output.resetCalls).toBe(1);
     expect(input.stopCalls).toBe(1);
   });

@@ -69,6 +69,8 @@ expect_relay_failure 2 '["https://relay-a.example?query", "https://relay-b.examp
 expect_relay_failure 2 '["https://user@relay-a.example", "https://relay-b.example"]'
 expect_relay_failure 2 '["https://@relay-a.example", "https://relay-b.example"]'
 expect_relay_failure 2 '["https://relay-a.example:", "https://relay-b.example"]'
+expect_relay_failure 2 '["https://.", "https://relay-b.example"]'
+expect_relay_failure 2 '["https://relay-a.example:0", "https://relay-b.example"]'
 expect_relay_failure 2 '["http://relay-a.example", "https://relay-b.example"]'
 expect_relay_failure 2 '["https://relay.example"]'
 
@@ -85,6 +87,32 @@ make_result \
   2026-08-23T00:00:00Z \
   2026-08-23T00:00:01Z
 LOCATOR=ticket RELAY=custom bash "$validator" evidence p2prpc-lab-canary "$fixture_dir/canary.json"
+
+relayless_route='{"locator":"ticket","relay":"disabled","dnsEnabled":false,"customRelayCount":0,"hostCount":2}'
+relayless_metrics='{"connectionsOpened":1,"connectionsClosed":1,"streamsOpened":1,"streamsClosed":1,"echoedBytes":64,"activeConnectionsAfter":0,"activeStreamsAfter":0,"advertisedRelayUrlNull":true,"nonLoopbackDirectPathsObserved":1,"relayPathsObserved":0}'
+make_result \
+  "$fixture_dir/relayless-canary.json" \
+  p2prpc-lab-canary \
+  raw-iroh-canary \
+  "$relayless_route" \
+  "$relayless_metrics" \
+  "$canary_scenarios" \
+  2026-08-23T00:00:00Z \
+  2026-08-23T00:00:01Z
+LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/relayless-canary.json"
+jq '.campaign.parameters.hostCount = 1' "$fixture_dir/relayless-canary.json" > "$fixture_dir/one-host-relayless.json"
+expect_failure env LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/one-host-relayless.json"
+jq '.campaign.metrics.nonLoopbackDirectPathsObserved = 0' "$fixture_dir/relayless-canary.json" > "$fixture_dir/loopback-only.json"
+expect_failure env LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/loopback-only.json"
+jq '.campaign.metrics.relayPathsObserved = 1' "$fixture_dir/relayless-canary.json" > "$fixture_dir/relay-used.json"
+expect_failure env LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/relay-used.json"
+jq '.campaign.metrics.advertisedRelayUrlNull = false' "$fixture_dir/relayless-canary.json" > "$fixture_dir/relay-advertised.json"
+expect_failure env LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/relay-advertised.json"
 
 topology_scenarios='[
   "locator.ticket.ipv4",
@@ -130,6 +158,41 @@ expect_failure env EXPECTED_CUSTOM_RELAY_COUNT=3 LOCATOR=ticket RELAY=custom bas
 jq '.campaign.parameters.customRelayCount = 1' "$fixture_dir/topology.json" > "$fixture_dir/one-relay.json"
 expect_failure env LOCATOR=ticket RELAY=custom bash "$validator" evidence \
   p2prpc-lab-topology-suite "$fixture_dir/one-relay.json"
+jq '.campaign.parameters.customRelayCount = 33' "$fixture_dir/topology.json" > "$fixture_dir/too-many-relays.json"
+expect_failure bash "$validator" evidence p2prpc-lab-topology-suite "$fixture_dir/too-many-relays.json"
+
+relayless_topology_scenarios='[
+  "locator.ticket.ipv4",
+  "locator.ticket.ipv6",
+  "locator.ticket.dual-stack",
+  "locator.ticket.multiple-candidates",
+  "locator.ticket.blackholed-first-fallback",
+  "locator.ticket.address-refresh",
+  "locator.ticket.expiry-rejected",
+  "locator.ticket.tampering-rejected",
+  "locator.ticket.staleness-rejected",
+  "identity.wrong-endpoint-rejected",
+  "identity.wrong-principal-rejected",
+  "relay.disabled.enforced",
+  "relay.disabled.non-loopback-direct",
+  "relay.disabled.no-relay-path",
+  "protocol.rpc",
+  "protocol.subscription",
+  "protocol.file-transfer",
+  "lifecycle.clean-shutdown"
+]'
+relayless_topology_metrics='{"scenariosPassed":18,"scenariosFailed":0,"activeConnectionsAfter":0,"activeStreamsAfter":0,"activeTransfersAfter":0,"activeHandlesAfter":0,"advertisedRelayUrlNull":true,"nonLoopbackDirectPathsObserved":1,"relayPathsObserved":0}'
+make_result \
+  "$fixture_dir/relayless-topology.json" \
+  p2prpc-lab-topology-suite \
+  topology-and-fault-matrix \
+  "$relayless_route" \
+  "$relayless_topology_metrics" \
+  "$relayless_topology_scenarios" \
+  2026-08-23T00:00:00Z \
+  2026-08-23T00:01:00Z
+LOCATOR=ticket RELAY=disabled bash "$validator" evidence \
+  p2prpc-lab-topology-suite "$fixture_dir/relayless-topology.json"
 
 clean_metrics='"activeConnectionsAfter":0,"activeStreamsAfter":0,"activeTransfersAfter":0,"activeHandlesAfter":0'
 mixed_scenarios='[
@@ -147,7 +210,7 @@ mixed_scenarios='[
   "lifecycle.connect-work-close-waves",
   "lifecycle.clean-shutdown"
 ]'
-mixed_parameters='{"peers":100,"rpcStreams":1000,"fileTransfers":16,"durationSeconds":14400}'
+mixed_parameters='{"locator":"ticket","relay":"custom","dnsEnabled":false,"customRelayCount":2,"peers":100,"rpcStreams":1000,"fileTransfers":16,"durationSeconds":14400}'
 mixed_metrics="{\"peerCount\":100,\"peakConcurrentRpcStreams\":1000,\"peakConcurrentFileTransfers\":16,\"elapsedSeconds\":14400,$clean_metrics}"
 make_result \
   "$fixture_dir/mixed.json" \
@@ -158,7 +221,8 @@ make_result \
   "$mixed_scenarios" \
   2026-08-23T00:00:00Z \
   2026-08-23T04:00:00Z
-bash "$validator" evidence p2prpc-lab-mixed-suite "$fixture_dir/mixed.json" release
+EXPECTED_CUSTOM_RELAY_COUNT=2 LOCATOR=ticket RELAY=custom \
+  bash "$validator" evidence p2prpc-lab-mixed-suite "$fixture_dir/mixed.json" release
 
 release_scenarios='[
   "storage.filesystem-transfer",
@@ -223,8 +287,16 @@ expect_failure bash "$validator" evidence p2prpc-lab-release-suite "$fixture_dir
 
 jq '.campaign.parameters.customRelayCount = 1' "$fixture_dir/release.json" > "$fixture_dir/one-release-relay.json"
 expect_failure bash "$validator" evidence p2prpc-lab-release-suite "$fixture_dir/one-release-relay.json"
+jq '.campaign.parameters.customRelayCount = 33' "$fixture_dir/release.json" > "$fixture_dir/too-many-release-relays.json"
+expect_failure bash "$validator" evidence p2prpc-lab-release-suite "$fixture_dir/too-many-release-relays.json"
 
 expect_failure env LOCATOR=dns RELAY=custom bash "$validator" evidence p2prpc-lab-canary "$fixture_dir/canary.json"
+jq '
+  .campaign.parameters.locator = "dns" |
+  .campaign.parameters.dnsEnabled = true
+' "$fixture_dir/canary.json" > "$fixture_dir/dns-custom-canary.json"
+expect_failure env LOCATOR=dns RELAY=custom bash "$validator" evidence \
+  p2prpc-lab-canary "$fixture_dir/dns-custom-canary.json"
 
 jq '
   .campaign.parameters.durationSeconds = 1800 |

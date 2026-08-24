@@ -29,8 +29,8 @@ export const DEFAULT_FILE_TRANSFER_LIMITS: FileTransferLimits = {
   maxLanes: 16,
   maxTransfers: 4,
   maxQueuedTransfers: 16,
-  maxFileSize: 1024 * 1024 * 1024 * 1024,
-  maxChunkCount: 256 * 1024,
+  maxFileSize: 16 * 1024 * 1024 * 1024,
+  maxChunkCount: 65_536,
   maxNameBytes: 255,
   maxMetadataBytes: 64 * 1024,
   maxTransferIdBytes: 128,
@@ -40,8 +40,24 @@ export const DEFAULT_FILE_TRANSFER_LIMITS: FileTransferLimits = {
 const textEncoder = new TextEncoder();
 const TRANSFER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]*$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+const validatedManifestMetadata = new WeakMap<object, unknown>();
 
 export function resolveFileTransferLimits(limits: Partial<FileTransferLimits> = {}): FileTransferLimits {
+  if (!isRecord(limits)) throw new P2PError('INVALID_FRAME', 'File transfer limits must be an object');
+  assertOnlyKeys(limits, [
+    'chunkSize',
+    'maxChunkSize',
+    'lanes',
+    'maxLanes',
+    'maxTransfers',
+    'maxQueuedTransfers',
+    'maxFileSize',
+    'maxChunkCount',
+    'maxNameBytes',
+    'maxMetadataBytes',
+    'maxTransferIdBytes',
+    'maxMissingRanges'
+  ], 'File transfer limits');
   const resolved = { ...DEFAULT_FILE_TRANSFER_LIMITS, ...limits };
   validateChunkSize(resolved.maxChunkSize);
   validateChunkSize(resolved.chunkSize, resolved.maxChunkSize);
@@ -105,16 +121,20 @@ export function validateDigest(value: unknown, label = 'digest'): string {
 
 export function validateManifest<TMetadata>(value: unknown, limits: FileTransferLimits): FileManifest<TMetadata> {
   if (!isRecord(value)) throw new P2PError('INVALID_FRAME', 'File manifest must be an object');
-  const transferId = validateTransferId(value.transferId, limits);
-  const name = validateFileName(value.name, limits);
-  const rawSize = value.size;
+  assertManifestKeys(value);
+  for (const required of ['transferId', 'name', 'size', 'digest', 'chunkSize', 'chunkCount']) {
+    if (!Object.hasOwn(value, required)) throw new P2PError('INVALID_FRAME', `File manifest is missing ${required}`);
+  }
+  const transferId = validateTransferId(dataProperty(value, 'transferId'), limits);
+  const name = validateFileName(dataProperty(value, 'name'), limits);
+  const rawSize = dataProperty(value, 'size');
   if (!Number.isSafeInteger(rawSize) || (rawSize as number) < 0 || (rawSize as number) > limits.maxFileSize) {
     throw new P2PError('RESOURCE_LIMIT', `File size exceeds the configured limit of ${limits.maxFileSize} bytes`);
   }
   const size = rawSize as number;
-  const digest = validateDigest(value.digest, 'file digest');
-  const chunkSize = validateChunkSize(value.chunkSize as number, limits.maxChunkSize);
-  const rawChunkCount = value.chunkCount;
+  const digest = validateDigest(dataProperty(value, 'digest'), 'file digest');
+  const chunkSize = validateChunkSize(dataProperty(value, 'chunkSize') as number, limits.maxChunkSize);
+  const rawChunkCount = dataProperty(value, 'chunkCount');
   if (!Number.isSafeInteger(rawChunkCount) || (rawChunkCount as number) < 0) {
     throw new P2PError('INVALID_FRAME', 'Invalid file chunk count');
   }
@@ -126,7 +146,9 @@ export function validateManifest<TMetadata>(value: unknown, limits: FileTransfer
   if (chunkCount !== expectedChunkCount) {
     throw new P2PError('INVALID_FRAME', 'Manifest chunk count does not match file size');
   }
-  const rawMetadata = 'metadata' in value ? value.metadata : undefined;
+  const rawMetadata = validatedManifestMetadata.has(value)
+    ? validatedManifestMetadata.get(value)
+    : Object.hasOwn(value, 'metadata') ? dataProperty(value, 'metadata') : undefined;
   const metadata = rawMetadata !== undefined
     ? cloneValidatedMetadata<TMetadata>(rawMetadata as TMetadata, limits.maxMetadataBytes)
     : undefined;
@@ -138,6 +160,7 @@ export function validateManifest<TMetadata>(value: unknown, limits: FileTransfer
       enumerable: true,
       get: () => cloneAndFreezePlainData(metadata) as TMetadata
     });
+    validatedManifestMetadata.set(manifest, metadata);
   }
   return Object.freeze(manifest);
 }
@@ -146,9 +169,35 @@ export function validateMetadata(value: unknown, maxBytes: number): void {
   void cloneValidatedMetadata(value, maxBytes);
 }
 
+/** Materialize the private canonical manifest snapshot as accessor-free wire data. */
+export function manifestWireValue<TMetadata>(manifest: FileManifest<TMetadata>): Record<string, unknown> {
+  const value: Record<string, unknown> = {
+    transferId: manifest.transferId,
+    name: manifest.name,
+    size: manifest.size,
+    digest: manifest.digest,
+    chunkSize: manifest.chunkSize,
+    chunkCount: manifest.chunkCount
+  };
+  if (validatedManifestMetadata.has(manifest)) {
+    value.metadata = cloneAndFreezePlainData(validatedManifestMetadata.get(manifest));
+  } else if (Object.hasOwn(manifest, 'metadata')) {
+    throw new P2PError('INTERNAL', 'Manifest metadata lacks a private validated snapshot');
+  }
+  return Object.freeze(value);
+}
+
 /** Returns a detached canonical snapshot of validated, message-packable metadata. */
 export function cloneValidatedMetadata<T>(value: T, maxBytes: number): T {
-  const snapshot = clonePlainData(value, 0, { items: 0 }, new WeakSet<object>()) as T;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new P2PError('RESOURCE_LIMIT', 'Invalid file metadata byte limit');
+  }
+  const snapshot = clonePlainData(
+    value,
+    0,
+    { items: 0, estimatedBytes: 0, maxBytes },
+    new WeakSet<object>()
+  ) as T;
   let bytes: number;
   try {
     bytes = pack(snapshot).byteLength;
@@ -167,21 +216,85 @@ export function expectedChunkSize(manifest: FileManifest, index: number): number
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function assertOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string
+): void {
+  const allowedKeys = new Set(allowed);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== 'string' || !allowedKeys.has(key)) {
+      throw new P2PError('INVALID_FRAME', `${label} contains an unknown field`);
+    }
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new P2PError('INVALID_FRAME', `${label} contains an unsafe field`);
+    }
+  }
+}
+
+function assertManifestKeys(value: Record<string, unknown>): void {
+  const allowed = new Set(['transferId', 'name', 'size', 'digest', 'chunkSize', 'chunkCount', 'metadata']);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string' || !allowed.has(key)) {
+      throw new P2PError('INVALID_FRAME', 'File manifest contains an unknown field');
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable) {
+      throw new P2PError('INVALID_FRAME', 'File manifest contains an unsafe field');
+    }
+    if (Object.hasOwn(descriptor, 'value')) continue;
+    if (
+      key !== 'metadata' ||
+      !validatedManifestMetadata.has(value) ||
+      typeof descriptor.get !== 'function' ||
+      descriptor.set !== undefined
+    ) {
+      throw new P2PError('INVALID_FRAME', 'File manifest contains an unsafe field');
+    }
+  }
 }
 
 function clonePlainData(
   value: unknown,
   depth: number,
-  counter: { items: number },
+  budget: { items: number; estimatedBytes: number; readonly maxBytes: number },
   seen: WeakSet<object>
 ): unknown {
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new P2PError('INVALID_FRAME', 'File metadata numbers must be finite');
+  consumeMetadataBudget(budget, 1, 0);
+  if (value === null || typeof value === 'boolean') {
+    consumeMetadataBudget(budget, 0, 1);
     return value;
   }
-  if (value instanceof Uint8Array) return value.slice();
+  if (typeof value === 'string') {
+    consumeMetadataBudget(budget, 0, encodedMetadataLength(value));
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Object.is(value, -0)) {
+      throw new P2PError('INVALID_FRAME', 'File metadata numbers must be finite and wire-stable');
+    }
+    consumeMetadataBudget(budget, 0, 9);
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    if (
+      Object.getPrototypeOf(value) !== Uint8Array.prototype &&
+      Object.getPrototypeOf(value) !== Buffer.prototype
+    ) throw new P2PError('INVALID_FRAME', 'File metadata must contain only plain byte arrays');
+    if (
+      Object.getOwnPropertyDescriptor(value, 'byteLength') ||
+      Object.getOwnPropertyDescriptor(value, 'constructor') ||
+      Object.getOwnPropertyDescriptor(value, Symbol.iterator)
+    ) throw new P2PError('INVALID_FRAME', 'File metadata byte arrays must be accessor-free');
+    consumeMetadataBudget(budget, 0, checkedMetadataLength(value.byteLength));
+    return new Uint8Array(value);
+  }
   if (typeof value !== 'object') throw new P2PError('INVALID_FRAME', 'File metadata contains an unsupported value');
   if (depth >= 16) throw new P2PError('RESOURCE_LIMIT', 'File metadata nesting is too deep');
   if (seen.has(value)) throw new P2PError('INVALID_FRAME', 'File metadata must not contain cycles');
@@ -190,26 +303,117 @@ function clonePlainData(
   if (!isArray && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
     throw new P2PError('INVALID_FRAME', 'File metadata must contain only plain data');
   }
-  const entries: Array<readonly [string, unknown]> = isArray
-    ? Array.from({ length: value.length }, (_, index) => [String(index), value[index]] as const)
-    : Object.entries(value as Record<string, unknown>);
-  counter.items += entries.length;
-  if (counter.items > 4096) throw new P2PError('RESOURCE_LIMIT', 'File metadata contains too many values');
-  const clone: unknown[] | Record<string, unknown> = isArray ? [] : Object.create(null) as Record<string, unknown>;
-  for (const [key, item] of entries) {
-    if (textEncoder.encode(key).byteLength > 1024 || hasControlCharacters(key)) {
+  consumeMetadataBudget(budget, 0, 5);
+  if (isArray) {
+    if (
+      value.length > 4096 - budget.items ||
+      value.length > budget.maxBytes - budget.estimatedBytes
+    ) {
+      throw new P2PError('RESOURCE_LIMIT', 'File metadata array exceeds configured limits');
+    }
+    const clone: unknown[] = [];
+    let elements = 0;
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+        throw new P2PError('INVALID_FRAME', 'File metadata arrays must be dense and accessor-free');
+      }
+      if (key === 'length') continue;
+      if (
+        typeof key !== 'string' ||
+        !descriptor.enumerable ||
+        !/^(?:0|[1-9]\d*)$/.test(key) ||
+        Number(key) >= value.length
+      ) {
+        throw new P2PError('INVALID_FRAME', 'File metadata arrays must not contain extra properties');
+      }
+      elements += 1;
+    }
+    if (elements !== value.length) {
+      throw new P2PError('INVALID_FRAME', 'File metadata arrays must be dense and accessor-free');
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+        throw new P2PError('INVALID_FRAME', 'File metadata arrays must be dense and accessor-free');
+      }
+      clone.push(clonePlainData(descriptor.value, depth + 1, budget, seen));
+    }
+    seen.delete(value);
+    return clone;
+  }
+
+  const clone = Object.create(null) as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') {
       throw new P2PError('INVALID_FRAME', 'File metadata contains an invalid key');
     }
-    const cloned = clonePlainData(item, depth + 1, counter, seen);
-    if (isArray) (clone as unknown[]).push(cloned);
-    else Object.defineProperty(clone, key, { value: cloned, enumerable: true, writable: true, configurable: true });
+    const keyBytes = Buffer.byteLength(key);
+    if (
+      keyBytes > 1024 ||
+      hasControlCharacters(key) ||
+      key === '__proto__' ||
+      key === 'constructor' ||
+      key === 'prototype'
+    ) {
+      throw new P2PError('INVALID_FRAME', 'File metadata contains an invalid key');
+    }
+    consumeMetadataBudget(budget, 1, checkedMetadataLength(keyBytes));
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new P2PError('INVALID_FRAME', 'File metadata objects must be accessor-free');
+    }
+    Object.defineProperty(clone, key, {
+      value: clonePlainData(descriptor.value, depth + 1, budget, seen),
+      enumerable: true,
+      writable: true,
+      configurable: true
+    });
   }
   seen.delete(value);
   return clone;
 }
 
+function dataProperty(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+    throw new P2PError('INVALID_FRAME', 'File manifest fields must be enumerable data properties');
+  }
+  return descriptor.value;
+}
+
+function consumeMetadataBudget(
+  budget: { items: number; estimatedBytes: number; readonly maxBytes: number },
+  items: number,
+  bytes: number
+): void {
+  if (
+    !Number.isSafeInteger(items) ||
+    !Number.isSafeInteger(bytes) ||
+    budget.items + items > 4096
+  ) {
+    throw new P2PError('RESOURCE_LIMIT', 'File metadata contains too many values');
+  }
+  if (bytes > budget.maxBytes - budget.estimatedBytes) {
+    throw new P2PError('RESOURCE_LIMIT', `File metadata exceeds ${budget.maxBytes} bytes`);
+  }
+  budget.items += items;
+  budget.estimatedBytes += bytes;
+}
+
+function encodedMetadataLength(value: string): number {
+  return checkedMetadataLength(Buffer.byteLength(value));
+}
+
+function checkedMetadataLength(length: number): number {
+  if (!Number.isSafeInteger(length) || length < 0 || length > Number.MAX_SAFE_INTEGER - 5) {
+    throw new P2PError('RESOURCE_LIMIT', 'File metadata length is invalid');
+  }
+  return length + 5;
+}
+
 function cloneAndFreezePlainData(value: unknown): unknown {
-  if (value instanceof Uint8Array) return value.slice();
+  if (value instanceof Uint8Array) return new Uint8Array(value);
   if (Array.isArray(value)) return Object.freeze(value.map(cloneAndFreezePlainData));
   if (value !== null && typeof value === 'object') {
     const clone = Object.create(null) as Record<string, unknown>;

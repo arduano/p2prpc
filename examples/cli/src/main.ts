@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises';
-import { basename, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 import { initTRPC } from '@trpc/server';
 import { z } from 'zod';
 import {
@@ -14,7 +15,7 @@ const t = initTRPC.context<PeerContext>().create();
 const router = t.router({
   hello: t.procedure.input(z.object({ name: z.string() })).query(({ input, ctx }) => ({
     message: `Hello ${input.name}`,
-    from: ctx.peer.id
+    from: ctx.p2p.peer.id
   })),
   ticks: t.procedure.input(z.number().int().min(1).max(20)).subscription(async function* ({ input, signal }) {
     for (let index = 1; index <= input && !signal?.aborted; index += 1) {
@@ -43,11 +44,18 @@ const node = await createP2PNode({
     // verified principal and requested RPC/file action.
     authorize: () => true
   }),
+  // Demo-only: this CLI deliberately accepts the route hints in the supplied
+  // ticket. Production services must check trusted address/relay allowlists.
+  iroh: {
+    allowDirectAddress: () => true,
+    allowRelayUrl: () => true
+  },
   createContext: (context) => context,
   onIncomingFile: (offer) => {
-    const output = resolve(downloadDirectory, basename(offer.manifest.name));
+    // The remote name is display metadata, never a destination selector.
+    const output = resolve(downloadDirectory, `${randomUUID()}.incoming`);
     console.log(`Accepting ${offer.manifest.name} (${offer.manifest.size} bytes) into ${output}`);
-    offer.accept(fileDestination(output));
+    return { accept: fileDestination(output) };
   },
   onTransferProgress: (progress) => {
     const percent = progress.totalBytes === 0 ? 100 : (progress.transferredBytes / progress.totalBytes) * 100;

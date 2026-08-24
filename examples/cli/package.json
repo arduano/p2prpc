@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@p2prpc/core": "*",
-    "@trpc/server": "^11.18.0",
+    "@trpc/server": "11.18.0",
     "superjson": "^2.2.6",
     "zod": "^4.4.3"
   },

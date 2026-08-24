@@ -9,45 +9,64 @@ import { RpcFrameKind, StreamKind, writeFrame, writeStreamKind } from '../src/pr
 import { serializeValue } from '../src/rpc/wire.js';
 import type { QuicSendStream } from '../src/transport/types.js';
 import {
-  createP2PNode,
   createSharedSecretSecurity,
-  dangerouslyAllowInsecureSessions,
   fileDestination,
   fileSource,
   p2pRpcContext,
   type ConnectOptions,
   type P2PNode,
-  type PeerContext,
-  type SessionCredential,
-  type SessionSecurity
+  type P2PRequestFiles,
+  type Peer,
+  type PeerContext
 } from '../src/index.js';
+import { createAdvancedP2PNode as createP2PNode } from '../src/node.js';
+import { dangerouslyAllowInsecureSessions } from '../src/security/shared-secret.js';
+import type { SessionCredential, SessionSecurity } from '../src/security/types.js';
+import { IrohEndpoint } from '../src/transport/iroh.js';
 
 const t = initTRPC.context<PeerContext>().create();
 const requireTenantHeader = t.middleware(({ ctx, next }) => {
-  if (ctx.request.headers['x-tenant-id'] !== 'tenant-a') {
+  if (ctx.p2p.request.headers['x-tenant-id'] !== 'tenant-a') {
     throw new TRPCError({ code: 'FORBIDDEN', message: 'missing tenant metadata' });
   }
   return next();
 });
 let protectedInvocations = 0;
+let pullSourcePath: string | undefined;
+let capturedRequestFiles: P2PRequestFiles | undefined;
 const router = t.router({
   add: t.procedure.input(z.object({ left: z.number(), right: z.number() })).query(({ input, ctx }) => ({
     value: input.left + input.right,
-    peer: ctx.peer.id
+    peer: ctx.p2p.peer.id
   })),
   fail: t.procedure.query(() => {
     throw new TRPCError({ code: 'FORBIDDEN', message: 'integration denied' });
   }),
   inspectSecurity: t.procedure.use(requireTenantHeader).query(({ ctx }) => ({
-    tenant: ctx.request.headers['x-tenant-id'],
-    subject: ctx.auth.principal.subject,
-    sessionId: ctx.auth.id,
+    tenant: ctx.p2p.request.headers['x-tenant-id'],
+    subject: ctx.p2p.auth.principal.subject,
+    sessionId: ctx.p2p.auth.id,
     contextFrozen: Object.isFrozen(ctx),
-    connectionFacadeFrozen: Object.isFrozen(ctx.connection)
+    p2pContextFrozen: Object.isFrozen(ctx.p2p),
+    hasUnreservedAuthAlias: Object.hasOwn(ctx, 'auth'),
+    connectionFacadeFrozen: Object.isFrozen(ctx.p2p.connection),
+    filesFacadeFrozen: Object.isFrozen(ctx.p2p.files)
   })),
   protectedMutation: t.procedure.mutation(() => {
     protectedInvocations += 1;
     return 'should-not-run';
+  }),
+  requestFile: t.procedure.query(async ({ ctx }) => {
+    if (!pullSourcePath) throw new TRPCError({ code: 'NOT_FOUND' });
+    return ctx.p2p.files.share(await fileSource(pullSourcePath), { maxDownloads: 1 });
+  }),
+  captureFileFacade: t.procedure.mutation(({ ctx }) => {
+    capturedRequestFiles = ctx.p2p.files;
+    return ctx.p2p.files.share({
+      name: 'captured.bin',
+      size: 0,
+      readChunk: async () => new Uint8Array()
+    });
   }),
   count: t.procedure.input(z.number().int().positive()).subscription(async function* ({ input, signal }) {
     for (let index = 0; index < input && !signal?.aborted; index += 1) yield index;
@@ -59,13 +78,16 @@ const nodes: Array<P2PNode<Router>> = [];
 const directories: string[] = [];
 afterEach(async () => {
   protectedInvocations = 0;
+  pullSourcePath = undefined;
+  capturedRequestFiles = undefined;
   await Promise.all(nodes.splice(0).map((node) => node.close()));
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 async function makeNode(
   onIncomingFile?: Parameters<typeof createP2PNode<Router>>[0]['onIncomingFile'],
-  security = dangerouslyAllowInsecureSessions()
+  security = dangerouslyAllowInsecureSessions(),
+  onPeer?: (peer: Peer<Router>) => void
 ): Promise<P2PNode<Router>> {
   const node = await createP2PNode({
     router,
@@ -73,13 +95,101 @@ async function makeNode(
     createContext: (context) => context,
     security,
     ...(onIncomingFile ? { onIncomingFile } : {}),
-    iroh: { relayMode: 'disabled' }
+    ...(onPeer ? { onPeer: (peer) => onPeer(peer as Peer<Router>) } : {}),
+    iroh: {
+      relayMode: 'disabled',
+      // The integration topology is an explicitly trusted local lab.
+      allowDirectAddress: () => true
+    }
   });
   nodes.push(node);
   return node;
 }
 
 describe('Iroh integration', () => {
+  it('connects over advertised LAN addresses with relays genuinely disabled', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc-relayless-lan-regression');
+    const allowNonLoopback = (address: string) => !address.startsWith('127.') && !address.startsWith('[::1]');
+    const receiver = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      bindAddress: '0.0.0.0:0',
+      allowAdvertisedAddress: allowNonLoopback,
+      allowDirectAddress: () => true
+    });
+    const sender = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      bindAddress: '0.0.0.0:0',
+      allowAdvertisedAddress: allowNonLoopback,
+      allowDirectAddress: () => true
+    });
+    try {
+      const ticket = await receiver.createTicket();
+      const encoded = ticket.split('.')[1];
+      expect(encoded).toBeDefined();
+      const locator = JSON.parse(Buffer.from(encoded!, 'base64url').toString('utf8')) as {
+        directAddresses: string[];
+        relayUrl: string | null;
+      };
+      expect(locator.relayUrl).toBeNull();
+      expect(locator.directAddresses.length).toBeGreaterThan(0);
+      expect(locator.directAddresses.every(allowNonLoopback)).toBe(true);
+
+      const incoming = receiver.accept();
+      const outbound = await sender.connect(ticket, alpn, receiver.id);
+      const inbound = await incoming;
+      expect(inbound).not.toBeNull();
+
+      const accepted = inbound!.acceptUni();
+      const send = await outbound.openUni();
+      await send.writeAll(Uint8Array.of(0x2a));
+      await send.finish();
+      const recv = await accepted;
+      await expect(recv.readExact(1)).resolves.toEqual(Uint8Array.of(0x2a));
+      await expect(recv.expectEnd()).resolves.toBeUndefined();
+    } finally {
+      await Promise.allSettled([sender.close(), receiver.close()]);
+    }
+  });
+
+  it('keeps a session reusable after defensive cleanup follows premature EOF', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc-reader-cleanup-regression');
+    const receiver = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      allowDirectAddress: () => true
+    });
+    const sender = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'disabled' },
+      allowDirectAddress: () => true
+    });
+    try {
+      const incoming = receiver.accept();
+      const outbound = await sender.connect(await receiver.createTicket(), alpn, receiver.id);
+      const inbound = await incoming;
+      expect(inbound).not.toBeNull();
+
+      const firstIncoming = inbound!.acceptUni();
+      const firstSend = await outbound.openUni();
+      await firstSend.writeAll(Uint8Array.of(1));
+      await firstSend.finish();
+      const firstRecv = await firstIncoming;
+      await expect(firstRecv.readExact(2)).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      // readExact() already observed EOF and released the native reader. A
+      // later defensive stop must be an idempotent success, not an attempt to
+      // cancel the detached WHATWG reader.
+      await expect(firstRecv.stop(3n)).resolves.toBeUndefined();
+
+      const canaryIncoming = inbound!.acceptUni();
+      const canarySend = await outbound.openUni();
+      await canarySend.writeAll(Uint8Array.of(2));
+      await canarySend.finish();
+      const canaryRecv = await canaryIncoming;
+      await expect(canaryRecv.readExact(1)).resolves.toEqual(Uint8Array.of(2));
+      await expect(canaryRecv.expectEnd()).resolves.toBeUndefined();
+    } finally {
+      await Promise.allSettled([sender.close(), receiver.close()]);
+    }
+  });
+
   it('serializes only the canonical credential fields during mutual authentication', { timeout: 30_000 }, async () => {
     const authenticatedCredentials: SessionCredential[] = [];
     const credentialContextsFrozen: boolean[] = [];
@@ -196,7 +306,7 @@ describe('Iroh integration', () => {
 
     const receiver = await makeNode((offer) => {
       expect(Object.isFrozen(offer)).toBe(true);
-      offer.accept(fileDestination(pushedPath));
+      return { accept: fileDestination(pushedPath) };
     });
     const sender = await makeNode();
     const peer = await sender.connect<Router>(nodeTarget(receiver));
@@ -208,7 +318,10 @@ describe('Iroh integration', () => {
       tenant: 'tenant-a',
       subject: sender.id,
       contextFrozen: true,
-      connectionFacadeFrozen: true
+      p2pContextFrozen: true,
+      hasUnreservedAuthAlias: false,
+      connectionFacadeFrozen: true,
+      filesFacadeFrozen: true
     });
     await expect(peer.rpc.inspectSecurity.query()).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } });
     await expect(peer.rpc.fail.query()).rejects.toMatchObject({ message: 'integration denied', data: { code: 'FORBIDDEN' } });
@@ -228,10 +341,27 @@ describe('Iroh integration', () => {
     expect(callResults.map((result) => result.value)).toEqual(Array.from({ length: 25 }, (_, index) => index + 1));
     expect(await readFile(pushedPath)).toEqual(content);
 
-    const handle = receiver.files.share(await fileSource(sourcePath), { allowedPeerIds: [sender.id], maxDownloads: 1 });
+    pullSourcePath = sourcePath;
+    const handle = await peer.rpc.requestFile.query();
     const pull = await peer.files.download(handle, fileDestination(pulledPath));
     await pull.result;
     expect(await readFile(pulledPath)).toEqual(content);
+  });
+
+  it('invalidates captured request file facades with their exact authenticated session', { timeout: 30_000 }, async () => {
+    const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
+    const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
+    const handle = await peer.rpc.captureFileFacade.mutate();
+    expect(capturedRequestFiles).toBeDefined();
+
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    expect(() => capturedRequestFiles!.share({
+      name: 'stale.bin',
+      size: 0,
+      readChunk: async () => new Uint8Array()
+    })).toThrow(expect.objectContaining({ code: 'UNAUTHORIZED' }));
+    expect(() => capturedRequestFiles!.revoke(handle)).toThrow(expect.objectContaining({ code: 'UNAUTHORIZED' }));
   });
 });
 

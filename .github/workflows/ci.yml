@@ -28,20 +28,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies without undeclared lifecycle scripts
+        run: npm ci --strict-allow-scripts
       - name: Validate GitHub Actions workflows
         shell: bash
-        run: |
-          archive="$RUNNER_TEMP/actionlint.tar.gz"
-          destination="$RUNNER_TEMP/actionlint"
-          mkdir -p "$destination"
-          curl --fail --silent --show-error --location \
-            --output "$archive" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" | sha256sum --check
-          tar --extract --gzip --file "$archive" --directory "$destination" actionlint
-          "$destination/actionlint"
+        run: bash scripts/check-github-actions.sh
       - name: Lint
         run: npm run lint
       - name: Typecheck
@@ -54,10 +45,31 @@ jobs:
         run: npm test
       - name: Build package
         run: npm run build
+      - name: Create exact package artifact
+        id: package
+        shell: bash
+        run: |
+          artifact_directory="$RUNNER_TEMP/npm-artifact"
+          npm run pack:artifact -- "$artifact_directory"
+          tarball="$(jq -er '.[0].filename' "$artifact_directory/pack.json")"
+          echo "artifact=$artifact_directory/$tarball" >> "$GITHUB_OUTPUT"
+          echo "metadata=$artifact_directory/pack.json" >> "$GITHUB_OUTPUT"
+      - name: Enforce package content and license policy
+        run: npm run check:package-content -- "${{ steps.package.outputs.artifact }}" "${{ steps.package.outputs.metadata }}"
+      - name: Lint packed package metadata
+        run: npm run check:package-publint -- "${{ steps.package.outputs.artifact }}"
+      - name: Validate packed TypeScript resolution
+        run: npm run check:package-types -- "${{ steps.package.outputs.artifact }}"
+      - name: Exercise an install-script-free packed consumer
+        run: npm run test:packed -- "${{ steps.package.outputs.artifact }}"
+      - name: Generate and validate runtime SBOM and registry signatures
+        run: >-
+          npm run generate:release-sbom --
+          "${{ steps.package.outputs.artifact }}"
+          "$RUNNER_TEMP/npm-artifact/sbom.cdx.json"
+          "$RUNNER_TEMP/npm-artifact/registry-signatures.json"
       - name: Build documentation
         run: npm run docs:build
-      - name: Inspect package contents
-        run: npm pack --dry-run -w @p2prpc/core
       - name: Audit dependencies
         run: npm audit --audit-level=low
 
@@ -91,12 +103,16 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies without undeclared lifecycle scripts
+        run: npm ci --strict-allow-scripts
       - name: Run unit and security tests
         run: npm test
       - name: Run native Iroh integration tests
         run: npm run test:integration
+      - name: Build and pack the consumer artifact
+        run: npm run build && npm run pack:artifact -- package-artifact
+      - name: Exercise the tree-shaken packed native boundary
+        run: npm run test:tree-shaken-native -- package-artifact
 
   minimum-runtime:
     name: Minimum runtime / Node 20.3.1
@@ -112,13 +128,15 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies without undeclared lifecycle scripts
+        run: npm ci --strict-allow-scripts
       - name: Build package
         run: npm run build
+      - name: Pack the minimum-runtime artifact
+        run: npm run pack:artifact -- package-artifact
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20.3.1
       - name: Exercise the published runtime boundary
-        run: npm run test:minimum-runtime
+        run: npm run test:minimum-runtime && npm run test:packed -- package-artifact

@@ -20,8 +20,50 @@ export interface FileSource<TMetadata = unknown> {
   readonly name: string;
   readonly size: number;
   readonly metadata?: TMetadata;
+  /**
+   * Advanced lifecycle used to retain validated resources through hashing and
+   * transmission. The manager always calls close(), including on cancellation.
+   */
+  prepare?(signal?: AbortSignal): Promise<PreparedFileSource<TMetadata>>;
   /** Custom sources must settle promptly when signal aborts. */
   readChunk(index: number, chunkSize: number, signal?: AbortSignal): Promise<Uint8Array>;
+}
+
+export interface PreparedFileSource<TMetadata = unknown> {
+  readonly name: string;
+  readonly size: number;
+  readonly metadata?: TMetadata;
+  readChunk(index: number, chunkSize: number, signal?: AbortSignal): Promise<Uint8Array>;
+  close(): Promise<void>;
+}
+
+/** Structural subset of Standard Schema v1 used for runtime file metadata validation. */
+export interface FileMetadataSchema<TMetadata> {
+  readonly '~standard': {
+    readonly version: 1;
+    readonly vendor: string;
+    readonly validate: (
+      value: unknown
+    ) => FileMetadataSchemaResult<TMetadata> | Promise<FileMetadataSchemaResult<TMetadata>>;
+  };
+}
+
+export type FileMetadataSchemaResult<TMetadata> =
+  | { readonly value: TMetadata; readonly issues?: undefined }
+  | { readonly issues: readonly unknown[]; readonly value?: undefined };
+
+/**
+ * Explicit irreversible-boundary signal for a destination commit.
+ *
+ * `markCommitted()` must be called exactly once, immediately after durable
+ * output becomes externally visible and before any fallible post-commit
+ * cleanup. The transfer manager uses that synchronous signal to ensure a
+ * later cleanup failure can never cause rollback, a contradictory Reject, or
+ * an unsafe automatic retry of an already-published file.
+ */
+export interface FileDestinationFinalizeContext {
+  readonly signal?: AbortSignal;
+  readonly markCommitted: () => void;
 }
 
 export interface FileDestination<TMetadata = unknown> {
@@ -33,10 +75,13 @@ export interface FileDestination<TMetadata = unknown> {
   writeChunk(manifest: FileManifest<TMetadata>, index: number, data: Uint8Array, signal?: AbortSignal): Promise<void>;
   /**
    * Verify the complete staged content against manifest.digest immediately
-   * before atomically publishing it. Per-chunk transport checks are not a
-   * substitute for this storage-side final verification.
+   * before atomically publishing it, then call `context.markCommitted()` at
+   * the exact publication boundary. Per-chunk transport checks are not a
+   * substitute for this storage-side final verification. Rejecting before
+   * `markCommitted()` asserts that publication did not happen; rejecting
+   * afterward reports only post-commit cleanup uncertainty.
    */
-  finalize(manifest: FileManifest<TMetadata>, signal?: AbortSignal): Promise<void>;
+  finalize(manifest: FileManifest<TMetadata>, context: FileDestinationFinalizeContext): Promise<void>;
   abort(manifest: FileManifest<TMetadata>, options: { discard: boolean }, signal?: AbortSignal): Promise<void>;
 }
 
@@ -48,11 +93,15 @@ export interface FileOffer<TMetadata = unknown> {
   /** Aborts if the authenticated connection/session expires or the offer decision times out. */
   readonly signal: AbortSignal;
   readonly manifest: FileManifest<TMetadata>;
-  accept(destination: FileDestination<TMetadata>): void;
-  reject(reason?: string): void;
 }
 
-export type IncomingFileHandler<TMetadata = unknown> = (offer: FileOffer<TMetadata>) => Promise<void> | void;
+export type IncomingFileDecision<TMetadata = unknown> =
+  | { readonly accept: FileDestination<TMetadata>; readonly reject?: never }
+  | { readonly reject: true | string; readonly accept?: never };
+
+export type IncomingFileHandler<TMetadata = unknown> = (
+  offer: FileOffer<TMetadata>
+) => Promise<IncomingFileDecision<TMetadata>> | IncomingFileDecision<TMetadata>;
 
 export interface TransferProgress {
   readonly transferId: string;
@@ -69,6 +118,14 @@ export interface TransferResult<TMetadata = unknown> {
   readonly durationMs: number;
 }
 
+export interface FileTransfer<TMetadata = unknown> {
+  readonly manifest: FileManifest<TMetadata>;
+  readonly result: Promise<TransferResult<TMetadata>>;
+  cancel(reason?: unknown): void;
+  /** Each iterator is an independent, bounded, conflated subscription. */
+  progress(): AsyncIterable<TransferProgress>;
+}
+
 export interface SharedFileHandle {
   readonly token: string;
   readonly expiresAt?: number;
@@ -81,18 +138,16 @@ export interface PeerSharePolicy {
    * Defaults to five minutes and may not exceed registry policy.
    */
   readonly expiresAt?: number;
-  /** Optional exact binding to canonical authenticated principal identity tuples. */
-  readonly allowedPrincipals?: readonly FilePrincipalIdentity[];
-  /**
-   * Optional additional binding to OAuth/OIDC subjects or service accounts.
-   * @deprecated Subject values are issuer-scoped. Prefer allowedPrincipals.
-   */
-  readonly allowedSubjects?: readonly string[];
   /** Defaults to one distinct download operation. */
   readonly maxDownloads?: number;
 }
 
-export type SharePolicy = PeerSharePolicy & (
+/** Advanced registry policy; root peer APIs derive these bindings automatically. */
+export interface PrincipalBoundSharePolicy extends PeerSharePolicy {
+  readonly allowedPrincipals?: readonly (FilePrincipalIdentity | SessionPrincipal)[];
+}
+
+export type SharePolicy = PrincipalBoundSharePolicy & (
   | {
       /** One or more authenticated Iroh endpoint IDs allowed to redeem the capability. */
       readonly allowedPeerIds: readonly string[];
@@ -105,12 +160,19 @@ export type SharePolicy = PeerSharePolicy & (
     }
 );
 
-export interface SendFileOptions {
+interface FileTransferOptions {
   readonly signal?: AbortSignal;
   readonly lanes?: number;
   readonly chunkSize?: number;
-  readonly transferId?: string;
   readonly onProgress?: (progress: TransferProgress) => void;
 }
 
-export type DownloadFileOptions = SendFileOptions;
+export interface SendFileOptions extends FileTransferOptions {
+  /** Stable push operation ID; reuse only to reconcile the exact same manifest. */
+  readonly transferId?: string;
+}
+
+export interface DownloadFileOptions extends FileTransferOptions {
+  /** Stable capability-redemption operation ID used across reconnect/retry. */
+  readonly operationId?: string;
+}

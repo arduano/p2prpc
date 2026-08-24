@@ -105,9 +105,18 @@ describe('RPC link flow-control boundaries', () => {
   it('cleans up a stream that arrives after openBi timed out', async () => {
     const opened = deferred<QuicBiStream>();
     const stream = testStream();
-    const client = testClient({ connection: async () => testConnection(() => opened.promise) });
+    let openingSignal: AbortSignal | undefined;
+    let closeCalls = 0;
+    const connection = testConnection((options) => {
+      openingSignal = options?.signal;
+      return opened.promise;
+    });
+    connection.close = () => { closeCalls += 1; };
+    const client = testClient({ connection: async () => connection });
 
     await expect(client.ping.query()).rejects.toThrow('RPC stream opening timed out');
+    expect(openingSignal?.aborted).toBe(true);
+    expect(closeCalls).toBe(1);
     opened.resolve(stream);
     await waitUntil(() => stream.send.resetCalls === 1 && stream.recv.stopCalls === 1);
   });
@@ -122,7 +131,26 @@ describe('RPC link flow-control boundaries', () => {
     expect(stream.recv.stopCalls).toBe(1);
   });
 
-  it('bounds a flow-control-stalled request write', async () => {
+  it('quarantines the physical connection when stream cleanup cannot be confirmed', async () => {
+    const stream = testStream({
+      priority: async () => { throw new Error('priority failed'); },
+      reset: pending
+    });
+    const connection = testConnection(async () => stream);
+    let closeCalls = 0;
+    connection.close = () => {
+      closeCalls += 1;
+      throw new Error('secondary transport close failure');
+    };
+    const client = testClient({ connection: async () => connection });
+
+    await expect(client.ping.query()).rejects.toThrow('priority failed');
+    expect(closeCalls).toBe(1);
+    expect(stream.send.resetCalls).toBe(1);
+    expect(stream.recv.stopCalls).toBe(1);
+  });
+
+  it('bounds a flow-control-stalled request write and reports its outcome as unknown', async () => {
     const stalled = deferred<void>();
     const stream = testStream({
       write: (index) => index === 2 ? stalled.promise : Promise.resolve(),
@@ -130,7 +158,12 @@ describe('RPC link flow-control boundaries', () => {
     });
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toThrow('RPC request write timed out');
+    await expect(client.ping.query()).rejects.toMatchObject({
+      cause: {
+        code: 'OUTCOME_UNKNOWN',
+        cause: { message: 'RPC request write timed out' }
+      }
+    });
     expect(stream.send.writeCalls).toBe(2);
     expect(stream.send.maximumConcurrentWrites).toBe(1);
     expect(stream.send.resetCalls).toBe(1);
@@ -196,12 +229,17 @@ describe('RPC link flow-control boundaries', () => {
     expect(stream.recv.stopCalls).toBe(1);
   });
 
-  it('bounds a stalled response read and releases both stream halves', async () => {
+  it('keeps response liveness caller-controlled and cleans up on cancellation', async () => {
     const stream = testStream();
+    const controller = new AbortController();
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toThrow('RPC response frame timed out');
-    expect(stream.send.writeCalls).toBe(3);
+    const result = client.ping.query(undefined, { signal: controller.signal });
+    await waitUntil(() => stream.send.writeCalls === 3);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ cause: { code: 'OUTCOME_UNKNOWN' } });
+    expect(stream.send.writeCalls).toBe(5);
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
   });
@@ -233,7 +271,9 @@ describe('RPC link flow-control boundaries', () => {
     };
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toThrow('Trailing bytes');
+    await expect(client.ping.query()).rejects.toMatchObject({
+      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: expect.stringContaining('Trailing bytes') } }
+    });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.expectEndCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
@@ -248,7 +288,9 @@ describe('RPC link flow-control boundaries', () => {
     };
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toThrow('Unary RPC completed without a result');
+    await expect(client.ping.query()).rejects.toMatchObject({
+      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: 'Unary RPC completed without a result' } }
+    });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
   });
@@ -260,7 +302,11 @@ describe('RPC link flow-control boundaries', () => {
       const requestFrame = await readFrame<RpcRequest>(new BufferedRecv(bytes.slice(1)));
       await writeFrame(stream.recv, RpcFrameKind.Error, {
         id: requestFrame.value.id,
-        shape: { message: `bad\r\n\u0085\u202e${'é'.repeat(8_192)}` }
+        shape: {
+          code: -32600,
+          message: `bad\r\n\u0085\u202e${'é'.repeat(8_192)}`,
+          data: { code: 'BAD_REQUEST', httpStatus: 400, path: 'ping' }
+        }
       });
     };
     const client = testClient({ connection: async () => testConnection(async () => stream) });
@@ -271,6 +317,43 @@ describe('RPC link flow-control boundaries', () => {
     expect(outcome.message).not.toMatch(/[\r\n\u0085\u202e]/u);
     expect(outcome.message).toContain('bad????');
     expect(Buffer.byteLength(outcome.message)).toBeLessThanOrEqual(8 * 1024);
+  });
+
+  it.each([
+    { message: 'missing nested fields', shape: { message: 'bad' } },
+    {
+      message: 'unknown nested fields',
+      shape: {
+        code: -32600,
+        message: 'bad',
+        data: { code: 'BAD_REQUEST', httpStatus: 400, path: 'ping', secret: 'smuggled' }
+      }
+    },
+    {
+      message: 'invalid nested types',
+      shape: {
+        code: -32600,
+        message: 'bad',
+        data: { code: 'BAD_REQUEST', httpStatus: '400', path: 'ping' }
+      }
+    }
+  ])('rejects $message in an authenticated peer error shape', async ({ shape }) => {
+    const stream = testStream();
+    stream.send.afterWrite = async (index, bytes) => {
+      if (index !== 3) return;
+      const requestFrame = await readFrame<RpcRequest>(new BufferedRecv(bytes.slice(1)));
+      await writeFrame(stream.recv, RpcFrameKind.Error, {
+        id: requestFrame.value.id,
+        shape
+      });
+    };
+    const client = testClient({ connection: async () => testConnection(async () => stream) });
+
+    await expect(client.ping.query()).rejects.toMatchObject({
+      cause: { code: 'OUTCOME_UNKNOWN', cause: { code: 'INVALID_FRAME' } }
+    });
+    expect(stream.send.resetCalls).toBe(1);
+    expect(stream.recv.stopCalls).toBe(1);
   });
 
   it('bounds terminal finish cleanup and falls back to reset', async () => {
@@ -303,7 +386,7 @@ function testClient(options: {
   });
 }
 
-function testConnection(openBi: () => Promise<QuicBiStream>): QuicConnection {
+function testConnection(openBi: QuicConnection['openBi']): QuicConnection {
   return {
     remoteId: 'remote',
     side: 'client',
@@ -318,8 +401,7 @@ function testConnection(openBi: () => Promise<QuicBiStream>): QuicConnection {
       sentBytes: 0,
       receivedBytes: 0,
       lostPackets: 0
-    }),
-    configure: () => undefined
+    })
   };
 }
 
@@ -327,7 +409,7 @@ function testStream(options: {
   priority?: () => Promise<void>;
   write?: (index: number, data: Uint8Array) => Promise<void>;
   finish?: () => Promise<void>;
-  reset?: () => void;
+  reset?: () => Promise<void> | void;
 } = {}): { send: RecordingSend; recv: BufferedRecv } {
   return {
     send: new RecordingSend(options),
@@ -360,7 +442,7 @@ class RecordingSend implements QuicSendStream {
     priority?: () => Promise<void>;
     write?: (index: number, data: Uint8Array) => Promise<void>;
     finish?: () => Promise<void>;
-    reset?: () => void;
+    reset?: () => Promise<void> | void;
   }) {}
 
   async writeAll(data: Uint8Array): Promise<void> {
@@ -384,7 +466,7 @@ class RecordingSend implements QuicSendStream {
 
   async reset(): Promise<void> {
     this.resetCalls += 1;
-    this.options.reset?.();
+    await this.options.reset?.();
   }
 
   async setPriority(): Promise<void> {

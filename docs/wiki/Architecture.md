@@ -1,82 +1,93 @@
 # Architecture
 
-[Home](Home.md) · [Data model](Data-Model.md) · [Lifecycles](Lifecycles.md) · [Security model](Security-Model.md) · [Files](File-Transfers.md) · [Audit guide](Audit-Guide.md) · [Validation](Production-Validation.md)
+p2prpc keeps routing, transport identity, application identity, authorization, RPC, and bulk bytes as separate layers. The separation is the main correctness mechanism.
 
-## Component model
+## Layers
 
 ```text
-┌──────────────────────── application boundary ────────────────────────┐
-│ tRPC router + middleware             typed remote tRPC proxy          │
-│ storage authorization                FileSource / FileDestination     │
-│ business policy                      audit and quota services         │
-└──────────────────────────────┬────────────────────────────────────────┘
-                               │
-┌──────────────────────── p2prpc core ─────────────────────────────────┐
-│ P2PNode                                                              │
-│ ├─ outbound target: locator + expected endpoint + principal          │
-│ ├─ peer runtimes: connection + authenticated session                 │
-│ ├─ RPC link/server: framing, metadata, dispatch, cancellation        │
-│ ├─ transfer managers: control, lanes, retries, integrity             │
-│ ├─ share registry: hashed capabilities and operation state           │
-│ └─ SessionSecurity: credentials, authentication, authorization       │
-└──────────────────────────────┬────────────────────────────────────────┘
-                               │
-┌────────────────────── transport and network ────────────────────────┐
-│ explicit route locator + independent target expectations            │
-│        → Iroh endpoint → encrypted multiplexed QUIC                 │
-└─────────────────────────────────────────────────────────────────────┘
+application procedures and storage policy
+─────────────────────────────────────────
+tRPC runtime schemas and middleware
+  reads verified ctx.p2p + untrusted request headers
+─────────────────────────────────────────
+p2prpc operation policy
+  authorize RPC path/type or file push/pull
+─────────────────────────────────────────
+p2prpc wire v4 session
+  mutual credential-handshake v3 and expiring principal
+─────────────────────────────────────────
+managed QUIC streams
+  admission, buffering, priority, cancellation, exact cleanup
+─────────────────────────────────────────
+Iroh QUIC
+  encryption, endpoint key proof, multiplexing, relay/direct paths
+─────────────────────────────────────────
+locator/discovery
+  signed ticket, DNS/PKARR, or mDNS reachability hints
 ```
 
-`P2PNode` is symmetrical: every node can accept connections, initiate connections, expose a router, invoke a remote router, and send or receive files. “Client” and “server” describe one QUIC connection or stream, not a permanent node role.
+No lower layer silently grants the authority of a higher one. In particular, knowing a node ID or ticket cannot dispatch application work.
 
-## Stream layout
+## One connection, independent streams
 
-| Stream | Direction | Multiplicity | Purpose |
-|---|---|---:|---|
-| Session authentication | Bidirectional | Exactly one before activation | Mutual credentials, challenges, session agreement. |
-| RPC | Bidirectional | One per query, mutation, or subscription | Request metadata/input, results, error, completion, cancellation. |
-| Transfer control | Bidirectional | One per transfer attempt | Authorization setup, manifest, resume ranges, attempt credentials, completion. |
-| Transfer data | Unidirectional | Bounded parallel lanes | Indexed chunks and per-chunk digests. |
+Each RPC owns one bidirectional stream. A file operation owns one bidirectional control stream and a bounded number of unidirectional data lanes. There is no application-level shared write lock, so a slow file lane cannot serialize unrelated RPC traffic. QUIC provides transport flow control; the scheduler bounds work before opening outbound streams or dispatching accepted inbound streams.
 
-Streams share QUIC encryption, congestion control, and connection flow control but avoid stream-level head-of-line blocking. The current native adapter does not expose effective stream priorities, so `setPriority()` is only an architectural hint.
+Locally opened streams pass through `ManagedConnection`. Its lease remains until both halves reach a terminal operation. A pre-aborted open never reaches native QUIC. Once native opening begins, cancellation rejects the caller promptly and quarantines the multiplexed physical connection; admission remains charged until native rejection, terminal cleanup of a late stream, or fulfilled physical closure. A rejected `closed()` observation is not proof and releases nothing. Inbound streams acquire admission before their kind is dispatched.
 
-## Protocol layers
+Connection/session owners and receiver commit ownership are deliberately different. A replacement connection gets a fresh authenticated session and transfer manager, while the receiver reconciliation ledger belongs to the node. This lets exact push retries reconcile across physical replacement and same-process runtime revival without carrying streams, session signals, or other connection resources forward. Hard records are bounded per peer, canonical principal, and node and cannot be capacity-evicted; replay tombstones use separate evictable bounds at those scopes. Deadline-indexed expiry avoids a whole-ledger scan on each request. The ledger is process-local, not crash-durable.
 
-| Layer | Establishes | Deliberately does not establish |
-|---|---|---|
-| Locator | A signed ticket attests its endpoint/routes/protocol/times; DNS/PKARR and mDNS instead resolve routes for the separately named endpoint | Enterprise ownership, expected application principal, or operation permission |
-| Outbound target expectations | Exact endpoint and application-principal tuple the caller intended, sourced independently of the locator | Proof that the endpoint or principal is authentic; later transport and handshake checks provide that proof |
-| Iroh transport | Confidential channel and possession of the endpoint Ed25519 key | OAuth identity or business authorization |
-| Application handshake | Mutual principals, transcript-bound session ID, contract match, and session expiry | Permission for an individual operation |
-| Operation policy | RPC path/type or file push/pull permission | Trust in inputs, metadata, paths, names, or content |
-| File capability | A bounded grant to one local source | Authentication of an unknown endpoint or principal |
+File retry authority is connection-attempt-local and never travels through an application-visible exception. Only a typed transport-loss observation made by the current attempt can become a retry candidate, and it becomes retryable only after that attempt proves its streams drained and its prepared source closed. Callbacks receive ordinary sanitized errors, so retaining or rethrowing an earlier attempt's abort reason cannot authorize a later retry.
 
-## Type safety and runtime trust
+## Correctness by construction
 
-tRPC supplies compile-time procedure paths and input/output inference. At runtime:
+The implementation uses these design rules rather than scattered recovery branches:
 
-- `connect<RemoteRouter>({ locator, expectedPeerId, expectedPrincipal })` enforces the target fields at runtime, but the `RemoteRouter` generic itself remains a caller-side TypeScript assertion; it does not negotiate or verify the remote router schema.
-- `contractVersion` is an application-managed compatibility label, not schema negotiation. Peers only compare the configured string.
-- MessagePack envelopes are size-, item-, and depth-bounded before decode.
-- RPC values use SuperJSON inside the validated envelope.
-- Application input parsers such as Zod remain responsible for RPC input validation.
-- TypeScript types disappear on the wire and never prove identity or authorization.
+1. Validate exact keys and bounds at every wire/configuration boundary.
+2. Snapshot caller-owned configuration and identity values before the first relevant `await`.
+3. Give each stream, callback, transfer, prepared source, destination reservation, and capability operation one owner.
+4. Release ownership exactly once in a terminal path; late native results are still closed.
+5. Carry retry decisions as private attempt-local outcomes, never infer them from caller-visible errors or error codes.
+6. Admit memory/concurrency before starting expensive work.
+7. Treat transport failure after a mutation or transfer commit boundary as `OUTCOME_UNKNOWN`, never as permission for an implicit retry.
+8. Keep route discovery separate from expected endpoint and principal trust.
 
-## Protocol identity
+MessagePack bodies are byte-, item-, and depth-limited. RPC values use a private SuperJSON codec with an acyclic built-in-only wire model; global application transformers, classes, symbols, aliases, and cycles are excluded. Outbound shape is preflighted before SuperJSON or MessagePack allocation. Inbound MessagePack is scanned before decoding, then annotation targets are semantically checked before built-in values are constructed.
 
-Nodes must match `p2prpc/2/<applicationId>/<contractVersion>`. A signed ticket carries the contract hint; every locator mode checks the contract again in the authenticated transcript. This is application-contract isolation even though the current Iroh adapter does not expose a custom native QUIC ALPN.
+## Scheduling and backpressure
 
-## Routing and connectivity
+The node has a peer-fair scheduler with global, endpoint, and principal ceilings for:
 
-`ConnectOptions.locator` is one of `{ kind: 'ticket', ticket }`, `{ kind: 'dns' }`, or `{ kind: 'mdns', serviceName? }`. It selects the initial route strategy, not an exclusive native route source. DNS must be enabled at node creation and installs an endpoint-wide Iroh lookup that may be consulted after ticket or mDNS hints fail. An mDNS locator explicitly browses its service; node-level mDNS configuration selects the default service and automatic advertisement. `iroh.relay` independently selects the default network, credential-free HTTPS custom relay URLs, or disabled relays. Custom relay means relay-assisted, not relay-only, because Iroh may upgrade the path to direct.
+- handshakes;
+- streams;
+- outbound and inbound transfers as separate resources;
+- library-controlled frame/chunk buffers;
+- application callbacks;
+- queued admission requests.
 
-The complete locator and identity expectations are snapshotted. A physical reconnect reuses a signed ticket or resolves DNS/mDNS again, then repeats endpoint admission, application authentication, and principal matching. `createTicket()` freshly samples the endpoint's current direct addresses and home relay before signing; synchronous `ticket()` is a legacy snapshot and should not be used when current routes matter.
+Principal quotas are applied after authentication and aggregate all endpoint keys for that identity. Transfer admission is direction-separated. At every quota level, streams and buffers have four independent file reserves: outbound control, inbound control, outbound data, and inbound data. General work and the other directions cannot consume a file reserve. Each file class spends its own reserve first; all file overflow is summed into one borrowable pool, so idle reserves are never double-counted. File overflow cannot borrow the final general/RPC stream or its control-frame buffer. Configuration must therefore admit that protected general path plus all four file paths, and three control-frame buffers plus both data buffers. A data buffer covers the larger of a control frame or one maximum chunk plus its 64 KiB segmented-read transient.
 
-Egress callbacks inspect ticket and mDNS candidates before dial. DNS/PKARR currently fails closed if either callback is configured because the pinned native wrapper cannot expose its resolved candidates first; use a separate DNS-disabled endpoint when route-source isolation or filtering is required. mDNS defaults to LAN-scoped direct addresses and rejects default-network relay hints unless explicitly allowed. Custom relay candidates must belong to the configured origin set, and disabled endpoints reject them. Exact-pinned `@momics/iroh-http-node` 0.6.0 also makes disabled relays loopback-only; relay-less production operation is not claimed for this version.
+An accepted bidirectional stream must reveal its kind before the scheduler knows whether it is RPC or file control. One sequential accept loop per authenticated connection reads exactly that one byte under the header deadline, so at most one BI stream per connection exists before admission. It then tries the stream's real class directly: RPC uses general capacity and file control uses the inbound-control class. Saturated classes are load-shed instead of queued in the accept loop, and a blocked general waiter cannot hide an available directional reserve. Malformed, late, or uncleanable classifiers are terminated or quarantine the connection. This makes symmetric control and lane progress a quota invariant rather than a task-ordering assumption. Lanes allocate from a bounded bitmap/range plan. Progress observers see independent conflated iterators, so a slow observer retains only the latest event and cannot block transport progress.
 
-## Important ownership boundaries
+`maxBufferedBytes` is deliberately narrow and auditable: it accounts for simultaneous library-controlled handshake frames (64 KiB per admitted handshake), control-frame/RPC serialization buffers owned by an admitted stream, and file chunks owned by data streams. It does not claim to cap caller-owned input that already exists, application procedure/database memory, native QUIC flow-control buffers, or operating-system caches. Those require process/container limits and the native memory gate.
 
-- p2prpc owns framing, session continuity, bounded metadata, core authorization calls, capability enforcement, transfer integrity, and cleanup ordering.
-- tRPC owns router dispatch and input/output typing.
-- Iroh owns transport encryption and endpoint-key possession.
-- The application owns identity issuance, policy semantics, storage path selection, local adapter safety, rate limits, durable audit, idempotency, and content trust.
+## Application work
+
+Cancellation is cooperative in JavaScript: aborting a signal cannot kill an arbitrary application promise. p2prpc stops wire work promptly and retains ownership/accounting for registered callback or procedure work until it actually settles. Applications must observe supplied signals for prompt shutdown. Closing admission rejects queued/new work but retains active ownership; shutdown cannot undo side effects already started inside non-cooperative application code. `Peer.close()` and `node.close()` wait up to `shutdownTimeoutMs`, then reject with `TIMEOUT` while the still-live task/resource ledgers remain truthful. Node shutdown also closes receiver-ledger admission synchronously, but clears its reconciliation evidence only after all node-owned work actually settles.
+
+## API compartments
+
+| Import | Intended use |
+|---|---|
+| `@p2prpc/core` | Production-safe branded security factories, nodes, peers, metadata, and files. |
+| `@p2prpc/core/advanced` | Custom security/transport seams and raw protocol components; part of the deployment TCB. |
+| `@p2prpc/core/testing` | Injected endpoints and explicitly insecure sessions. Never ship in production code. |
+
+The alternate transport seam has a fail-closed shape check, but transport semantic conformance still requires the repository integration/lifecycle suite. Raw adapters must ignore managed stream-open options: the wrapper owns cancellation while continuing to observe the native promise, because an adapter must never reject early while a hidden native open can still produce a stream. `closed()` must fulfill only after the physical connection and all native streams are terminal, must expose one shared lifecycle to every caller, and must reject—not fulfill—if closure cannot be observed. A rejection is diagnostic failure, never closure proof; p2prpc then retains admission rather than reporting false quiescence.
+
+`onPeer` is a best-effort notification and is never a correctness dependency. Applications can inspect `peersSnapshot()` and obtain a current authenticated handle with `getPeer()`; session-bound file issuance inside a procedure uses `ctx.p2p.files` directly.
+
+A disconnected outbound runtime retains only its frozen locator/endpoint/principal expectations and may be revived by a matching authenticated inbound connection. Initial installation, replacement, revival, duplicate arbitration, and outbound reconnect all converge on one admission-success gate after synchronous callback-capable work. The gate requires an open node, registry ownership, live-map membership, the exact current epoch, and an unexpired session; public promise continuations recheck it after their last `await`, while queued `onPeer` delivery rechecks the captured exact selection. A callback that closes the node or selected peer therefore makes acquisition reject `DISCONNECTED` instead of returning or notifying a dead handle. Endpoint admission, mutual authentication, exact canonical-principal comparison, session expiry, and operation authorization are still rerun. A purely inbound runtime has no trusted dial target and closes with its connection.
+
+## Known transport boundary
+
+Iroh path selection can migrate between relay and direct routes without changing the authenticated endpoint or application session. Remote ticket direct routes and default-network relay hints require explicit egress decisions; custom relays use configured canonical-origin membership. Policies receive immutable candidates and fail closed if absent or throwing. With the pinned wrapper, DNS-resolved candidates cannot be inspected before dial, so DNS plus custom relay or address callbacks is unsupported rather than weakly filtered. Relay-disabled endpoints keep direct UDP networking but advertise/select no relay; a version-locked compatibility seam corrects the wrapper's conflation of “no relay” with its loopback-only test mode and fails closed when that assumption changes.
