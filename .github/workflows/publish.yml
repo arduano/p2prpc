@@ -353,7 +353,7 @@ jobs:
           actual_integrity="$(node -e '
             const { createHash } = require("node:crypto");
             const { readFileSync } = require("node:fs");
-            process.stdout.write(`sha512-${createHash("sha512").update(readFileSync(process.argv[1])).digest("base64")}`);
+            process.stdout.write("sha512-" + createHash("sha512").update(readFileSync(process.argv[1])).digest("base64"));
           ' "release-artifact/$tarball")"
           [[ "$actual_integrity" == "$expected_integrity" ]]
           npm_version="$(npm --version)"
@@ -414,7 +414,7 @@ jobs:
               # response. Recover only after those exact bytes and tag become
               # publicly observable; every mismatch remains a hard failure.
               recovered=false
-              for attempt in {1..12}; do
+              for (( attempt = 0; attempt < 12; attempt += 1 )); do
                 if verify_existing_candidate; then
                   recovered=true
                   break
@@ -463,7 +463,7 @@ jobs:
           verification="$RUNNER_TEMP/npm-publication"
           mkdir -p "$verification/consumer" "$verification/registry"
           found=false
-          for attempt in {1..12}; do
+          for (( attempt = 0; attempt < 12; attempt += 1 )); do
             if response="$(npm view "@p2prpc/core@$version" dist.integrity --json 2>/dev/null)" &&
               registry_integrity="$(jq -er '.' <<< "$response")"; then
               found=true
@@ -495,7 +495,7 @@ jobs:
             --audit=false \
             "@p2prpc/core@$version"
           provenance_verified=false
-          for attempt in {1..12}; do
+          for (( attempt = 0; attempt < 12; attempt += 1 )); do
             if npm audit signatures --omit=dev --json --include-attestations > signatures.json &&
               jq -e --arg version "$version" '
                 (.invalid | length) == 0 and
