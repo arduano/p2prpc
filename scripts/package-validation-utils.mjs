@@ -29,9 +29,9 @@ export async function temporaryDirectory(label) {
 }
 
 export async function run(command, args, options = {}) {
-  const executable = process.platform === 'win32' && command === 'npm' ? 'npm.cmd' : command;
+  const invocation = commandInvocation(command, args);
   await new Promise((resolvePromise, reject) => {
-    const child = spawn(executable, args, {
+    const child = spawn(invocation.executable, invocation.args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       stdio: options.stdio ?? 'inherit',
@@ -46,9 +46,9 @@ export async function run(command, args, options = {}) {
 }
 
 export async function runAndCapture(command, args, options = {}) {
-  const executable = process.platform === 'win32' && command === 'npm' ? 'npm.cmd' : command;
+  const invocation = commandInvocation(command, args);
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(executable, args, {
+    const child = spawn(invocation.executable, invocation.args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
       stdio: ['ignore', 'pipe', 'inherit'],
@@ -65,6 +65,16 @@ export async function runAndCapture(command, args, options = {}) {
       else reject(new Error(`${command} ${args.join(' ')} failed (${signal ?? `exit ${code}`})`));
     });
   });
+}
+
+function commandInvocation(command, args) {
+  if (command !== 'npm') return { executable: command, args };
+  const npmCli = process.env.npm_execpath;
+  if (typeof npmCli === 'string' && npmCli.length > 0) {
+    return { executable: process.execPath, args: [npmCli, ...args] };
+  }
+  invariant(process.platform !== 'win32', 'Run package validation through an npm script on Windows');
+  return { executable: command, args };
 }
 
 export async function installPackedArtifact(artifact, directory) {
