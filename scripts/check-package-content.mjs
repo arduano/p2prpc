@@ -37,16 +37,23 @@ try {
 } catch (cause) {
   throw new Error('Packed package.json is not valid JSON', { cause });
 }
-invariant(manifest.name === '@p2prpc/core', 'Packed package has the wrong name');
+invariant(manifest.name === '@arduano/p2prpc-core', 'Packed package has the wrong name');
 invariant(typeof manifest.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u.test(manifest.version), 'Packed package version is invalid');
-invariant(archive.artifact === `p2prpc-core-${manifest.version}.tgz`, 'Package filename does not match its version');
-invariant(manifest.private !== true, 'Packed package must be public');
+invariant(archive.artifact === `arduano-p2prpc-core-${manifest.version}.tgz`, 'Package filename does not match its version');
+invariant(manifest.private === false, 'Packed package must be explicitly public');
 invariant(manifest.license === 'MIT', 'Packed package must declare MIT');
 invariant(manifest.type === 'module', 'Packed package must declare ESM semantics');
 invariant(manifest.sideEffects === false, 'Packed package must be tree-shakeable by construction');
 invariant(manifest.engines?.node === '>=20.3.0', 'Packed package must preserve its verified Node.js support floor');
 invariant(manifest.publishConfig?.access === 'public', 'Packed package must publish publicly');
-invariant(manifest.publishConfig?.provenance === true, 'Packed package must request npm provenance');
+invariant(
+  manifest.publishConfig?.registry === 'https://npm.pkg.github.com',
+  'Packed package must publish only to GitHub Packages'
+);
+invariant(
+  sameStrings(Object.keys(manifest.publishConfig ?? {}), ['access', 'registry']),
+  'Packed package publish configuration contains an unaudited setting'
+);
 invariant(Array.isArray(manifest.files), 'Packed package must define an explicit files allowlist');
 invariant(
   JSON.stringify([...manifest.files].sort()) === JSON.stringify([

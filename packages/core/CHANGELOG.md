@@ -1,4 +1,4 @@
-# @p2prpc/core
+# @arduano/p2prpc-core
 
 ## 0.2.0
 
@@ -20,7 +20,7 @@
 
   The single-connection stress gate now cancels only after an adopted data lane reports progress and records that trigger explicitly, separating ordinary transfer cancellation from the intentional connection-quarantine behavior for cancellation racing an unrevocable native stream open.
 
-  Release publication is now retry-safe: an existing immutable npm version is accepted only when its integrity, exact tarball bytes, requested dist-tag, provenance source commit, and original trusted workflow invocation match the candidate. Ambiguous npm acknowledgements and partial GitHub releases can therefore be recovered without weakening byte or provenance checks.
+  Release publication is now tag-driven through GitHub Packages and retry-safe: an existing immutable package version is accepted only when its integrity, exact tarball bytes, expected `latest`/`next` distribution tag, source commit, and semver Git tag match the candidate. Ambiguous registry acknowledgements and partial GitHub releases can therefore be recovered without weakening byte or provenance checks.
 
   The production OIDC issuer API now accepts only a configured HTTPS JWKS, static JWKS, or single static public verification key. Arbitrary JOSE key-resolver callbacks are rejected because they receive unverified token headers and could otherwise let attacker-controlled `jku`/`x5u` choose trust roots.
 
@@ -34,4 +34,8 @@
 
   Capability-pull reconnect authority is now private to the exact connection attempt rather than encoded in reusable error identity. Callback signals expose ordinary sanitized errors, so a stale abort reason, replayed transport error, plain `DISCONNECTED`, or untyped connection abort cannot authorize redial. A current typed transport loss becomes retryable only after current-attempt stream drain and successful prepared-source close; the reservation remains active until cleanup settles, and cleanup uncertainty completes it terminally with `OUTCOME_UNKNOWN`.
 
-  These two lifecycle corrections do not change wire v4 or the documented public TypeScript API.
+  tRPC subscriptions now emit their `started` lifecycle event only after the complete request is dispatched. A native connection that can no longer open BI or UNI streams is quarantined immediately so retained peers can redial instead of reusing a stale session handle.
+
+  The lower Iroh handle TTL is disabled because its time-based sweep could remove a healthy long-running WebTransport session without observing p2prpc ownership. Stream and connection handles now remain governed by p2prpc's explicit terminal lifecycle, preventing active subscriptions from failing at the former six-minute boundary.
+
+  These lifecycle corrections do not change wire v4 or the documented public TypeScript API.

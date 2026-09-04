@@ -48,8 +48,8 @@ tRPC carries typed control values and capability handles. File bytes stay outsid
 
 The package root exposes peer-bound OIDC and shared-secret factories, `createP2PNode`, typed peers, RPC metadata helpers, and safe file APIs. It does not expose anonymous sessions, custom credential implementations, raw transports, or a directly constructible transfer.
 
-- `@p2prpc/core/advanced` is an explicit trust boundary for custom security, transports, raw links, and registries.
-- `@p2prpc/core/testing` contains the intentionally insecure session helper and injected-endpoint node factory.
+- `@arduano/p2prpc-core/advanced` is an explicit trust boundary for custom security, transports, raw links, and registries.
+- `@arduano/p2prpc-core/testing` contains the intentionally insecure session helper and injected-endpoint node factory.
 
 Root `createP2PNode` rejects an unbranded custom security object at runtime as well as at the TypeScript boundary.
 

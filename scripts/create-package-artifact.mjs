@@ -11,7 +11,7 @@ invariant((await readdir(outputDirectory)).length === 0, `Package artifact direc
 const resultText = await runAndCapture('npm', [
   'pack',
   '--workspace',
-  '@p2prpc/core',
+  '@arduano/p2prpc-core',
   '--ignore-scripts',
   '--pack-destination',
   outputDirectory,
@@ -25,8 +25,8 @@ try {
 }
 invariant(Array.isArray(results) && results.length === 1, 'npm pack must produce exactly one package');
 const [result] = results;
-invariant(result.name === '@p2prpc/core', `Unexpected packed package: ${String(result.name)}`);
-invariant(typeof result.filename === 'string' && /^p2prpc-core-[0-9A-Za-z._-]+\.tgz$/u.test(result.filename), 'Unexpected npm tarball name');
+invariant(result.name === '@arduano/p2prpc-core', `Unexpected packed package: ${String(result.name)}`);
+invariant(typeof result.filename === 'string' && /^arduano-p2prpc-core-[0-9A-Za-z._-]+\.tgz$/u.test(result.filename), 'Unexpected npm tarball name');
 
 const artifact = join(outputDirectory, result.filename);
 const digest = createHash('sha256').update(await readFile(artifact)).digest('hex');

@@ -15,9 +15,9 @@ try {
   const smoke = join(directory, 'smoke.mjs');
   await writeFile(smoke, `
     import assert from 'node:assert/strict';
-    import * as p2prpc from '@p2prpc/core';
-    import * as advanced from '@p2prpc/core/advanced';
-    import * as testing from '@p2prpc/core/testing';
+    import * as p2prpc from '@arduano/p2prpc-core';
+    import * as advanced from '@arduano/p2prpc-core/advanced';
+    import * as testing from '@arduano/p2prpc-core/testing';
 
     assert.equal(typeof p2prpc.createP2PNode, 'function');
     assert.equal(typeof p2prpc.fileSource, 'function');

@@ -778,6 +778,73 @@ describe('structured runtime ownership', () => {
     expect(scheduler.snapshot()).toMatchObject({ peers: 0, principals: 0 });
   });
 
+  it('quarantines a connection whose native BI session handle can no longer open streams', async () => {
+    const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+    const physicallyClosed = deferred<string>();
+    const nativeFailure = new Error('{"code":"INVALID_INPUT","message":"unknown handle: 4294967297"}');
+    let closeRequests = 0;
+    const base = testConnection(() => Promise.reject(nativeFailure));
+    const managed = new ManagedConnection(
+      {
+        ...base,
+        closed: () => physicallyClosed.promise,
+        close: () => { closeRequests += 1; }
+      },
+      scheduler,
+      { peerId: 'peer', principalId: 'principal' },
+      new AbortController().signal,
+      16,
+      16
+    );
+
+    await expect(managed.openBi()).rejects.toBe(nativeFailure);
+    expect(closeRequests).toBe(1);
+    expect(scheduler.snapshot()).toMatchObject({
+      queued: 0,
+      peers: 0,
+      principals: 0,
+      active: { streams: 0, bufferedBytes: 0 }
+    });
+    await expect(managed.openBi()).rejects.toMatchObject({ code: 'DISCONNECTED' });
+
+    physicallyClosed.resolve('stale native session replaced');
+    await expect(managed.closed()).resolves.toBe('stale native session replaced');
+  });
+
+  it('quarantines a connection whose native UNI session handle can no longer open streams', async () => {
+    const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+    const physicallyClosed = deferred<string>();
+    const nativeFailure = new Error('{"code":"INVALID_INPUT","message":"unknown handle: 4294967297"}');
+    let closeRequests = 0;
+    const base = testConnection(async () => recordingStream());
+    const managed = new ManagedConnection(
+      {
+        ...base,
+        openUni: () => Promise.reject(nativeFailure),
+        closed: () => physicallyClosed.promise,
+        close: () => { closeRequests += 1; }
+      },
+      scheduler,
+      { peerId: 'peer', principalId: 'principal' },
+      new AbortController().signal,
+      16,
+      16
+    );
+
+    await expect(managed.openUni()).rejects.toBe(nativeFailure);
+    expect(closeRequests).toBe(1);
+    expect(scheduler.snapshot()).toMatchObject({
+      queued: 0,
+      peers: 0,
+      principals: 0,
+      active: { streams: 0, bufferedBytes: 0 }
+    });
+    await expect(managed.openUni()).rejects.toMatchObject({ code: 'DISCONNECTED' });
+
+    physicallyClosed.resolve('stale native session replaced');
+    await expect(managed.closed()).resolves.toBe('stale native session replaced');
+  });
+
   it('promptly rejects a cancelled hung UNI open and retains admission until physical closure', async () => {
     const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
     const nativeOpenStarted = deferred<void>();

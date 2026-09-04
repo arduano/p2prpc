@@ -13,7 +13,7 @@ export function invariant(condition, message) {
 
 export function packageArtifactArgument(position = 2) {
   const value = process.argv[position] ?? process.env.P2PRPC_PACKAGE_TARBALL;
-  invariant(typeof value === 'string' && value.length > 0, 'Pass the packed @p2prpc/core .tgz artifact path');
+  invariant(typeof value === 'string' && value.length > 0, 'Pass the packed @arduano/p2prpc-core .tgz artifact path');
   const candidate = resolve(value);
   if (statSync(candidate).isDirectory()) {
     const tarballs = readdirSync(candidate).filter((entry) => entry.endsWith('.tgz'));

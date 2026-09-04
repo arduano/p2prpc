@@ -18,11 +18,11 @@
     "examples/*"
   ],
   "scripts": {
-    "build": "npm run build -w @p2prpc/core",
-    "typecheck": "npm run typecheck -w @p2prpc/core && npm run typecheck -w @p2prpc/cli-example && npm run typecheck:benchmarks",
+    "build": "npm run build -w @arduano/p2prpc-core",
+    "typecheck": "npm run typecheck -w @arduano/p2prpc-core && npm run typecheck -w @p2prpc/cli-example && npm run typecheck:benchmarks",
     "typecheck:benchmarks": "tsc --noEmit -p benchmarks/tsconfig.json",
-    "test": "npm run test -w @p2prpc/core",
-    "test:integration": "npm run test:integration -w @p2prpc/core",
+    "test": "npm run test -w @arduano/p2prpc-core",
+    "test:integration": "npm run test:integration -w @arduano/p2prpc-core",
     "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
     "test:packed": "node scripts/packed-install-smoke.mjs",
     "test:tree-shaken-native": "node scripts/tree-shaken-native-smoke.mjs",
@@ -31,6 +31,7 @@
     "check:package-content": "node scripts/check-package-content.mjs",
     "check:package-publint": "publint --strict --pack=false",
     "check:package-types": "attw --profile esm-only --no-definitely-typed",
+    "check:release-tag": "node scripts/check-release-tag.mjs",
     "generate:release-sbom": "node scripts/generate-release-sbom.mjs",
     "pack:artifact": "node scripts/create-package-artifact.mjs",
     "docs:dev": "vitepress dev docs/wiki",

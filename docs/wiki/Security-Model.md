@@ -64,7 +64,7 @@ Use distinct audiences and grants per application/environment/trust domain. Pref
 
 Shared-secret mode proves membership with HMAC-SHA-256 over the full role-specific transcript. It requires at least 32 bytes of securely generated material and an explicit `authorize` callback; omitted authorization is impossible and callback failure denies. The secret does not distinguish holders, users, or tenants, so it is appropriate for a tightly provisioned workload group, not general enterprise user identity.
 
-The insecure helper exists only in `@p2prpc/core/testing`.
+The insecure helper exists only in `@arduano/p2prpc-core/testing`.
 
 ## Authorization
 

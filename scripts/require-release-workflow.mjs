@@ -1,6 +1,6 @@
 import process from 'node:process';
 
 process.stderr.write(
-  'Direct releases are disabled. Dispatch the pinned "Publish to npm" GitHub Actions workflow with a successful production-validation run for this exact commit.\n'
+  'Direct releases are disabled. Push an exact semver tag after public CI passes for this main-branch commit; the pinned GitHub Packages workflow performs publication.\n'
 );
 process.exitCode = 1;

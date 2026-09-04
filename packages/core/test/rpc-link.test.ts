@@ -14,7 +14,10 @@ import type {
 
 const t = initTRPC.create();
 const router = t.router({
-  ping: t.procedure.query(() => 'unused')
+  ping: t.procedure.query(() => 'unused'),
+  stream: t.procedure.subscription(async function* () {
+    yield 'unused';
+  })
 });
 void router;
 
@@ -208,6 +211,25 @@ describe('RPC link flow-control boundaries', () => {
     expect(stream.send.writeCalls).toBe(5);
     expect(stream.send.maximumConcurrentWrites).toBe(1);
     expect(stream.send.resetCalls).toBe(1);
+    expect(stream.recv.stopCalls).toBe(1);
+  });
+
+  it('announces a subscription only after its complete request is dispatched', async () => {
+    const stream = testStream();
+    const client = testClient({ connection: async () => testConnection(async () => stream) });
+    let started = false;
+    const subscription = client.stream.subscribe(undefined, {
+      onStarted: () => { started = true; },
+      onData: () => undefined,
+      onError: () => undefined
+    });
+
+    expect(started).toBe(false);
+    await waitUntil(() => stream.send.writeCalls === 3);
+    expect(started).toBe(true);
+
+    subscription.unsubscribe();
+    await waitUntil(() => stream.send.resetCalls === 1);
     expect(stream.recv.stopCalls).toBe(1);
   });
 

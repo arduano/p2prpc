@@ -19,7 +19,10 @@ authenticated Iroh QUIC connection
 The [architecture and security wiki](https://arduano.github.io/p2prpc/) is the concise audit model. Start with [System Model](./docs/wiki/Home.md), [Lifecycles](./docs/wiki/Lifecycles.md), and the [Audit Guide](./docs/wiki/Audit-Guide.md).
 
 > [!IMPORTANT]
-> This is a pre-1.0 release candidate and has not been published to npm. Publishing remains blocked until the exact candidate passes the external discovery/relay, mixed-load, and 10,000-file lifecycle gates in [Production Validation](./docs/wiki/Production-Validation.md).
+> This is a pre-1.0 package. A release tag requires successful public CI for
+> the exact `main` commit. Publication does not by itself claim that the
+> optional external discovery/relay, mixed-load, and 10,000-file qualification
+> in [Production Validation](./docs/wiki/Production-Validation.md) has run.
 
 ## Requirements
 
@@ -31,11 +34,27 @@ The [architecture and security wiki](https://arduano.github.io/p2prpc/) is the c
 
 CommonJS, browsers, and React Native are outside this release.
 
-After the first registry release:
+## Install from GitHub Packages
+
+The package is hosted on GitHub Packages, which requires authentication even
+when the package visibility is public. Give a classic personal access token
+`read:packages`, expose it as `GITHUB_PACKAGES_TOKEN`, and configure npm without
+committing the token:
+
+```ini
+# ~/.npmrc or a downstream repository's .npmrc
+@arduano:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
+```
 
 ```bash
-npm install @p2prpc/core @trpc/client@11.18.0 @trpc/server@11.18.0
+npm install --save-exact @arduano/p2prpc-core@0.2.0 @trpc/client@11.18.0 @trpc/server@11.18.0
 ```
+
+GitHub Actions can use `GITHUB_TOKEN` after this package repository grants the
+consumer repository Actions access. Set `packages: read`, use
+`actions/setup-node` with `registry-url: https://npm.pkg.github.com`, and expose
+the token as `NODE_AUTH_TOKEN` only on install steps.
 
 ## Secure RPC MVP
 
@@ -49,7 +68,7 @@ import {
   createSharedSecretSecurity,
   p2pRpcContext,
   type PeerContext
-} from '@p2prpc/core';
+} from '@arduano/p2prpc-core';
 
 const t = initTRPC.context<PeerContext>().create();
 const tenantProcedure = t.procedure.use(({ ctx, next }) => {
@@ -119,7 +138,7 @@ p2prpc is an OAuth resource server. Your application obtains and refreshes acces
 import {
   createOidcSessionSecurity,
   irohPeerIdJwkThumbprint
-} from '@p2prpc/core';
+} from '@arduano/p2prpc-core';
 
 const security = createOidcSessionSecurity({
   issuers: [{
@@ -231,9 +250,9 @@ See [Production Validation](./docs/wiki/Production-Validation.md) for the exact 
 
 ## API trust boundary
 
-- `@p2prpc/core` — production node/peer APIs and branded peer-bound security factories.
-- `@p2prpc/core/advanced` — custom authenticators/transports, raw link/registry components; explicitly expands the deployment TCB.
-- `@p2prpc/core/testing` — endpoint injection and `dangerouslyAllowInsecureSessions()`; never use in production.
+- `@arduano/p2prpc-core` — production node/peer APIs and branded peer-bound security factories.
+- `@arduano/p2prpc-core/advanced` — custom authenticators/transports, raw link/registry components; explicitly expands the deployment TCB.
+- `@arduano/p2prpc-core/testing` — endpoint injection and `dangerouslyAllowInsecureSessions()`; never use in production.
 
 ## Development
 
@@ -249,3 +268,29 @@ npm run docs:build
 ```
 
 The repository is MIT licensed. Third-party native packaging notes are in [THIRD_PARTY_NOTICES.md](./packages/core/THIRD_PARTY_NOTICES.md), and vulnerabilities should follow [SECURITY.md](./SECURITY.md).
+
+## Releasing
+
+Changesets update the package version on `main`. Wait for public CI to pass for
+that exact commit, then push the matching semver tag (for example, `v0.2.0`).
+The tag workflow verifies the successful exact-commit CI run, rebuilds and
+checks one immutable tarball, publishes it to GitHub Packages with the
+repository `GITHUB_TOKEN`, verifies a clean downstream install and exact
+registry bytes, records build provenance, and creates the matching GitHub
+Release. Direct `npm publish` is intentionally disabled.
+
+The protected external production-validation workflow remains the stronger
+qualification for deployments that need its two-host discovery, relay, stress,
+and native-resource evidence. A package release without that evidence is
+deliberately described as published and CI-qualified, not production-qualified.
+
+Stable versions use the `latest` distribution tag; prerelease versions use
+`next`. The Git tag is the release trigger and must be protected from deletion
+or retargeting.
+
+GitHub creates a personal-account package as private on its first publication.
+The verification job deliberately stops there on that first run. Change the
+package visibility to public in its GitHub package settings, grant each
+downstream Actions repository read access, and rerun the tag workflow to finish
+verification and the GitHub Release. No registry credential belongs in this
+repository.

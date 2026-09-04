@@ -1,6 +1,7 @@
 {
-  "name": "@p2prpc/core",
+  "name": "@arduano/p2prpc-core",
   "version": "0.2.0",
+  "private": false,
   "description": "Type-safe peer-to-peer tRPC and striped file transfer over Iroh QUIC",
   "type": "module",
   "license": "MIT",
@@ -15,7 +16,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "provenance": true
+    "registry": "https://npm.pkg.github.com"
   },
   "sideEffects": false,
   "types": "./dist/index.d.ts",
