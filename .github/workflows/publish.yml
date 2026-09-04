@@ -149,7 +149,7 @@ jobs:
               > SHA256SUMS
           )
       - name: Upload immutable release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: p2prpc-release-candidate-${{ github.sha }}
           path: release-artifact/
@@ -210,7 +210,7 @@ jobs:
         with:
           subject-path: release-artifact/${{ steps.artifact.outputs.tarball }}
       - name: Preserve provenance bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: p2prpc-provenance-${{ github.sha }}
           path: ${{ steps.provenance.outputs.bundle-path }}
@@ -398,7 +398,7 @@ jobs:
               attestation: $attestation[0]
             }' > "$verification/publication-verification.json"
       - name: Upload publication verification
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: p2prpc-publication-verification-${{ github.sha }}
           path: |
