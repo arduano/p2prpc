@@ -45,7 +45,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")"
+          runs="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f status=success \
+            -f head_sha="$GITHUB_SHA" \
+            -f per_page=100)"
           run_id="$(jq -er --arg sha "$GITHUB_SHA" '
             [.workflow_runs[] |
               select(
@@ -471,11 +477,15 @@ jobs:
                 .draft == false and
                 .prerelease == $prerelease
             ' <<< "$existing" >/dev/null
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
           else
             args=(--verify-tag --title "$title" --generate-notes)
             if [[ "$version" == *-* ]]; then args+=(--prerelease); fi
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${args[@]}"
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              "${args[@]}" \
+              --repo "$GITHUB_REPOSITORY"
           fi
           expected_assets="$(printf '%s\n' "${assets[@]}" |
             while IFS= read -r asset; do basename "$asset"; done | jq -R . | jq -s 'sort')"
@@ -486,7 +496,9 @@ jobs:
           ' <<< "$release" >/dev/null
           download_dir="$RUNNER_TEMP/github-release-assets"
           mkdir -p "$download_dir"
-          gh release download "$GITHUB_REF_NAME" --dir "$download_dir"
+          gh release download "$GITHUB_REF_NAME" \
+            --dir "$download_dir" \
+            --repo "$GITHUB_REPOSITORY"
           for asset in "${assets[@]}"; do
             cmp --silent "$asset" "$download_dir/$(basename "$asset")" || {
               echo "GitHub release asset differs from verified source: $(basename "$asset")" >&2
