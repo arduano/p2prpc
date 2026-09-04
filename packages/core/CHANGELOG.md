@@ -1,5 +1,11 @@
 # @arduano/p2prpc-core
 
+## 0.2.1
+
+- Correct the GitHub Packages workflow so npm receives an unambiguous absolute
+  tarball path. The failed `v0.2.0` workflow did not publish registry bytes;
+  `v0.2.1` is the first intended GitHub Packages version.
+
 ## 0.2.0
 
 ### Minor Changes
