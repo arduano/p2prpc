@@ -48,7 +48,7 @@ committing the token:
 ```
 
 ```bash
-npm install --save-exact @arduano/p2prpc-core@0.2.0 @trpc/client@11.18.0 @trpc/server@11.18.0
+npm install --save-exact @arduano/p2prpc-core@0.2.1 @trpc/client@11.18.0 @trpc/server@11.18.0
 ```
 
 GitHub Actions can use `GITHUB_TOKEN` after this package repository grants the
@@ -272,7 +272,7 @@ The repository is MIT licensed. Third-party native packaging notes are in [THIRD
 ## Releasing
 
 Changesets update the package version on `main`. Wait for public CI to pass for
-that exact commit, then push the matching semver tag (for example, `v0.2.0`).
+that exact commit, then push the matching semver tag (for example, `v0.2.1`).
 The tag workflow verifies the successful exact-commit CI run, rebuilds and
 checks one immutable tarball, publishes it to GitHub Packages with the
 repository `GITHUB_TOKEN`, verifies a clean downstream install and exact

@@ -258,7 +258,7 @@ jobs:
             fi
             npm ping --registry=https://npm.pkg.github.com >/dev/null
             set +e
-            npm publish "release-artifact/$tarball" \
+            npm publish "$GITHUB_WORKSPACE/release-artifact/$tarball" \
               --ignore-scripts \
               --access public \
               --registry=https://npm.pkg.github.com \
