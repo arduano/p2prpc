@@ -2,9 +2,25 @@
 
 The goal is to validate p2prpc's protocol, scheduling, discovery integration, and lifecycle cleanup—not to benchmark or re-implement Iroh.
 
-## Release rule
+## Publication and qualification rules
 
-No npm publish is approved until the exact candidate commit passes the external topology/stress lab and one tarball built from that same commit passes every artifact gate. The external drivers execute the checked-out commit, not the npm tarball; the publish manifest binds the commit, production-validation run ID, tarball SHA-256, and npm integrity. GitHub run/artifact metadata retains the full commit and logs, while the evidence files retain bounded environment, configuration, timing, and counter data. Relay origins are never copied into public artifacts: configured, attempted, connected, and denied sets use full 64-hex SHA-256 fingerprints. Evidence labels native DNS attempts as opaque because the pinned wrapper does not expose its resolved candidates. A failed or incomplete row is a no-go. The repository contains drivers and validation rules; it does not by itself constitute external production evidence.
+A GitHub Packages release requires successful public CI for the exact tagged
+`main` commit and one tarball built from that same commit passing every package
+artifact gate. The publish manifest binds the commit, semver tag, CI run ID,
+tarball SHA-256, and npm integrity. That is the pre-1.0 publication bar; it is
+not a claim of formal production qualification.
+
+The stronger production qualification additionally requires the external
+topology/stress lab below for the exact commit. Those drivers execute the
+checked-out commit, not the package tarball. GitHub run/artifact metadata retains
+the full commit and logs, while the evidence files retain bounded environment,
+configuration, timing, and counter data. Relay origins are never copied into
+public artifacts: configured, attempted, connected, and denied sets use full
+64-hex SHA-256 fingerprints. Evidence labels native DNS attempts as opaque
+because the pinned wrapper does not expose its resolved candidates. A failed or
+incomplete row is a no-go for a production-qualified claim. The repository
+contains drivers and validation rules; it does not by itself constitute
+external production evidence.
 
 ## Local candidate gates
 
@@ -21,9 +37,19 @@ bash scripts/test-lab-driver-validation.sh
 npm audit --audit-level=low
 ```
 
-The release workflow additionally validates packed contents/license, `publint`, Are-the-Types-Wrong, installation from the tarball, a tree-shaken native import, SBOM and registry-signature evidence, action syntax, provenance, and post-publish byte equality. Publishing consumes the immutable candidate with lifecycle scripts disabled; it does not rebuild it. A rerun never blindly republishes an immutable npm version: it may recover only when registry integrity, tarball bytes, requested dist-tag, signed source commit, and the original trusted workflow invocation all match. GitHub release creation similarly verifies or replaces only the expected assets.
+The release workflow additionally validates packed contents/license, `publint`, Are-the-Types-Wrong, installation from the tarball, a tree-shaken native import, SBOM and dependency-registry-signature evidence, action syntax, GitHub build provenance, and post-publish byte equality. Publication consumes the immutable candidate with lifecycle scripts disabled; it does not rebuild it. A rerun never blindly republishes an immutable package version: it may recover only when registry integrity, tarball bytes, the expected `latest`/`next` distribution tag, source commit, and semver Git tag all match. GitHub release creation similarly verifies or replaces only the expected assets.
 
-Release governance is part of the gate: protect `main`, require review for the `npm` environment, and scope npm trusted publishing to this repository and `.github/workflows/publish.yml`. The Changesets workflow may update a release PR, but it has no Actions-approval permission and cannot waive that PR's normal required checks. Lab runners must be dedicated or ephemeral, execute only protected-branch code, keep credentials outside the workspace, and start each run from a clean host boundary. Lab driver binaries are accepted only when their version, schema, and SHA-256 match the protected manifest.
+Release governance is part of the gate: protect `main` and version tags, require review for the `github-packages` environment, and leave `packages: write` available only to the tag-triggered publish job. It authenticates with the repository-scoped `GITHUB_TOKEN`; no registry PAT is stored. The Changesets workflow may update a release PR, but it has no Actions-approval permission and cannot waive that PR's normal required checks. Lab runners must be dedicated or ephemeral, execute only protected-branch code, keep credentials outside the workspace, and start each run from a clean host boundary. Lab driver binaries are accepted only when their version, schema, and SHA-256 match the protected manifest.
+
+Public CI must complete on `main` before the matching `v<version>` tag is
+pushed. The publish workflow discovers and revalidates that successful run for
+the exact commit. Run the protected `release` production-validation suite first
+when the release is also intended to carry the stronger qualification claim;
+its evidence is retained separately and is not implied by publication. GitHub
+initially creates a personal-account package as private; after first
+publication, a maintainer must make it public in package settings and explicitly
+grant downstream Actions repositories read access. Authenticated npm
+configuration remains necessary even after that visibility change.
 
 ## Required discovery/topology matrix
 
@@ -85,4 +111,4 @@ The exact-pinned shared Iroh package has a narrow writer-cleanup seam: when nati
 
 A zero scheduler ledger after shutdown means every tracked logical owner released; scheduler close itself does not erase active leases. It still does not alone prove that opaque native implementations returned all handles, so retain the stream, file-descriptor, native-handle, task, and memory baselines.
 
-Retain the GitHub run, immutable artifact digests, release manifest, checksums, SBOM, registry-signature result, and verified npm provenance for the exact commit. Any code, lockfile, workflow, relay-set, or package-byte change invalidates the candidate and requires the relevant gates again.
+Retain the GitHub run, immutable artifact digests, release manifest, checksums, SBOM, dependency-registry-signature result, GitHub provenance bundle, and publication verification for the exact tag and commit. Any code, lockfile, workflow, relay-set, or package-byte change invalidates the candidate and requires the relevant gates again.

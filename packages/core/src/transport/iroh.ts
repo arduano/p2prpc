@@ -597,7 +597,20 @@ export class IrohEndpoint implements QuicEndpoint {
         dns: discoveryOptions.dns,
         mdns: false
       },
-      internals: { maxChunkSizeBytes: 1024 * 1024 },
+      internals: {
+        maxChunkSizeBytes: 1024 * 1024,
+        // iroh-http's blanket slab sweep includes live WebTransport session
+        // handles. Session lookups do not refresh the slab timestamp, so its
+        // five-minute default removes an otherwise healthy connection on the
+        // next one-minute sweep. Long-running RPC subscriptions then end at
+        // six minutes and every later stream open fails with "unknown handle".
+        //
+        // p2prpc already owns every native stream half until explicit terminal
+        // cleanup or fulfilled physical connection closure. Disable the lower
+        // layer's time-based reclamation so transport resources follow those
+        // lifecycle proofs instead of wall-clock age.
+        handleTtl: 0
+      },
       key: secretKey
     };
     if (options.bindAddress) nodeOptions.bindAddr = typeof options.bindAddress === 'string'

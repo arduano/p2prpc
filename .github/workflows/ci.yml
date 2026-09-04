@@ -33,6 +33,11 @@ jobs:
       - name: Validate GitHub Actions workflows
         shell: bash
         run: bash scripts/check-github-actions.sh
+      - name: Validate release package identity and tag contract
+        shell: bash
+        run: |
+          version="$(node -p "require('./packages/core/package.json').version")"
+          npm run check:release-tag -- "refs/tags/v$version"
       - name: Lint
         run: npm run lint
       - name: Typecheck

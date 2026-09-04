@@ -1,234 +1,86 @@
-name: Publish to npm
+name: Publish GitHub Package
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: npm distribution tag
-        required: true
-        default: latest
-        type: choice
-        options: [latest, next]
-      production_validation_run_id:
-        description: Successful release-suite run ID for this exact commit
-        required: true
-        type: string
+  push:
+    tags:
+      - "v*"
 
 concurrency:
-  group: npm-publish
+  group: github-packages-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
   candidate:
-    name: Verify and build immutable candidate
-    if: github.ref == 'refs/heads/main'
+    name: Validate immutable release candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     permissions:
       actions: read
       contents: read
+    outputs:
+      ci-run-id: ${{ steps.ci.outputs.run-id }}
+      version: ${{ steps.package.outputs.version }}
     steps:
-      - name: Check out repository
+      - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Validate GitHub Actions workflows
-        shell: bash
-        run: bash scripts/check-github-actions.sh
-      - name: Verify production validation evidence
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRODUCTION_RUN_ID: ${{ inputs.production_validation_run_id }}
-        run: |
-          bash scripts/test-lab-driver-validation.sh
-          [[ "$PRODUCTION_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
-            echo "Production validation run ID must be a positive integer" >&2
-            exit 1
-          }
-          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_RUN_ID}")"
-          jq -e --arg sha "$GITHUB_SHA" '
-            .status == "completed" and
-            .conclusion == "success" and
-            .event == "workflow_dispatch" and
-            .path == ".github/workflows/production-validation.yml" and
-            .head_branch == "main" and
-            .head_sha == $sha
-          ' <<< "$run" >/dev/null || {
-            echo "Production validation must be a successful manual run for this exact main-branch commit" >&2
-            exit 1
-          }
-          attempt="$(jq -er '.run_attempt' <<< "$run")"
-          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts')"
-          expected=(
-            "topology-ticket-default-${attempt}"
-            "topology-ticket-custom-${attempt}"
-            "topology-ticket-disabled-${attempt}"
-            "topology-dns-default-${attempt}"
-            "topology-mdns-default-${attempt}"
-            "topology-mdns-custom-${attempt}"
-            "topology-mdns-disabled-${attempt}"
-            "files-10000-${attempt}"
-            "mixed-load-${attempt}"
-          )
-          for name in "${expected[@]}"; do
-            jq -e --arg name "$name" '
-              any(.[]; .name == $name and .expired == false)
-            ' <<< "$artifacts" >/dev/null || {
-              echo "Production validation artifact is missing or expired: $name" >&2
-              exit 1
-            }
-          done
-          mkdir -p release-evidence/topology release-evidence/files release-evidence/mixed
-          relay_fingerprint_count() {
-            jq -er '
-              .configuration.relayUrlFingerprints |
-              if
-                type == "array" and
-                all(.[]; type == "string" and test("^[0-9a-f]{64}$")) and
-                length == (unique | length)
-              then length
-              else error("relay fingerprints must be a unique array of canonical fingerprints")
-              end
-            ' "$1"
-          }
-          for scenario in \
-            ticket-default ticket-custom ticket-disabled \
-            dns-default \
-            mdns-default mdns-custom mdns-disabled; do
-              locator="${scenario%%-*}"
-              relay="${scenario#*-}"
-              scenario="${locator}-${relay}"
-              evidence_dir="release-evidence/topology/${scenario}"
-              gh run download "$PRODUCTION_RUN_ID" \
-                --name "topology-${scenario}-${attempt}" \
-                --dir "$evidence_dir"
-              relay_count="$(relay_fingerprint_count "$evidence_dir/p2prpc-${scenario}.json")"
-              if [[ "$relay" == "custom" ]]; then
-                (( relay_count >= 2 && relay_count <= 32 )) || {
-                  echo "Custom topology evidence must contain 2-32 relay fingerprints: $scenario" >&2
-                  exit 1
-                }
-              elif (( relay_count != 0 )); then
-                echo "Non-custom topology evidence must not contain custom relay fingerprints: $scenario" >&2
-                exit 1
-              fi
-              EXPECTED_CUSTOM_RELAY_COUNT="$relay_count" LOCATOR="$locator" RELAY="$relay" \
-                bash scripts/validate-lab-driver.sh evidence \
-                p2prpc-lab-canary "$evidence_dir/raw-iroh-${scenario}.json"
-              EXPECTED_CUSTOM_RELAY_COUNT="$relay_count" LOCATOR="$locator" RELAY="$relay" \
-                bash scripts/validate-lab-driver.sh evidence \
-                p2prpc-lab-topology-suite "$evidence_dir/topology-${scenario}.json"
-              jq -e --arg locator "$locator" --arg relay "$relay" --argjson relayCount "$relay_count" '
-                .schemaVersion == 2 and
-                .status == "passed" and
-                .configuration.fileCount == 40 and
-                .configuration.errorCasesPerClass == 2 and
-                .configuration.locator == $locator and
-                .configuration.relay == $relay and
-                (.configuration.relayUrlFingerprints | type == "array" and length == $relayCount) and
-                (.relayEvidence.configured | sort) == (.configuration.relayUrlFingerprints | sort) and
-                (.relayEvidence.attemptVisibility ==
-                  (if $locator == "dns" then "opaque-native-dns" else "explicit-candidates" end)) and
-                ($relay != "disabled" or (.relayEvidence.connected | length) == 0) and
-                ([.relayEvidence.configured[], .relayEvidence.attempted[],
-                  .relayEvidence.connected[], .relayEvidence.denied[]] |
-                  all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
-                .totals.successfulFiles == 40 and
-                .totals.authenticationEventsPerEndpoint == 1 and
-                .negativeCases.rpcCanaries == 100 and
-                .negativeCases.senderCancellationLanes == 1 and
-                .negativeCases.senderCancellationTrigger == "first-data-progress" and
-                ([
-                  .negativeCases.controlAttempts.rejectedPushes,
-                  .negativeCases.controlAttempts.revokedPulls,
-                  .negativeCases.controlAttempts.senderCancellations,
-                  .negativeCases.controlAttempts.destinationFailures
-                ] | all(.[];
-                  .logicalCases == 2 and
-                  .senderOpenedBi == 2 and
-                  .receiverAcceptedBi == 2 and
-                  .exact == true
-                )) and
-                (.negativeCases.destinationFailureAttemptsByIndex | length == 2 and all(.[]; . == 1))
-              ' "$evidence_dir/p2prpc-${scenario}.json" >/dev/null
-          done
-          gh run download "$PRODUCTION_RUN_ID" --name "files-10000-${attempt}" --dir release-evidence/files
-          gh run download "$PRODUCTION_RUN_ID" --name "mixed-load-${attempt}" --dir release-evidence/mixed
-          file_relay_count="$(relay_fingerprint_count release-evidence/files/files-10000.json)"
-          (( file_relay_count >= 1 && file_relay_count <= 32 )) || {
-            echo "File lifecycle evidence must contain 1-32 custom relay fingerprints" >&2
-            exit 1
-          }
-          release_relay_count="$(jq -er '
-            .campaign.parameters.customRelayCount |
-            if type == "number" and floor == . then . else error("custom relay count must be an integer") end
-          ' release-evidence/mixed/release-suite.json)"
-          (( release_relay_count >= 2 && release_relay_count <= 32 )) || {
-            echo "Release evidence must report 2-32 custom relays" >&2
-            exit 1
-          }
-          EXPECTED_CUSTOM_RELAY_COUNT="$file_relay_count" LOCATOR=ticket RELAY=custom \
-            bash scripts/validate-lab-driver.sh evidence \
-            p2prpc-lab-canary release-evidence/files/raw-iroh-files-10000.json
-          EXPECTED_CUSTOM_RELAY_COUNT="$release_relay_count" LOCATOR=ticket RELAY=custom \
-            bash scripts/validate-lab-driver.sh evidence \
-            p2prpc-lab-canary release-evidence/mixed/raw-iroh-mixed-load.json
-          jq -e --argjson relayCount "$file_relay_count" '
-            .schemaVersion == 2 and
-            .status == "passed" and
-            .qualification.productionGateEligible == true and
-            .configuration.fileCount == 10000 and
-            .configuration.pushes == 5000 and
-            .configuration.pulls == 5000 and
-            .configuration.errorCasesPerClass == 50 and
-            .configuration.locator == "ticket" and
-            .configuration.relay == "custom" and
-            (.configuration.relayUrlFingerprints | type == "array" and length == $relayCount) and
-            (.relayEvidence.configured | sort) == (.configuration.relayUrlFingerprints | sort) and
-            .relayEvidence.attemptVisibility == "explicit-candidates" and
-            (.relayEvidence.attempted | type == "array") and
-            ([.relayEvidence.configured[], .relayEvidence.attempted[],
-              .relayEvidence.connected[], .relayEvidence.denied[]] |
-              all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
-            .totals.successfulFiles == 10000 and
-            .totals.authenticationEventsPerEndpoint == 1 and
-            .negativeCases.rpcCanaries == 100 and
-            .negativeCases.senderCancellationLanes == 1 and
-            .negativeCases.senderCancellationTrigger == "first-data-progress" and
-            ([
-              .negativeCases.controlAttempts.rejectedPushes,
-              .negativeCases.controlAttempts.revokedPulls,
-              .negativeCases.controlAttempts.senderCancellations,
-              .negativeCases.controlAttempts.destinationFailures
-            ] | all(.[];
-              .logicalCases == 50 and
-              .senderOpenedBi == 50 and
-              .receiverAcceptedBi == 50 and
-              .exact == true
-            )) and
-            (.negativeCases.destinationFailureAttemptsByIndex | length == 50 and all(.[]; . == 1))
-          ' release-evidence/files/files-10000.json >/dev/null
-          EXPECTED_CUSTOM_RELAY_COUNT="$release_relay_count" LOCATOR=ticket RELAY=custom \
-            bash scripts/validate-lab-driver.sh evidence p2prpc-lab-mixed-suite \
-              release-evidence/mixed/mixed-load.json release
-          EXPECTED_CUSTOM_RELAY_COUNT="$release_relay_count" \
-            bash scripts/validate-lab-driver.sh evidence p2prpc-lab-release-suite \
-              release-evidence/mixed/release-suite.json
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-      - name: Install dependencies without undeclared lifecycle scripts
+      - name: Install locked dependencies without undeclared lifecycle scripts
         run: npm ci --strict-allow-scripts
-      - name: Validate release
-        run: npm run lint && npm run typecheck && npm test && npm run test:integration && npm run build
+      - name: Verify exact semver tag
+        run: npm run check:release-tag -- "$GITHUB_REF"
+      - name: Validate GitHub Actions workflows
+        run: bash scripts/check-github-actions.sh
+      - name: Verify exact main-branch CI gate
+        id: ci
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")"
+          run_id="$(jq -er --arg sha "$GITHUB_SHA" '
+            [.workflow_runs[] |
+              select(
+                .head_sha == $sha and
+                .status == "completed" and
+                .conclusion == "success" and
+                .event == "push" and
+                .head_branch == "main" and
+                .path == ".github/workflows/ci.yml"
+              )][0].id
+          ' <<< "$runs")" || {
+            echo "No successful main-branch CI run exists for tagged commit $GITHUB_SHA" >&2
+            exit 1
+          }
+          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+          jq -e --arg sha "$GITHUB_SHA" '
+            select(
+              .head_sha == $sha and
+              .head_branch == "main" and
+              .event == "push" and
+              .path == ".github/workflows/ci.yml" and
+              .status == "completed" and
+              .conclusion == "success"
+            )
+          ' <<< "$run" >/dev/null
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+      - name: Validate source and native integration
+        run: >-
+          npm run lint &&
+          npm run typecheck &&
+          npm test &&
+          npm run test:integration &&
+          npm run build &&
+          npm run check:docs &&
+          npm run docs:build
       - name: Audit dependencies
         run: npm audit --audit-level=low
       - name: Read package version
@@ -237,37 +89,49 @@ jobs:
         run: |
           version="$(node -p "require('./packages/core/package.json').version")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-      - name: Build exact release artifact and evidence
+      - name: Build and verify exact release artifact
         shell: bash
         env:
+          CI_RUN_ID: ${{ steps.ci.outputs.run-id }}
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
-          PRODUCTION_RUN_ID: ${{ inputs.production_validation_run_id }}
         run: |
           npm run pack:artifact -- release-artifact
           tarball="$(jq -er '.[0].filename' release-artifact/pack.json)"
-          [[ -f "release-artifact/$tarball" ]]
-          npm run check:package-content -- "release-artifact/$tarball" release-artifact/pack.json
-          npm run check:package-publint -- "release-artifact/$tarball"
-          npm run check:package-types -- "release-artifact/$tarball"
-          npm run test:packed -- "release-artifact/$tarball"
-          npm run test:tree-shaken-native -- "release-artifact/$tarball"
+          artifact="release-artifact/$tarball"
+          npm run check:package-content -- "$artifact" release-artifact/pack.json
+          npm run check:package-publint -- "$artifact"
+          npm run check:package-types -- "$artifact"
+          npm run test:packed -- "$artifact"
+          npm run test:tree-shaken-native -- "$artifact"
           npm run generate:release-sbom -- \
-            "release-artifact/$tarball" \
+            "$artifact" \
             release-artifact/sbom.cdx.json \
             release-artifact/registry-signatures.json
           integrity="$(jq -er '.[0].integrity' release-artifact/pack.json)"
-          sha256="$(sha256sum "release-artifact/$tarball" | awk '{ print $1 }')"
-          [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]
+          sha256="$(sha256sum "$artifact" | awk '{ print $1 }')"
+          dist_tag=latest
+          if [[ "$RELEASE_VERSION" == *-* ]]; then dist_tag=next; fi
           jq -n \
             --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
             --arg version "$RELEASE_VERSION" \
             --arg tarball "$tarball" \
             --arg integrity "$integrity" \
             --arg sha256 "$sha256" \
-            --arg productionRunId "$PRODUCTION_RUN_ID" \
-            '{schemaVersion:2, commit:$commit, version:$version, tarball:$tarball, integrity:$integrity, sha256:$sha256, productionValidationRunId:$productionRunId}' \
-            > release-artifact/manifest.json
+            --arg distTag "$dist_tag" \
+            --arg ciRunId "$CI_RUN_ID" \
+            '{
+              schemaVersion: 3,
+              package: "@arduano/p2prpc-core",
+              commit: $commit,
+              distTag: $distTag,
+              ref: $ref,
+              version: $version,
+              tarball: $tarball,
+              integrity: $integrity,
+              sha256: $sha256,
+              ciRunId: $ciRunId
+            }' > release-artifact/manifest.json
           (
             cd release-artifact
             sha256sum \
@@ -278,102 +142,98 @@ jobs:
               registry-signatures.json \
               > SHA256SUMS
           )
-      - name: Upload immutable release artifact
+      - name: Upload immutable release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: npm-release-candidate-${{ github.sha }}
+          name: p2prpc-release-candidate-${{ github.sha }}
           path: release-artifact/
           if-no-files-found: error
           overwrite: true
-          retention-days: 30
+          retention-days: 90
 
   publish:
-    name: Trusted publish exact candidate
+    name: Publish exact GitHub Package
     needs: candidate
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: npm
+    timeout-minutes: 15
+    environment: github-packages
     permissions:
       actions: read
+      attestations: write
+      contents: read
       id-token: write
+      packages: write
     steps:
-      - name: Set up trusted-publishing Node.js
+      - name: Set up GitHub Packages authentication
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Download immutable release artifact
+          registry-url: https://npm.pkg.github.com
+          scope: '@arduano'
+      - name: Download immutable release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: npm-release-candidate-${{ github.sha }}
+          name: p2prpc-release-candidate-${{ github.sha }}
           path: release-artifact
-      - name: Verify and publish or recover the exact registry candidate
+      - name: Verify release manifest
+        id: artifact
+        shell: bash
+        run: |
+          (cd release-artifact && sha256sum --check SHA256SUMS)
+          jq -e --arg commit "$GITHUB_SHA" --arg ref "$GITHUB_REF" '
+            (keys | sort) == [
+              "ciRunId", "commit", "distTag", "integrity", "package",
+              "ref", "schemaVersion", "sha256", "tarball", "version"
+            ] and
+            .schemaVersion == 3 and
+            .package == "@arduano/p2prpc-core" and
+            .commit == $commit and
+            .ref == $ref and
+            .ref == ("refs/tags/v" + .version) and
+            .distTag == (if (.version | contains("-")) then "next" else "latest" end) and
+            (.ciRunId | test("^[1-9][0-9]*$")) and
+            (.integrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$")) and
+            (.sha256 | test("^[0-9a-f]{64}$")) and
+            .tarball == ("arduano-p2prpc-core-" + .version + ".tgz")
+          ' release-artifact/manifest.json >/dev/null
+          tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - name: Attest immutable package bytes
+        id: provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v4.2.2
+        with:
+          subject-path: release-artifact/${{ steps.artifact.outputs.tarball }}
+      - name: Preserve provenance bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p2prpc-provenance-${{ github.sha }}
+          path: ${{ steps.provenance.outputs.bundle-path }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Publish or recover the exact registry candidate
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          PRODUCTION_RUN_ID: ${{ inputs.production_validation_run_id }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          jq -e --arg commit "$GITHUB_SHA" --arg productionRunId "$PRODUCTION_RUN_ID" '
-            (keys | sort) == [
-              "commit",
-              "integrity",
-              "productionValidationRunId",
-              "schemaVersion",
-              "sha256",
-              "tarball",
-              "version"
-            ] and
-            .schemaVersion == 2 and
-            .commit == $commit and
-            .productionValidationRunId == $productionRunId and
-            (.productionValidationRunId | test("^[1-9][0-9]*$")) and
-            (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")) and
-            (.integrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$")) and
-            (.sha256 | test("^[0-9a-f]{64}$"))
-          ' release-artifact/manifest.json >/dev/null
-          (cd release-artifact && sha256sum --check SHA256SUMS)
           tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
           version="$(jq -er '.version' release-artifact/manifest.json)"
-          [[ "$tarball" =~ ^p2prpc-core-[0-9A-Za-z._-]+\.tgz$ ]]
-          [[ "$tarball" == "p2prpc-core-${version}.tgz" ]]
-          [[ -f "release-artifact/$tarball" ]]
-          jq -e \
-            --arg version "$version" \
-            --arg tarball "$tarball" \
-            --arg integrity "$(jq -er '.integrity' release-artifact/manifest.json)" '
-              length == 1 and
-              .[0].name == "@p2prpc/core" and
-              .[0].version == $version and
-              .[0].filename == $tarball and
-              .[0].integrity == $integrity
-            ' release-artifact/pack.json >/dev/null
-          expected_sha256="$(jq -er '.sha256' release-artifact/manifest.json)"
-          [[ "$(sha256sum "release-artifact/$tarball" | awk '{ print $1 }')" == "$expected_sha256" ]]
+          dist_tag="$(jq -er '.distTag' release-artifact/manifest.json)"
           expected_integrity="$(jq -er '.integrity' release-artifact/manifest.json)"
-          actual_integrity="$(node -e '
-            const { createHash } = require("node:crypto");
-            const { readFileSync } = require("node:fs");
-            process.stdout.write("sha512-" + createHash("sha512").update(readFileSync(process.argv[1])).digest("base64"));
-          ' "release-artifact/$tarball")"
-          [[ "$actual_integrity" == "$expected_integrity" ]]
-          npm_version="$(npm --version)"
-          node -e '
-            const [major, minor] = process.argv[1].split(".").map(Number);
-            if (major < 11 || (major === 11 && minor < 5)) process.exit(1);
-          ' "$npm_version"
-
-          registry_dir="$RUNNER_TEMP/npm-existing-candidate"
+          registry_dir="$RUNNER_TEMP/registry-candidate"
           mkdir -p "$registry_dir"
           verify_existing_candidate() {
-            local response registry_integrity tags registry_tarball
-            response="$(npm view "@p2prpc/core@$version" dist.integrity --json 2> "$registry_dir/view-error.log")" || return 1
+            local response registry_integrity registry_tarball tags
+            response="$(npm view "@arduano/p2prpc-core@$version" dist.integrity \
+              --json --registry=https://npm.pkg.github.com 2> "$registry_dir/view-error.log")" || return 1
             registry_integrity="$(jq -er '.' <<< "$response")" || return 1
             [[ "$registry_integrity" == "$expected_integrity" ]] || {
               echo "Registry version exists with different integrity" >&2
               return 2
             }
             rm -f -- "$registry_dir"/*.tgz "$registry_dir/pack.json"
-            npm pack "@p2prpc/core@$version" \
+            npm pack "@arduano/p2prpc-core@$version" \
+              --registry=https://npm.pkg.github.com \
               --ignore-scripts \
               --pack-destination "$registry_dir" \
               --json > "$registry_dir/pack.json" || return 1
@@ -382,16 +242,13 @@ jobs:
               echo "Registry tarball differs from the immutable release candidate" >&2
               return 2
             }
-            tags="$(npm view '@p2prpc/core' dist-tags --json 2> "$registry_dir/tags-error.log")" || return 1
-            jq -e --arg tag "$RELEASE_TAG" --arg version "$version" '.[$tag] == $version' \
-              <<< "$tags" >/dev/null || {
-                echo "Registry version exists, but the requested dist-tag does not identify it" >&2
-                return 3
-              }
+            tags="$(npm view '@arduano/p2prpc-core' dist-tags \
+              --json --registry=https://npm.pkg.github.com 2> "$registry_dir/tags-error.log")" || return 1
+            jq -e --arg tag "$dist_tag" --arg version "$version" '.[$tag] == $version' \
+              <<< "$tags" >/dev/null || return 3
           }
-
           if verify_existing_candidate; then
-            echo "Exact npm publication already exists; continuing with verification"
+            echo "Exact GitHub Package already exists"
           else
             existing_status=$?
             if (( existing_status == 2 || existing_status == 3 )); then exit 1; fi
@@ -399,20 +256,17 @@ jobs:
               cat "$registry_dir/view-error.log" >&2
               exit 1
             fi
-            npm ping >/dev/null
+            npm ping --registry=https://npm.pkg.github.com >/dev/null
             set +e
             npm publish "release-artifact/$tarball" \
               --ignore-scripts \
               --access public \
-              --provenance \
-              --tag "$RELEASE_TAG" \
+              --registry=https://npm.pkg.github.com \
+              --tag "$dist_tag" \
               2>&1 | tee "$registry_dir/publish.log"
             publish_status=${PIPESTATUS[0]}
             set -e
             if (( publish_status != 0 )); then
-              # npm may accept immutable bytes before the client loses its
-              # response. Recover only after those exact bytes and tag become
-              # publicly observable; every mismatch remains a hard failure.
               recovered=false
               for (( attempt = 0; attempt < 12; attempt += 1 )); do
                 if verify_existing_candidate; then
@@ -420,71 +274,72 @@ jobs:
                   break
                 else
                   status=$?
-                  if (( status == 2 )); then exit 1; fi
+                  if (( status == 2 || status == 3 )); then exit 1; fi
                 fi
                 sleep 5
               done
               [[ "$recovered" == "true" ]] || exit "$publish_status"
-              echo "Recovered an ambiguously acknowledged exact npm publication"
+              echo "Recovered an ambiguously acknowledged exact publication"
             fi
           fi
 
   verify-publication:
-    name: Verify public bytes, signatures, and provenance
+    name: Verify registry bytes and downstream install
     needs: [candidate, publish]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       actions: read
+      attestations: read
+      contents: read
+      packages: read
     steps:
-      - name: Set up verification Node.js
+      - name: Set up GitHub Packages authentication
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Download immutable release artifact
+          registry-url: https://npm.pkg.github.com
+          scope: '@arduano'
+      - name: Download immutable release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: npm-release-candidate-${{ github.sha }}
+          name: p2prpc-release-candidate-${{ github.sha }}
           path: release-artifact
-      - name: Verify registry publication and Sigstore provenance
+      - name: Download provenance bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: p2prpc-provenance-${{ github.sha }}
+          path: provenance
+      - name: Verify publication
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           (cd release-artifact && sha256sum --check SHA256SUMS)
           version="$(jq -er '.version' release-artifact/manifest.json)"
           tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
           expected_integrity="$(jq -er '.integrity' release-artifact/manifest.json)"
-          expected_sha512="$(node -e '
-            const { createHash } = require("node:crypto");
-            const { readFileSync } = require("node:fs");
-            process.stdout.write(createHash("sha512").update(readFileSync(process.argv[1])).digest("hex"));
-          ' "release-artifact/$tarball")"
-          verification="$RUNNER_TEMP/npm-publication"
+          verification="$RUNNER_TEMP/publication"
           mkdir -p "$verification/consumer" "$verification/registry"
           found=false
           for (( attempt = 0; attempt < 12; attempt += 1 )); do
-            if response="$(npm view "@p2prpc/core@$version" dist.integrity --json 2>/dev/null)" &&
+            if response="$(npm view "@arduano/p2prpc-core@$version" dist.integrity \
+              --json --registry=https://npm.pkg.github.com 2>/dev/null)" &&
               registry_integrity="$(jq -er '.' <<< "$response")"; then
               found=true
               break
             fi
             sleep 5
           done
-          [[ "$found" == "true" ]] || {
-            echo "Published package did not become visible in time" >&2
-            exit 1
-          }
-          [[ "$registry_integrity" == "$expected_integrity" ]]
-          npm pack "@p2prpc/core@$version" \
+          [[ "$found" == "true" && "$registry_integrity" == "$expected_integrity" ]]
+          npm pack "@arduano/p2prpc-core@$version" \
+            --registry=https://npm.pkg.github.com \
             --ignore-scripts \
             --pack-destination "$verification/registry" \
             --json > "$verification/registry/pack.json"
           registry_tarball="$(jq -er '.[0].filename' "$verification/registry/pack.json")"
-          cmp --silent "release-artifact/$tarball" "$verification/registry/$registry_tarball" || {
-            echo "Registry tarball differs from the validated release candidate" >&2
-            exit 1
-          }
+          cmp --silent "release-artifact/$tarball" "$verification/registry/$registry_tarball"
           cd "$verification/consumer"
           npm init --yes >/dev/null
           npm install \
@@ -493,209 +348,106 @@ jobs:
             --strict-peer-deps \
             --fund=false \
             --audit=false \
-            "@p2prpc/core@$version"
-          provenance_verified=false
-          for (( attempt = 0; attempt < 12; attempt += 1 )); do
-            if npm audit signatures --omit=dev --json --include-attestations > signatures.json &&
-              jq -e --arg version "$version" '
-                (.invalid | length) == 0 and
-                (.missing | length) == 0 and
-                any(.verified[];
-                  .name == "@p2prpc/core" and
-                  .version == $version and
-                  .attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"
-                )
-              ' signatures.json >/dev/null; then
-              provenance_verified=true
-              break
-            fi
-            sleep 5
-          done
-          [[ "$provenance_verified" == "true" ]] || {
-            echo "Published package provenance did not become verifiable in time" >&2
+            "@arduano/p2prpc-core@$version"
+          node --input-type=module - <<'NODE'
+          import assert from 'node:assert/strict';
+          import * as core from '@arduano/p2prpc-core';
+          import * as advanced from '@arduano/p2prpc-core/advanced';
+          import * as testing from '@arduano/p2prpc-core/testing';
+          assert.equal(typeof core.createP2PNode, 'function');
+          assert.equal(typeof advanced.createAdvancedP2PNode, 'function');
+          assert.equal(typeof testing.dangerouslyAllowInsecureSessions, 'function');
+          NODE
+          cd "$GITHUB_WORKSPACE"
+          visibility="$(gh api "/users/${GITHUB_REPOSITORY_OWNER}/packages/npm/p2prpc-core" --jq '.visibility')"
+          [[ "$visibility" == "public" ]] || {
+            echo "::error::Set @arduano/p2prpc-core visibility to public in GitHub package settings, then rerun this workflow."
             exit 1
           }
-          node --input-type=module - \
-            "$version" \
-            "$expected_sha512" \
-            "$GITHUB_SHA" \
-            "$GITHUB_REPOSITORY_ID" \
-            signatures.json \
-            > "$verification/provenance-statement.json" <<'NODE'
-          import assert from 'node:assert/strict';
-          import { readFileSync } from 'node:fs';
-
-          const [version, sha512, commit, repositoryId, signaturesPath] = process.argv.slice(2);
-          const signatures = JSON.parse(readFileSync(signaturesPath, 'utf8'));
-          const packages = signatures.verified.filter((entry) =>
-            entry.name === '@p2prpc/core' && entry.version === version
-          );
-          assert.equal(packages.length, 1, 'Expected one verified @p2prpc/core package');
-          const [published] = packages;
-          assert.equal(published.registry, 'https://registry.npmjs.org/');
-          const bundles = published.attestationBundles.filter((entry) =>
-            entry.predicateType === 'https://slsa.dev/provenance/v1'
-          );
-          assert.equal(bundles.length, 1, 'Expected one verified SLSA provenance bundle');
-          const statement = JSON.parse(Buffer.from(
-            bundles[0].bundle.dsseEnvelope.payload,
-            'base64'
-          ).toString('utf8'));
-          assert.equal(statement._type, 'https://in-toto.io/Statement/v1');
-          assert.equal(statement.predicateType, 'https://slsa.dev/provenance/v1');
-          assert.deepEqual(statement.subject, [{
-            name: `pkg:npm/%40p2prpc/core@${version}`,
-            digest: { sha512 }
-          }]);
-          const definition = statement.predicate.buildDefinition;
-          assert.equal(
-            definition.buildType,
-            'https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1'
-          );
-          const workflow = definition.externalParameters.workflow;
-          assert.equal(workflow.repository, 'https://github.com/arduano/p2prpc');
-          assert.equal(workflow.path.replace(/^\/+/, ''), '.github/workflows/publish.yml');
-          assert.equal(workflow.ref, 'refs/heads/main');
-          assert.equal(definition.internalParameters.github.event_name, 'workflow_dispatch');
-          assert.equal(String(definition.internalParameters.github.repository_id), repositoryId);
-          assert.ok(definition.resolvedDependencies.some((dependency) =>
-            dependency.uri === 'git+https://github.com/arduano/p2prpc@refs/heads/main' &&
-            dependency.digest?.gitCommit === commit
-          ), 'Provenance does not resolve to the published commit');
-          const runDetails = statement.predicate.runDetails;
-          assert.equal(runDetails.builder.id, 'https://github.com/actions/runner/github-hosted');
-          const invocationId = runDetails.metadata.invocationId;
-          const invocation = /^https:\/\/github\.com\/arduano\/p2prpc\/actions\/runs\/([1-9][0-9]*)\/attempts\/([1-9][0-9]*)$/.exec(invocationId);
-          assert.ok(invocation, 'Provenance invocation is not a p2prpc publish workflow run attempt');
-          process.stdout.write(`${JSON.stringify({
-            predicateType: statement.predicateType,
-            subject: statement.subject,
-            buildType: definition.buildType,
-            source: {
-              repository: workflow.repository,
-              workflow: workflow.path.replace(/^\/+/, ''),
-              ref: workflow.ref,
-              commit
-            },
-            builder: runDetails.builder.id,
-            invocationId,
-            invocation: {
-              runId: invocation[1],
-              runAttempt: invocation[2]
-            }
-          }, null, 2)}\n`);
-          NODE
-          publish_run_id="$(jq -er '.invocation.runId' "$verification/provenance-statement.json")"
-          publish_run_attempt="$(jq -er '.invocation.runAttempt' "$verification/provenance-statement.json")"
-          publish_attempt="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${publish_run_id}/attempts/${publish_run_attempt}")"
-          jq -e \
-            --arg commit "$GITHUB_SHA" \
-            --arg repositoryId "$GITHUB_REPOSITORY_ID" \
-            --arg runId "$publish_run_id" \
-            --arg runAttempt "$publish_run_attempt" '
-              (.id | tostring) == $runId and
-              (.run_attempt | tostring) == $runAttempt and
-              .event == "workflow_dispatch" and
-              .path == ".github/workflows/publish.yml" and
-              .head_branch == "main" and
-              .head_sha == $commit and
-              (.repository.id | tostring) == $repositoryId
-            ' <<< "$publish_attempt" >/dev/null || {
-              echo "Published provenance does not identify a trusted run attempt for this commit" >&2
-              exit 1
-            }
+          bundle="$(find provenance -type f -print -quit)"
+          gh attestation verify "release-artifact/$tarball" \
+            --bundle "$bundle" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners \
+            --format json > "$verification/attestation-verification.json"
           jq -n \
-            --arg version "$version" \
+            --arg package "@arduano/p2prpc-core@$version" \
+            --arg registry "https://npm.pkg.github.com" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
             --arg integrity "$expected_integrity" \
-            --arg sha256 "$(sha256sum "$verification/registry/$registry_tarball" | awk '{ print $1 }')" \
-            --slurpfile signatures signatures.json \
-            --slurpfile provenance "$verification/provenance-statement.json" '
-              ($signatures[0].verified[] |
-                select(.name == "@p2prpc/core" and .version == $version)) as $package |
-              {
-                schemaVersion: 2,
-                package: ("@p2prpc/core@" + $version),
-                integrity: $integrity,
-                sha256: $sha256,
-                registry: $package.registry,
-                attestations: $package.attestations,
-                provenance: $provenance[0]
-              }
-            ' > "$verification/publication-verification.json"
-      - name: Upload public-registry verification
+            --arg sha256 "$(sha256sum "release-artifact/$tarball" | awk '{ print $1 }')" \
+            --slurpfile attestation "$verification/attestation-verification.json" \
+            '{
+              schemaVersion: 1,
+              package: $package,
+              registry: $registry,
+              commit: $commit,
+              ref: $ref,
+              integrity: $integrity,
+              sha256: $sha256,
+              attestation: $attestation[0]
+            }' > "$verification/publication-verification.json"
+      - name: Upload publication verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: npm-publication-verification-${{ github.sha }}
-          path: ${{ runner.temp }}/npm-publication/publication-verification.json
+          name: p2prpc-publication-verification-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/publication/attestation-verification.json
+            ${{ runner.temp }}/publication/publication-verification.json
           if-no-files-found: error
           overwrite: true
           retention-days: 90
 
   github-release:
-    name: Create GitHub release after registry verification
-    needs: [candidate, verify-publication]
+    name: Create GitHub release
+    needs: [candidate, publish, verify-publication]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       actions: read
       contents: write
     steps:
-      - name: Download published artifact
+      - name: Download immutable release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: npm-release-candidate-${{ github.sha }}
+          name: p2prpc-release-candidate-${{ github.sha }}
           path: release-artifact
-      - name: Download public-registry verification
+      - name: Download provenance bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: npm-publication-verification-${{ github.sha }}
+          name: p2prpc-provenance-${{ github.sha }}
+          path: provenance
+      - name: Download publication verification
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: p2prpc-publication-verification-${{ github.sha }}
           path: publication-verification
-      - name: Create GitHub release
+      - name: Create or recover exact GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIST_TAG: ${{ inputs.tag }}
         run: |
+          (cd release-artifact && sha256sum --check SHA256SUMS)
           version="$(jq -er '.version' release-artifact/manifest.json)"
           tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
-          integrity="$(jq -er '.integrity' release-artifact/manifest.json)"
-          sha256="$(jq -er '.sha256' release-artifact/manifest.json)"
+          [[ "$GITHUB_REF_NAME" == "v$version" ]]
           jq -e \
-            --arg version "$version" \
-            --arg integrity "$integrity" \
-            --arg sha256 "$sha256" \
-            --arg commit "$GITHUB_SHA" '
-              .schemaVersion == 2 and
-              .package == ("@p2prpc/core@" + $version) and
-              .integrity == $integrity and
-              .sha256 == $sha256 and
-              .registry == "https://registry.npmjs.org/" and
-              .attestations.provenance.predicateType == "https://slsa.dev/provenance/v1" and
-              .provenance.predicateType == "https://slsa.dev/provenance/v1" and
-              .provenance.buildType == "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1" and
-              .provenance.builder == "https://github.com/actions/runner/github-hosted" and
-              .provenance.subject == [{
-                name: ("pkg:npm/%40p2prpc/core@" + $version),
-                digest: { sha512: .provenance.subject[0].digest.sha512 }
-              }] and
-              (.provenance.subject[0].digest.sha512 | test("^[0-9a-f]{128}$")) and
-              .provenance.source == {
-                repository: "https://github.com/arduano/p2prpc",
-                workflow: ".github/workflows/publish.yml",
-                ref: "refs/heads/main",
-                commit: $commit
-              } and
-              (.provenance.invocationId |
-                test("^https://github\\.com/arduano/p2prpc/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*$")) and
-              .provenance.invocation == {
-                runId: .provenance.invocation.runId,
-                runAttempt: .provenance.invocation.runAttempt
-              } and
-              (.provenance.invocation.runId | test("^[1-9][0-9]*$")) and
-              (.provenance.invocation.runAttempt | test("^[1-9][0-9]*$"))
+            --arg package "@arduano/p2prpc-core@$version" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" '
+              .schemaVersion == 1 and
+              .package == $package and
+              .registry == "https://npm.pkg.github.com" and
+              .commit == $commit and
+              .ref == $ref and
+              (.attestation | type == "array" and length >= 1)
             ' publication-verification/publication-verification.json >/dev/null
-          release_tag="v$version"
-          release_title="@p2prpc/core $version"
+          bundle="$(find provenance -type f -print -quit)"
+          title="@arduano/p2prpc-core $version"
           assets=(
             release-artifact/SHA256SUMS
             release-artifact/manifest.json
@@ -703,53 +455,41 @@ jobs:
             "release-artifact/$tarball"
             release-artifact/sbom.cdx.json
             release-artifact/registry-signatures.json
+            "$bundle"
+            publication-verification/attestation-verification.json
             publication-verification/publication-verification.json
           )
-          release_args=(
-            --target "$GITHUB_SHA"
-            --title "$release_title"
-            --generate-notes
-          )
-          if [[ "$DIST_TAG" == "next" ]]; then
-            release_args+=(--prerelease)
-          fi
-          if existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" 2>/dev/null)"; then
+          if existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null)"; then
             expected_prerelease=false
-            if [[ "$DIST_TAG" == "next" ]]; then expected_prerelease=true; fi
+            if [[ "$version" == *-* ]]; then expected_prerelease=true; fi
             jq -e \
-              --arg tag "$release_tag" \
-              --arg target "$GITHUB_SHA" \
-              --arg title "$release_title" \
+              --arg tag "$GITHUB_REF_NAME" \
+              --arg title "$title" \
               --argjson prerelease "$expected_prerelease" '
                 .tag_name == $tag and
-                .target_commitish == $target and
                 .name == $title and
                 .draft == false and
                 .prerelease == $prerelease
-              ' <<< "$existing" >/dev/null || {
-                echo "Existing GitHub release does not match the immutable candidate" >&2
-                exit 1
-              }
-            gh release upload "$release_tag" "${assets[@]}" --clobber
+            ' <<< "$existing" >/dev/null
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
-            gh release create "$release_tag" "${assets[@]}" "${release_args[@]}"
+            args=(--verify-tag --title "$title" --generate-notes)
+            if [[ "$version" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${args[@]}"
           fi
-
-          expected_assets="$(printf '%s\n' "${assets[@]}" | while IFS= read -r asset; do basename "$asset"; done | jq -R . | jq -s 'sort')"
-          published_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}")"
+          expected_assets="$(printf '%s\n' "${assets[@]}" |
+            while IFS= read -r asset; do basename "$asset"; done | jq -R . | jq -s 'sort')"
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
           jq -e --argjson expected "$expected_assets" '
             ([.assets[].name] | sort) == $expected and
             ([.assets[].name] | length) == ([.assets[].name] | unique | length)
-          ' <<< "$published_release" >/dev/null || {
-            echo "GitHub release asset set is not exact" >&2
-            exit 1
-          }
+          ' <<< "$release" >/dev/null
           download_dir="$RUNNER_TEMP/github-release-assets"
           mkdir -p "$download_dir"
-          gh release download "$release_tag" --dir "$download_dir"
+          gh release download "$GITHUB_REF_NAME" --dir "$download_dir"
           for asset in "${assets[@]}"; do
             cmp --silent "$asset" "$download_dir/$(basename "$asset")" || {
-              echo "GitHub release asset differs from the verified candidate: $(basename "$asset")" >&2
+              echo "GitHub release asset differs from verified source: $(basename "$asset")" >&2
               exit 1
             }
           done

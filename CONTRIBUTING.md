@@ -23,7 +23,7 @@ npm run test:integration
 npm run build
 npm run test:minimum-runtime
 npm run docs:build
-npm pack --dry-run -w @p2prpc/core
+npm pack --dry-run -w @arduano/p2prpc-core
 npm audit --audit-level=low
 ```
 

@@ -1,6 +1,6 @@
 # Third-party notices
 
-`@p2prpc/core` does not bundle third-party runtime source or native binaries. Its npm artifact imports separately installed dependencies, which remain under their own terms. The lockfile records the exact versions used by this repository.
+`@arduano/p2prpc-core` does not bundle third-party runtime source or native binaries. Its npm artifact imports separately installed dependencies, which remain under their own terms. The lockfile records the exact versions used by this repository.
 
 | Direct runtime dependency | Declared license | Source |
 |---|---|---|

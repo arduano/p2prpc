@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import process from 'node:process';
 
 process.env.NAPI_RS_ENFORCE_VERSION_CHECK = '1';
-const { fileSource } = await import('@p2prpc/core');
+const { fileSource } = await import('@arduano/p2prpc-core');
 
 const directory = await mkdtemp(join(tmpdir(), 'p2prpc-minimum-runtime-'));
 try {

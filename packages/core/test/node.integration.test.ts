@@ -70,6 +70,14 @@ const router = t.router({
   }),
   count: t.procedure.input(z.number().int().positive()).subscription(async function* ({ input, signal }) {
     for (let index = 0; index < input && !signal?.aborted; index += 1) yield index;
+  }),
+  hold: t.procedure.subscription(async function* ({ signal }) {
+    yield 'ready';
+    if (signal?.aborted) return;
+    await new Promise<void>((resolve) => {
+      const finish = () => resolve();
+      signal?.addEventListener('abort', finish, { once: true });
+    });
   })
 });
 type Router = typeof router;
@@ -348,6 +356,111 @@ describe('Iroh integration', () => {
     expect(await readFile(pulledPath)).toEqual(content);
   });
 
+  it('keeps one physical session reusable across subscription replacement churn', { timeout: 60_000 }, async () => {
+    const receiver = await makeNode();
+    const sender = await makeNode();
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
+
+    for (let batch = 0; batch < 25; batch += 1) {
+      const started = Array.from({ length: 4 }, () => deferred<void>());
+      const subscriptions = started.map((ready) => peer.rpc.hold.subscribe(undefined, {
+        onStarted: () => ready.resolve(),
+        onData: () => undefined,
+        onError: (error) => ready.reject(error)
+      }));
+      await Promise.all(started.map((ready) => ready.promise));
+      for (const subscription of subscriptions) subscription.unsubscribe();
+
+      const canaries = await Promise.all(
+        Array.from({ length: 4 }, (_, index) =>
+          peer.rpc.add.query({ left: batch * 4 + index, right: 1 })
+        )
+      );
+      expect(canaries.map((result) => result.value)).toEqual(
+        Array.from({ length: 4 }, (_, index) => batch * 4 + index + 1)
+      );
+    }
+
+    await expect.poll(async () => (await peer.diagnostics()).resources.active.streams).toBe(0);
+  });
+
+  it('reconnects a retained peer proxy after a short authenticated-session expiry', { timeout: 30_000 }, async () => {
+    const ttlMs = 250;
+    const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
+    const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
+
+    await expect(peer.rpc.add.query({ left: 20, right: 1 })).resolves.toMatchObject({ value: 21 });
+    const initialSessionId = (await peer.diagnostics()).sessionId;
+
+    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
+    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
+
+    await expect(peer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
+    expect((await peer.diagnostics()).sessionId).not.toBe(initialSessionId);
+  });
+
+  it('reconnects a retained peer proxy after expiry terminates an active subscription', { timeout: 30_000 }, async () => {
+    const ttlMs = 250;
+    const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
+    const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
+    const peer = await sender.connect<Router>(nodeTarget(receiver));
+    const ready = deferred<void>();
+    const ended = deferred<void>();
+    const subscription = peer.rpc.hold.subscribe(undefined, {
+      onData: () => ready.resolve(),
+      onComplete: () => ended.resolve(),
+      onError: () => ended.resolve()
+    });
+
+    await ready.promise;
+    const initialSessionId = (await peer.diagnostics()).sessionId;
+    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
+    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
+    await ended.promise;
+
+    await expect(peer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
+    expect((await peer.diagnostics()).sessionId).not.toBe(initialSessionId);
+    subscription.unsubscribe();
+  });
+
+  it('publishes a fresh inbound peer after an expired subscription session is redialed', { timeout: 30_000 }, async () => {
+    // Leave enough of the renewed epoch for the reverse-call canary even on a
+    // busy CI host; this is still short enough to exercise real timer expiry.
+    const ttlMs = 750;
+    const inboundPeers: Peer<Router>[] = [];
+    const receiver = await makeNode(
+      undefined,
+      dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }),
+      (peer) => inboundPeers.push(peer)
+    );
+    const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
+    const outboundPeer = await sender.connect<Router>(nodeTarget(receiver));
+    const ready = deferred<void>();
+    const ended = deferred<void>();
+    const subscription = outboundPeer.rpc.hold.subscribe(undefined, {
+      onData: () => ready.resolve(),
+      onComplete: () => ended.resolve(),
+      onError: () => ended.resolve()
+    });
+
+    await ready.promise;
+    await expect.poll(() => inboundPeers.length).toBe(1);
+    const expiredInboundPeer = inboundPeers[0]!;
+    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
+    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
+    await ended.promise;
+    await expect(expiredInboundPeer.rpc.add.query({ left: 1, right: 1 }))
+      .rejects.toMatchObject({ cause: { code: 'DISCONNECTED' } });
+
+    await expect(outboundPeer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
+    await expect.poll(() => inboundPeers.length, { timeout: 5_000 }).toBe(2);
+    const currentInboundPeer = receiver.getPeer<Router>(sender.id);
+    expect(currentInboundPeer).toBeDefined();
+    await expect(currentInboundPeer!.rpc.add.query({ left: 20, right: 1 })).resolves.toMatchObject({ value: 21 });
+    subscription.unsubscribe();
+  });
+
   it('invalidates captured request file facades with their exact authenticated session', { timeout: 30_000 }, async () => {
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
@@ -377,4 +490,18 @@ function nodeTarget(node: P2PNode<Router>): ConnectOptions {
       tenantId: null
     }
   };
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (cause: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
 }

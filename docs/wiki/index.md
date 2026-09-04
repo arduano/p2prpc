@@ -41,6 +41,6 @@ features:
 
 <div class="home-intro">
 
-This site documents **p2prpc wire protocol v4** as implemented by `@p2prpc/core`. Start with the [five-minute system model](Home.md), then follow the lifecycle and audit pages when you need control-level detail.
+This site documents **p2prpc wire protocol v4** as implemented by `@arduano/p2prpc-core`. Start with the [five-minute system model](Home.md), then follow the lifecycle and audit pages when you need control-level detail.
 
 </div>

@@ -91,6 +91,12 @@ export class ManagedConnection implements QuicConnection {
       } else if (!stream) {
         this.opening.delete(lease);
         lease.release();
+        // A raw transport that cannot open a stream is no longer a usable
+        // connection, even if its separate closed() notification has not
+        // arrived yet. Quarantine it so retained Peer proxies can move to the
+        // disconnected state and redial instead of retrying one stale native
+        // session handle forever.
+        this.quarantine('Bidirectional stream opening failed');
       } else if (!this.closedForOpens) {
         // This is only reachable if wrapping the native stream itself throws.
         // Quarantine it: no caller owns its terminal halves. Admission remains
@@ -143,6 +149,7 @@ export class ManagedConnection implements QuicConnection {
       } else if (!stream) {
         this.opening.delete(lease);
         lease.release();
+        this.quarantine('Unidirectional stream opening failed');
       } else if (!this.closedForOpens) {
         this.quarantine('Stream adoption failed');
         this.settleLateUni(Promise.resolve(stream), lease);

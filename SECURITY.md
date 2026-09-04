@@ -4,7 +4,7 @@
 
 Do not open a public issue with secrets or exploit details. Use [GitHub private vulnerability reporting](https://github.com/arduano/p2prpc/security/advisories/new) and include affected commit/version, impact, reproduction, and any proposed mitigation. Rotate credentials, capability tokens, or endpoint keys included in a report.
 
-Before the first npm release, only `main` is supported. After releases begin, the current minor line and `main` are intended to receive fixes.
+Before the first registry release, only `main` is supported. After releases begin, the current minor line and `main` are intended to receive fixes.
 
 ## Security target
 
@@ -92,7 +92,7 @@ p2prpc is a resource server, not an authorization server: applications own brows
 - Treat capability tokens as secrets; never put them in headers, logs, traces, or durable audit records.
 - Export `onSecurityEvent` to a monitored durable sink. The in-process callback is intentionally best effort.
 - Bound application procedures, schemas, databases, custom callbacks, disk use, and tenant workloads above library limits. Cooperate promptly with supplied `AbortSignal`s.
-- Review any import from `@p2prpc/core/advanced` as part of the trusted computing base. Never deploy `@p2prpc/core/testing`.
+- Review any import from `@arduano/p2prpc-core/advanced` as part of the trusted computing base. Never deploy `@arduano/p2prpc-core/testing`.
 
 ## Discovery and native boundary
 
@@ -120,4 +120,4 @@ p2prpc is a resource server, not an authorization server: applications own brows
 
 ## Release status
 
-Local tests create a candidate, not production approval. The exact source commit must also pass ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled two-host cases; 100-peer mixed workload; and 5,000 pushes plus 5,000 pulls over one authenticated physical connection with stream/task/share/reconciliation/memory/native-handle return-to-baseline. No qualifying external evidence is claimed until those artifacts exist. The one published tarball is then built from that commit, validated without rebuilding in the publish job, and bound to the lab run by the release manifest. See [Production Validation](./docs/wiki/Production-Validation.md).
+Public CI and package gates establish a releasable pre-1.0 artifact, not formal production approval. The stronger qualification additionally exercises ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled two-host cases; a 100-peer mixed workload; and 5,000 pushes plus 5,000 pulls over one authenticated physical connection with stream/task/share/reconciliation/memory/native-handle return-to-baseline. No qualifying external evidence is claimed until those artifacts exist. See [Production Validation](./docs/wiki/Production-Validation.md).

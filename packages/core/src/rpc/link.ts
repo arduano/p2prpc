@@ -192,6 +192,15 @@ export function irohLink<TRouter extends AnyTRPCRouter>(options: IrohLinkOptions
           );
           requestSent = true;
           ensureActive();
+          // Match tRPC's subscription lifecycle contract.  In particular,
+          // consumers need a positive boundary at which an unsubscribe can no
+          // longer race a still-pending native stream open.  Emitting started
+          // only after the complete request is on the wire makes that boundary
+          // useful without claiming that the remote procedure has produced an
+          // item yet.
+          if (op.type === 'subscription') {
+            observer.next({ result: { type: 'started' } });
+          }
 
           // Application response liveness belongs to the caller's AbortSignal.
           // A fixed transport timer would make a healthy long-running query or

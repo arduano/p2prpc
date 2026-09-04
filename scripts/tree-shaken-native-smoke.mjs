@@ -17,8 +17,8 @@ try {
   const installedManifest = JSON.parse(await readFile(join(
     directory,
     'node_modules',
-    '@p2prpc',
-    'core',
+    '@arduano',
+    'p2prpc-core',
     'package.json'
   ), 'utf8'));
   const external = [...new Set([
@@ -30,7 +30,7 @@ try {
   const output = join(directory, 'bundle.mjs');
   await writeFile(entry, `
     import { initTRPC } from '@trpc/server';
-    import { createP2PNode, createSharedSecretSecurity } from '@p2prpc/core';
+    import { createP2PNode, createSharedSecretSecurity } from '@arduano/p2prpc-core';
 
     export async function smoke() {
       const t = initTRPC.context().create();
@@ -72,8 +72,8 @@ try {
   });
   const bundleInputs = Object.keys(result.metafile.inputs);
   assert.ok(
-    bundleInputs.some((path) => path.includes('node_modules/@p2prpc/core/dist/')),
-    'Tree-shaken bundle did not include the packed @p2prpc/core runtime'
+    bundleInputs.some((path) => path.includes('node_modules/@arduano/p2prpc-core/dist/')),
+    'Tree-shaken bundle did not include the packed @arduano/p2prpc-core runtime'
   );
   assert.ok(
     bundleInputs.every((path) => !/[\\/]dist[\\/](?:advanced|testing)\.js$/u.test(path)),

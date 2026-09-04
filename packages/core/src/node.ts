@@ -280,7 +280,7 @@ export type P2PNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata = unknow
   readonly endpointFactory?: never;
 };
 
-/** Test-only configuration accepted by `@p2prpc/core/testing`. */
+/** Test-only configuration accepted by `@arduano/p2prpc-core/testing`. */
 export type TestingP2PNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> = Omit<
   AdvancedP2PNodeOptions<TRouter, TFileMetadata>,
   'security'
@@ -322,6 +322,12 @@ const DEFAULT_PEER_CLOSE_REASON = 'Peer closed';
 const MAX_PEER_CLOSE_REASON_BYTES = 256;
 const HANDSHAKE_BUFFER_BYTES = 64 * 1024;
 
+/**
+ * Authenticated peer handle. A handle returned by `connect()` follows that
+ * retained outbound runtime across transport/session replacement. A purely
+ * inbound handle is session scoped; durable reverse routes must retain the
+ * pinned endpoint ID and reacquire the current handle with `getPeer()`.
+ */
 export class Peer<TRemoteRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
   readonly rpc: CreateTRPCClient<TRemoteRouter>;
   readonly files: PeerFiles<TFileMetadata>;
@@ -2757,11 +2763,11 @@ export function createP2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unk
   if (!isPeerBoundSessionSecurity(options?.security)) {
     return Promise.reject(new P2PError(
       'UNAUTHORIZED',
-      'Production nodes require a peer-bound security factory from @p2prpc/core'
+      'Production nodes require a peer-bound security factory from @arduano/p2prpc-core'
     ));
   }
   if (Object.hasOwn(options, 'endpointFactory')) {
-    return Promise.reject(new P2PError('UNAUTHORIZED', 'Custom endpoints are available only from @p2prpc/core/advanced'));
+    return Promise.reject(new P2PError('UNAUTHORIZED', 'Custom endpoints are available only from @arduano/p2prpc-core/advanced'));
   }
   return P2PNode.create(options);
 }

@@ -78,13 +78,13 @@ Cancellation is cooperative in JavaScript: aborting a signal cannot kill an arbi
 
 | Import | Intended use |
 |---|---|
-| `@p2prpc/core` | Production-safe branded security factories, nodes, peers, metadata, and files. |
-| `@p2prpc/core/advanced` | Custom security/transport seams and raw protocol components; part of the deployment TCB. |
-| `@p2prpc/core/testing` | Injected endpoints and explicitly insecure sessions. Never ship in production code. |
+| `@arduano/p2prpc-core` | Production-safe branded security factories, nodes, peers, metadata, and files. |
+| `@arduano/p2prpc-core/advanced` | Custom security/transport seams and raw protocol components; part of the deployment TCB. |
+| `@arduano/p2prpc-core/testing` | Injected endpoints and explicitly insecure sessions. Never ship in production code. |
 
 The alternate transport seam has a fail-closed shape check, but transport semantic conformance still requires the repository integration/lifecycle suite. Raw adapters must ignore managed stream-open options: the wrapper owns cancellation while continuing to observe the native promise, because an adapter must never reject early while a hidden native open can still produce a stream. `closed()` must fulfill only after the physical connection and all native streams are terminal, must expose one shared lifecycle to every caller, and must reject—not fulfill—if closure cannot be observed. A rejection is diagnostic failure, never closure proof; p2prpc then retains admission rather than reporting false quiescence.
 
-`onPeer` is a best-effort notification and is never a correctness dependency. Applications can inspect `peersSnapshot()` and obtain a current authenticated handle with `getPeer()`; session-bound file issuance inside a procedure uses `ctx.p2p.files` directly.
+`onPeer` is a best-effort notification and is never a correctness dependency. Applications can inspect `peersSnapshot()` and obtain a current authenticated handle with `getPeer()`; session-bound file issuance inside a procedure uses `ctx.p2p.files` directly. Inbound `Peer` objects are scoped to their authenticated session, so a durable reverse-RPC binding stores the pinned endpoint ID and resolves `getPeer()` at dispatch time instead of retaining an `onPeer` object across expiry and reauthentication.
 
 A disconnected outbound runtime retains only its frozen locator/endpoint/principal expectations and may be revived by a matching authenticated inbound connection. Initial installation, replacement, revival, duplicate arbitration, and outbound reconnect all converge on one admission-success gate after synchronous callback-capable work. The gate requires an open node, registry ownership, live-map membership, the exact current epoch, and an unexpired session; public promise continuations recheck it after their last `await`, while queued `onPeer` delivery rechecks the captured exact selection. A callback that closes the node or selected peer therefore makes acquisition reject `DISCONNECTED` instead of returning or notifying a dead handle. Endpoint admission, mutual authentication, exact canonical-principal comparison, session expiry, and operation authorization are still rerun. A purely inbound runtime has no trusted dial target and closes with its connection.
 

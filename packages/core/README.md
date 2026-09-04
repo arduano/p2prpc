@@ -1,8 +1,15 @@
-# @p2prpc/core
+# @arduano/p2prpc-core
 
 Type-safe peer-to-peer tRPC and secure parallel file transfer over one authenticated Iroh QUIC connection.
 
-> Pre-1.0 release candidate: this package is configured for public npm publishing but is not released until the exact candidate passes the external production-validation gates.
+> Pre-1.0 package: a release tag publishes to GitHub Packages only after the
+> exact `main` commit passes public CI. Publication alone is not a claim that
+> the optional external production-validation suite has run.
+
+GitHub Packages requires an authenticated npm client, including for public
+packages. See the repository [installation and authentication
+instructions](https://github.com/arduano/p2prpc#install-from-github-packages) before running
+`npm install @arduano/p2prpc-core`.
 
 ## What it guarantees
 
@@ -23,7 +30,7 @@ import {
   createP2PNode,
   createSharedSecretSecurity,
   type PeerContext
-} from '@p2prpc/core';
+} from '@arduano/p2prpc-core';
 
 const t = initTRPC.context<PeerContext>().create();
 const router = t.router({
@@ -50,7 +57,7 @@ const node = await createP2PNode({
 });
 ```
 
-Production root creation accepts only peer-bound security returned by `createSharedSecretSecurity` or `createOidcSessionSecurity`. Custom security/transports live under `@p2prpc/core/advanced`; injected endpoints and the deliberately insecure helper live under `@p2prpc/core/testing`. Structural custom file sources and destinations are accepted by root file APIs and become trusted application code: they must independently meet the documented stability, integrity, publication, cancellation, and cleanup contracts.
+Production root creation accepts only peer-bound security returned by `createSharedSecretSecurity` or `createOidcSessionSecurity`. Custom security/transports live under `@arduano/p2prpc-core/advanced`; injected endpoints and the deliberately insecure helper live under `@arduano/p2prpc-core/testing`. Structural custom file sources and destinations are accepted by root file APIs and become trusted application code: they must independently meet the documented stability, integrity, publication, cancellation, and cleanup contracts.
 
 ## Connect
 
@@ -99,7 +106,7 @@ The OIDC helper verifies configured issuer, audience, algorithms, HTTPS JWKS/sta
 import {
   createOidcSessionSecurity,
   irohPeerIdJwkThumbprint
-} from '@p2prpc/core';
+} from '@arduano/p2prpc-core';
 
 const security = createOidcSessionSecurity({
   issuers: [{

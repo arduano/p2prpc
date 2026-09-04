@@ -80,8 +80,8 @@ The 2026-08-24 follow-up closed the reproduced stale retry-provenance and admiss
 - Packed public API contains no testing/internal leaks and ATTW/publint/install/tree-shake checks pass.
 - External ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled topology cases pass.
 - Mixed workload, 100-peer, and 10,000-file single-physical-connection gates meet error/fairness/memory/native-baseline criteria. The file gate is exactly 5,000 pushes and 5,000 capability pulls and requires zero active/ambiguous operations, bounded tombstones, and task/share/resource/stream return to baseline.
-- The external lab run is tied to the exact source commit; the immutable publish manifest ties that commit and run ID to the one validated tarball.
-- SBOM, registry signatures, tarball digest, and post-publish registry bytes match; verified provenance names this repository, publish workflow, commit, run, and tarball SHA-512.
-- `main`, the `npm` environment, trusted-publisher identity, and dedicated/ephemeral self-hosted lab runners have independently reviewed protections.
+- The immutable publish manifest ties the exact source commit and successful public CI run ID to the one validated tarball. Any separately claimed external lab qualification is tied to that same source commit and retained with its own evidence.
+- SBOM, dependency registry signatures, tarball digest, and post-publish GitHub Packages bytes match; verified GitHub build provenance names this repository, publish workflow, tag, commit, and tarball digest.
+- `main`, release tags, the `github-packages` environment, package access grants, and dedicated/ephemeral self-hosted lab runners have independently reviewed protections.
 
 A green local suite creates a release candidate. It does not substitute for the external relay/discovery/native lifecycle evidence. A same-host, loopback, mocked, reduced, reconnecting, or diagnostics-incomplete run cannot qualify the 10,000-file or two-host topology claims; this repository does not claim those artifacts before they exist for the exact candidate.

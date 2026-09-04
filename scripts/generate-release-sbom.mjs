@@ -56,8 +56,8 @@ try {
   ], { cwd: directory });
   const sbom = JSON.parse(sbomText);
   const rootRef = `${manifest.name}@${manifest.version}`;
-  sbom.metadata.component.group = '@p2prpc';
-  sbom.metadata.component.name = 'core';
+  sbom.metadata.component.group = '@arduano';
+  sbom.metadata.component.name = 'p2prpc-core';
   sbom.metadata.component.hashes = [
     { alg: 'SHA-256', content: createHash('sha256').update(archive.compressed).digest('hex') },
     { alg: 'SHA-512', content: createHash('sha512').update(archive.compressed).digest('hex') }
@@ -65,7 +65,7 @@ try {
   invariant(sbom.bomFormat === 'CycloneDX' && sbom.specVersion === '1.5', 'npm emitted an unexpected SBOM format');
   invariant(sbom.metadata?.component?.['bom-ref'] === rootRef, 'SBOM root does not match the packed package');
   invariant(sbom.metadata.component.version === manifest.version, 'SBOM version does not match the packed package');
-  invariant(sbom.metadata.component.purl === `pkg:npm/%40p2prpc/core@${manifest.version}`, 'SBOM purl does not match the packed package');
+  invariant(sbom.metadata.component.purl === `pkg:npm/%40arduano/p2prpc-core@${manifest.version}`, 'SBOM purl does not match the packed package');
   invariant(
     sbom.metadata.component.licenses?.some((entry) => entry.license?.id === 'MIT'),
     'SBOM root does not declare MIT'
