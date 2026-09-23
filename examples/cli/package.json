@@ -9,9 +9,9 @@
   },
   "dependencies": {
     "@arduano/p2prpc-core": "0.3.0-renewal.0",
-    "@trpc/server": "11.18.0",
+    "@trpc/server": "11.19.0",
     "superjson": "^2.2.6",
-    "zod": "^4.4.3"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "tsx": "^4.23.12"
