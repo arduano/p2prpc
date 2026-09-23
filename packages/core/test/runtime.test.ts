@@ -13,6 +13,38 @@ import type {
 } from '../src/transport/types.js';
 
 describe('structured runtime ownership', () => {
+  it('reserves renewal progress in both directions under full application capacity and bounded queue pressure', async () => {
+    const limits = {
+      ...DEFAULT_RESOURCE_LIMITS, renewalQueueCapacity: 3,
+      global: { ...DEFAULT_RESOURCE_LIMITS.global, handshakes: 1, queued: 1 },
+      perPeer: { ...DEFAULT_RESOURCE_LIMITS.perPeer, handshakes: 1, queued: 1 },
+      perPrincipal: { ...DEFAULT_RESOURCE_LIMITS.perPrincipal, handshakes: 1, queued: 1 }
+    };
+    const scheduler = new ResourceScheduler(limits);
+    const occupiedBytes = limits.perPeer.bufferedBytes -
+      limits.fileControlReserve.perPeer.inbound.bufferedBytes - limits.fileControlReserve.perPeer.outbound.bufferedBytes -
+      limits.fileDataReserve.perPeer.inbound.bufferedBytes - limits.fileDataReserve.perPeer.outbound.bufferedBytes;
+    const application = await scheduler.acquire('peer', { bufferedBytes: occupiedBytes });
+    expect(scheduler.tryAcquire('peer', { bufferedBytes: 1 })).toBeUndefined();
+    const request = { handshakes: 1, bufferedBytes: 64 * 1024, renewal: 'initiator' as const };
+    const initiator = await scheduler.acquire('peer', request);
+    const responder = await scheduler.acquire('peer', { ...request, renewal: 'responder' });
+    expect(scheduler.snapshot().active.handshakes).toBe(2);
+    expect(scheduler.snapshot().active.bufferedBytes).toBe(occupiedBytes + 128 * 1024);
+    const controller = new AbortController();
+    const pending = ['second', 'third', 'fourth'].map((peer) => scheduler.acquire(peer, request, controller.signal));
+    const outcomes = Promise.allSettled(pending);
+    expect(scheduler.snapshot().queued).toBe(3);
+    controller.abort(new Error('test cleanup'));
+    expect((await outcomes).every((result) => result.status === 'rejected')).toBe(true);
+    initiator.release();
+    responder.release();
+    application.release();
+    await scheduler.whenIdle();
+    expect(scheduler.snapshot().active.handshakes).toBe(0);
+    expect(scheduler.snapshot().active.bufferedBytes).toBe(0);
+  });
+
   it('bounds runtime slots by distinct peer ID while sharing same-peer claims', async () => {
     const registry = new RuntimeSlotRegistry<object>(1);
     const first = registry.reserve('peer-a');

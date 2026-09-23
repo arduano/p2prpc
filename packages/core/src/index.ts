@@ -1,3 +1,4 @@
+export { SESSION_RENEWAL_CONTRACT } from "./protocol.js";
 export { createP2PNode } from './node.js';
 export type {
   ConnectOptions,

@@ -24,18 +24,18 @@ close node
 
 `P2PNode.close()` applies the same ownership rule to receiver reconciliation. It immediately closes ledger admission, so shutdown cannot create new file-operation records. Existing transfer transitions retain the ledger until runtime tasks, transport closure, and resource ownership settle; only then is it cleared. If the public shutdown deadline returns `TIMEOUT`, that background settlement and retained evidence continue rather than being reported or erased as clean shutdown.
 
-An outbound runtime may survive a physical disconnect and retains the same frozen locator expectations and canonical principal. It can be revived either by its own outbound reconnect or by a newly authenticated inbound connection for the same endpoint and exact principal; deterministic connection arbitration applies if both arrive. Every replacement repeats endpoint admission, the complete mutual handshake, principal comparison, and authorization. A purely inbound runtime has no trusted reconnect target and is removed when its connection closes. Its `Peer` object is therefore authenticated-session scoped: applications which model a durable reverse route must retain the pinned endpoint identity and resolve `getPeer()` for each dispatch or subscription attempt, rather than caching the object delivered by `onPeer` across session renewal.
+An outbound runtime may survive a physical disconnect and retains the same frozen locator expectations and canonical principal. It can be revived either by its own outbound reconnect or by a newly authenticated inbound connection for the same endpoint and exact principal; deterministic connection arbitration applies if both arrive. Every replacement repeats endpoint admission, the complete mutual handshake, principal comparison, and authorization. A purely inbound runtime has no trusted reconnect target and is removed when its connection closes. Its `Peer` object is therefore physical-connection scoped: applications which model a durable reverse route must retain the pinned endpoint identity and resolve `getPeer()` for each dispatch or subscription attempt, rather than caching the object delivered by `onPeer` across physical replacement.
 
 Peer admission has one success linearization rule shared by initial installation, replacement, retained-runtime revival, duplicate arbitration, and outbound reconnect. A distinct endpoint still reserves its `maxPeers` slot before dial/authentication work starts. Replacement constructs one immutable epoch, publishes it as the runtime's sole live state, then aborts and closes the superseded epoch. All paths converge after synchronous security events, abort listeners, expiry scheduling, and adapter `close()` callbacks. Public promise continuations repeat the same gate after their last `await`; queued `onPeer` delivery repeats it for the exact captured selection. The gate succeeds only if the node remains open, the runtime still owns its registry slot and live-map entry, the exact selected epoch remains live, and its session is unexpired. If a callback closed the selected peer or node, acquisition rejects `DISCONNECTED`; terminal state always wins.
 
 ## Mutual session handshake
 
-Wire/ALPN v4 carries this unchanged credential-handshake v3 sequence:
+Wire/ALPN v5 carries this credential-handshake v4 sequence:
 
 ```text
 initiator                                      responder
-ClientHello(v3, protocol, nonce A, time A)  ->
-                                             <- ServerChallenge(nonce B, echo A, time B)
+ClientHello(v4, protocol, nonce A, time A, TTL A, predecessor, generation)  ->
+                                             <- ServerChallenge(nonce B, echo A, time B, TTL B, predecessor, generation)
 ClientCredential(role/transcript proof)     ->
                                              <- ServerCredential(proof, grant B)
 ClientFinished(session ID, grant A)          -> FIN
@@ -50,7 +50,31 @@ The session expires at the minimum verified grant, principal expiry, and configu
 
 Remote JWKS fetches time out after 5 seconds. A successful set is cached for 10 minutes; unknown-key refresh and failed-fetch retry use a 30-second cooldown. Static JWKs require explicit compatible `alg`; fetched keys may omit it, but a present value must be compatible/allow-listed and every fetched key has a bounded unique `kid`.
 
-A newly rotated key may therefore wait for the unknown-key cooldown before refresh. A removed key can remain usable until an earlier successful refresh or the 10-minute cache expiry. Changing JWKS does not reauthenticate an established session: that session ends at its own token/grant/configured expiry. Deployments needing faster revocation require shorter lifetimes or authoritative online policy.
+A newly rotated key may therefore wait for the unknown-key cooldown before refresh. A removed key can remain usable until an earlier successful refresh or the 10-minute cache expiry. Renewal repeats credential validation through the configured verifier; JWKS cache behavior still bounds removed-key discovery. Deployments needing faster revocation require shorter lifetimes or authoritative online policy.
+
+## Authentication-generation renewal
+
+Wire v5 / handshake v4 requires a coordinated upgrade. The original QUIC client
+starts a fresh mutual credential exchange halfway through the current grant on
+one dedicated bounded authentication stream. Its transcript commits the prior
+session ID and next generation. Both peers repeat endpoint admission, principal
+and active-operation authorization before publishing a replacement. Physical
+stream and operation identity remain unchanged; no RPC or subscription is replayed.
+
+The old wall-clock and monotonic expiry watchdogs remain authoritative throughout
+preparation. One pending candidate and a generation fence bound overlap. Failed
+credentials, policy, preparation or expiry close the connection. New operation
+authorization waits behind the renewal barrier; idle subscriptions are rechecked.
+Captured request contexts remain immutable admission snapshots, while `peer.session`
+reports the current generation. Captured file facades cannot acquire new authority
+after request completion or generation replacement. Scope and non-freshness claim
+changes fail closed instead of transferring an old middleware decision.
+
+Active reads and mutations finish once on their original streams. Cancellation
+remains attached to that invocation and unknown mutation outcomes must be
+reconciled by the application. Genuine physical loss still terminates streams
+and uses ordinary explicit cursor/receipt recovery. Security events include
+credential-free `session.renewed` records; no new `onPeer` event is required.
 
 ## RPC
 

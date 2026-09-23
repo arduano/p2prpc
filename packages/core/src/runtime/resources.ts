@@ -2,6 +2,8 @@ import { P2PError } from '../errors.js';
 
 export interface ResourceRequest {
   readonly handshakes?: number;
+  /** Separate authenticated renewal progress reserves in each physical direction. */
+  readonly renewal?: 'initiator' | 'responder';
   readonly streams?: number;
   /** Locally initiated file operations. Kept separate to prevent cross-dial deadlock. */
   readonly outboundTransfers?: number;
@@ -15,7 +17,7 @@ export interface ResourceRequest {
   readonly fileData?: 'outbound' | 'inbound';
 }
 
-export type ResourceAmounts = Required<Omit<ResourceRequest, 'fileControl' | 'fileData'>>;
+export type ResourceAmounts = Required<Omit<ResourceRequest, 'fileControl' | 'fileData' | 'renewal'>>;
 
 export interface ResourceCapacity {
   readonly streams: number;
@@ -36,6 +38,8 @@ export interface ResourceOwner {
 }
 
 export interface ResourceLimits {
+  /** Bounded by registered physical peers; independent of application queues. */
+  readonly renewalQueueCapacity?: number;
   readonly global: ResourceLimit;
   readonly perPeer: ResourceLimit;
   /** Aggregate quota shared by every endpoint key authenticated as one principal. */
@@ -78,6 +82,9 @@ type MutableResourceAmounts = {
 };
 
 type ResourceCounter = MutableResourceAmounts & {
+  initiatorRenewals: number;
+  responderRenewals: number;
+  renewalBufferedBytes: number;
   /** Subset of streams admitted from the file-data reserve. */
   outboundFileDataStreams: number;
   inboundFileDataStreams: number;
@@ -127,6 +134,9 @@ interface OwnerIdleWaiter {
 
 const ZERO = (): ResourceCounter => ({
   handshakes: 0,
+  initiatorRenewals: 0,
+  responderRenewals: 0,
+  renewalBufferedBytes: 0,
   streams: 0,
   outboundTransfers: 0,
   inboundTransfers: 0,
@@ -231,10 +241,11 @@ export class ResourceScheduler {
     }
     const peer = this.peer(owner.peerId);
     const principal = owner.principalId === undefined ? undefined : this.principal(owner.principalId);
+    const renewalQueue = input.renewal === undefined ? 0 : this.limits.renewalQueueCapacity ?? this.limits.global.queued;
     if (
-      this.queued >= this.limits.global.queued ||
-      peer.queue.length >= this.limits.perPeer.queued ||
-      (principal !== undefined && principal.queued >= this.limits.perPrincipal.queued)
+      this.queued >= this.limits.global.queued + renewalQueue ||
+      peer.queue.length >= this.limits.perPeer.queued + (input.renewal === undefined ? 0 : 1) ||
+      (principal !== undefined && principal.queued >= this.limits.perPrincipal.queued + renewalQueue)
     ) {
       this.compactOwner(owner.peerId, peer, owner.principalId, principal);
       return Promise.reject(new P2PError('RESOURCE_LIMIT', 'Resource admission queue is full'));
@@ -544,6 +555,9 @@ function validOwnerId(value: unknown): value is string {
 function normalizeRequest(input: ResourceRequest): ResourceCounter {
   const output = {
     handshakes: input.handshakes ?? 0,
+    initiatorRenewals: input.renewal === 'initiator' ? input.handshakes ?? 0 : 0,
+    responderRenewals: input.renewal === 'responder' ? input.handshakes ?? 0 : 0,
+    renewalBufferedBytes: input.renewal === undefined ? 0 : input.bufferedBytes ?? 0,
     streams: input.streams ?? 0,
     outboundTransfers: input.outboundTransfers ?? 0,
     inboundTransfers: input.inboundTransfers ?? 0,
@@ -560,6 +574,13 @@ function normalizeRequest(input: ResourceRequest): ResourceCounter {
   };
   for (const [name, value] of Object.entries(output)) {
     if (!Number.isSafeInteger(value) || value < 0) throw new P2PError('RESOURCE_LIMIT', `Invalid ${name} resource request`);
+  }
+  if (input.renewal !== undefined && (
+    !['initiator', 'responder'].includes(input.renewal) || input.handshakes !== 1 ||
+    input.bufferedBytes !== 64 * 1024 || output.streams !== 0 || output.callbacks !== 0 ||
+    output.inboundTransfers !== 0 || output.outboundTransfers !== 0 || input.fileData !== undefined || input.fileControl !== undefined
+  )) {
+    throw new P2PError('RESOURCE_LIMIT', 'Invalid authenticated renewal resource class');
   }
   if (input.fileData !== undefined && input.fileData !== 'outbound' && input.fileData !== 'inbound') {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid file-data resource class');
@@ -581,6 +602,9 @@ function normalizeRequest(input: ResourceRequest): ResourceCounter {
 }
 
 function validateLimits(limits: ResourceLimits): void {
+  if (limits.renewalQueueCapacity !== undefined && (!Number.isSafeInteger(limits.renewalQueueCapacity) || limits.renewalQueueCapacity < 1)) {
+    throw new P2PError('RESOURCE_LIMIT', 'Invalid renewal queue capacity');
+  }
   for (const level of [limits.global, limits.perPeer, limits.perPrincipal]) {
     for (const [name, value] of Object.entries(level)) {
       if (!Number.isSafeInteger(value) || value < 1) throw new P2PError('RESOURCE_LIMIT', `Invalid ${name} resource limit`);
@@ -654,7 +678,13 @@ function fits(
   const nextInboundControlStreams = active.inboundFileControlStreams + request.inboundFileControlStreams;
   const nextGeneralStreams = nextStreams - nextOutboundStreams - nextInboundStreams -
     nextOutboundControlStreams - nextInboundControlStreams;
-  const nextBufferedBytes = active.bufferedBytes + request.bufferedBytes;
+  // Renewals have a fixed 64 KiB reserve per admitted handshake, separately
+  // capped in both directions. Long-lived application streams cannot consume
+  // their progress budget, and symmetric renewal cannot deadlock itself.
+  const nextInitiatorRenewals = active.initiatorRenewals + request.initiatorRenewals;
+  const nextResponderRenewals = active.responderRenewals + request.responderRenewals;
+  const nextRenewalBufferedBytes = active.renewalBufferedBytes + request.renewalBufferedBytes;
+  const nextBufferedBytes = active.bufferedBytes + request.bufferedBytes - nextRenewalBufferedBytes;
   const nextOutboundBufferedBytes = active.outboundFileDataBufferedBytes + request.outboundFileDataBufferedBytes;
   const nextInboundBufferedBytes = active.inboundFileDataBufferedBytes + request.inboundFileDataBufferedBytes;
   const nextOutboundControlBufferedBytes = active.outboundFileControlBufferedBytes + request.outboundFileControlBufferedBytes;
@@ -680,7 +710,8 @@ function fits(
     overflow(nextOutboundControlBufferedBytes, controlReserve.outbound.bufferedBytes) +
     overflow(nextInboundControlBufferedBytes, controlReserve.inbound.bufferedBytes);
   const sharedBufferUse = nextGeneralBufferedBytes + fileBufferOverflow;
-  return active.handshakes + request.handshakes <= limit.handshakes &&
+  return active.handshakes + request.handshakes - nextInitiatorRenewals - nextResponderRenewals <= limit.handshakes &&
+    nextInitiatorRenewals <= limit.handshakes && nextResponderRenewals <= limit.handshakes &&
     nextStreams <= limit.streams &&
     sharedStreamUse <= limit.streams - streamReserves &&
     fileStreamOverflow <= limit.streams - streamReserves - generalReserve.streams &&
@@ -698,6 +729,9 @@ function overflow(usage: number, reserve: number): number {
 
 function add(target: ResourceCounter, value: ResourceCounter, direction: 1 | -1): void {
   target.handshakes += direction * value.handshakes;
+  target.initiatorRenewals += direction * value.initiatorRenewals;
+  target.responderRenewals += direction * value.responderRenewals;
+  target.renewalBufferedBytes += direction * value.renewalBufferedBytes;
   target.streams += direction * value.streams;
   target.outboundTransfers += direction * value.outboundTransfers;
   target.inboundTransfers += direction * value.inboundTransfers;

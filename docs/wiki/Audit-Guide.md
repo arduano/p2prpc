@@ -1,6 +1,6 @@
 # Audit guide
 
-This is the shortest useful review order for p2prpc wire/ALPN v4. The credential-handshake and file resume formats independently remain v3.
+This is the shortest useful review order for p2prpc wire/ALPN v5. The credential handshake is format v4; file resume state independently remains format v3.
 
 ## 1. Establish the deployed boundary
 
@@ -17,7 +17,7 @@ For one outbound connection, identify the trusted source of:
 - expected issuer/subject/client/tenant;
 - token audience/scope and peer binding.
 
-Confirm discovery never supplies the expectations. Trace endpoint comparison and `preAuthorizePeer` before credential disclosure, then all six exact v3 frames, transcript construction, expiry cap, expected-principal comparison, and runtime installation. Repeat from the inbound side, where no outbound expectation exists. Verify a same-principal inbound connection can revive a retained disconnected outbound runtime, while a different principal fails and a purely inbound runtime remains non-reconnectable.
+Confirm discovery never supplies the expectations. Trace endpoint comparison and `preAuthorizePeer` before credential disclosure, then all six exact v4 frames, transcript construction, expiry cap, expected-principal comparison, and runtime installation. Repeat from the inbound side, where no outbound expectation exists. Verify a same-principal inbound connection can revive a retained disconnected outbound runtime, while a different principal fails and a purely inbound runtime remains non-reconnectable.
 
 Trace initial install, replacement, retained incumbent, duplicate arbitration, and reconnect into the same final admission-success gate. After every synchronous security event, abort listener, expiry action, and transport-close callback, require the node open, runtime slot and live-map entry still owned, exact epoch current, and session unexpired. Verify public promise continuations recheck after their last `await` and queued `onPeer` delivery rechecks its exact captured selection. Deterministically close the node from `session.authenticated`, queue closure before public resolution, close the incumbent while retiring a duplicate, and repeat during outbound reconnect; each acquisition must reject `DISCONNECTED`, return or notify no stale peer, and emit no false authentication rejection.
 

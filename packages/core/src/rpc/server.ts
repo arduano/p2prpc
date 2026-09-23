@@ -32,6 +32,8 @@ export interface RpcServerOptions<TRouter extends AnyTRPCRouter> {
   readonly setupTimeoutMs: number;
   /** Aborts every request on the authenticated physical session when it is replaced or closed. */
   readonly sessionSignal?: AbortSignal;
+  /** Check the current authenticated generation before dispatch and delivery. */
+  readonly assertActive?: () => void;
   /** Per QUIC read/write/finish deadline. Defaults to setupTimeoutMs. */
   readonly ioTimeoutMs?: number;
   readonly onError?: (error: Error, request?: RpcRequest) => void;
@@ -139,6 +141,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
         requestSignal
       );
 
+      this.options.assertActive?.();
       const procedure = ownedWork(() => callTRPCProcedure({
           router: this.options.router,
           path: currentRequest.path,
@@ -164,6 +167,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
               iteratorCompleted = true;
               break;
             }
+            this.options.assertActive?.();
             await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
               id: currentRequest.id,
               data: serializeValue(item.value, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
@@ -180,6 +184,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
         }
       } else {
         requestSignal.throwIfAborted();
+        this.options.assertActive?.();
         await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
           id: currentRequest.id,
           data: serializeValue(result, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
@@ -187,6 +192,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
       }
 
       requestSignal.throwIfAborted();
+      this.options.assertActive?.();
       terminal = true;
       await this.ioOperation(writeFrame(
         stream.send,

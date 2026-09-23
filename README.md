@@ -7,7 +7,7 @@
 
 Type-safe peer-to-peer tRPC, subscriptions, and secure parallel file transfer over one Iroh QUIC connection.
 
-p2prpc separates route discovery, Iroh endpoint identity, application identity, authorization, RPC metadata, and file capabilities. Knowing a node ID or signed ticket is never enough to dispatch work: both peers must finish the bounded mutual session handshake, establish an expiring principal, and authorize each operation. The current QUIC application protocol/ALPN is v4; its credential handshake format remains v3.
+p2prpc separates route discovery, Iroh endpoint identity, application identity, authorization, RPC metadata, and file capabilities. Knowing a node ID or signed ticket is never enough to dispatch work: both peers must finish the bounded mutual session handshake, establish an expiring principal, and authorize each operation. The current QUIC application protocol/ALPN is v5; its credential handshake format is v4.
 
 ```text
 authenticated Iroh QUIC connection
@@ -190,7 +190,7 @@ await transfer.result;
 
 `fileSource()` retains one no-follow, identity-checked descriptor from hashing through transmission. `fileDestination()` uses bounded binary resume state, per-chunk and complete BLAKE3 verification, no-follow staging/lock files, and atomic durable publication.
 
-Wire v4 closes every file delivery with a receiver-generated 256-bit receipt challenge after publication. A valid receiver completion makes sender success permanent. For a push, the echoed receipt also lets the receiver demote its hard acknowledgement-ambiguous record to a bounded replay tombstone. The node-lifetime ledger survives physical connection replacement and same-process runtime revival, but not process restart. Hard records have per-peer, canonical-principal, and node-wide caps and are never capacity-evicted; tombstones have separate evictable caps. This preserves reconciliation for a lost acknowledgement without making normal acknowledged push throughput wait for a 15-minute TTL.
+Wire v5 closes every file delivery with a receiver-generated 256-bit receipt challenge after publication. A valid receiver completion makes sender success permanent. For a push, the echoed receipt also lets the receiver demote its hard acknowledgement-ambiguous record to a bounded replay tombstone. The node-lifetime ledger survives physical connection replacement and same-process runtime revival, but not process restart. Hard records have per-peer, canonical-principal, and node-wide caps and are never capacity-evicted; tombstones have separate evictable caps. This preserves reconciliation for a lost acknowledgement without making normal acknowledged push throughput wait for a 15-minute TTL.
 
 ## Typed capability pull
 

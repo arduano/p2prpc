@@ -292,7 +292,7 @@ describe('Iroh integration', () => {
     }
   });
 
-  it('closes expired sessions and obtains fresh credentials on reconnect', { timeout: 30_000 }, async () => {
+  it('renews authentication before expiry without reconnecting', { timeout: 30_000 }, async () => {
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const peer = await sender.connect<Router>(nodeTarget(receiver));
@@ -384,49 +384,47 @@ describe('Iroh integration', () => {
     await expect.poll(async () => (await peer.diagnostics()).resources.active.streams).toBe(0);
   });
 
-  it('reconnects a retained peer proxy after a short authenticated-session expiry', { timeout: 30_000 }, async () => {
-    const ttlMs = 250;
+  it('retains the same live peer proxy through short authentication generations', { timeout: 30_000 }, async () => {
+    const ttlMs = 750;
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
     const peer = await sender.connect<Router>(nodeTarget(receiver));
+    const initial = peer.session;
+    const physicalConnectionId = (await peer.diagnostics()).connection.connectionId;
 
-    await expect(peer.rpc.add.query({ left: 20, right: 1 })).resolves.toMatchObject({ value: 21 });
-    const initialSessionId = (await peer.diagnostics()).sessionId;
-
-    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
-    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
-
+    await expect.poll(() => peer.session.generation, { timeout: 5_000 }).toBeGreaterThanOrEqual(initial.generation + 3);
+    expect(sender.getPeer(receiver.id)?.session).toBe(peer.session);
+    expect(receiver.getPeer(sender.id)).toBeDefined();
     await expect(peer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
-    expect((await peer.diagnostics()).sessionId).not.toBe(initialSessionId);
+    expect(peer.session.id).not.toBe(initial.id);
+    expect((await peer.diagnostics()).connection.connectionId).toBe(physicalConnectionId);
   });
 
-  it('reconnects a retained peer proxy after expiry terminates an active subscription', { timeout: 30_000 }, async () => {
-    const ttlMs = 250;
+  it('keeps an idle subscription open while authentication generations retire', { timeout: 30_000 }, async () => {
+    const ttlMs = 750;
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
     const peer = await sender.connect<Router>(nodeTarget(receiver));
     const ready = deferred<void>();
-    const ended = deferred<void>();
+    let ended = false;
     const subscription = peer.rpc.hold.subscribe(undefined, {
       onData: () => ready.resolve(),
-      onComplete: () => ended.resolve(),
-      onError: () => ended.resolve()
+      onComplete: () => { ended = true; },
+      onError: () => { ended = true; }
     });
-
-    await ready.promise;
-    const initialSessionId = (await peer.diagnostics()).sessionId;
-    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
-    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
-    await ended.promise;
-
-    await expect(peer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
-    expect((await peer.diagnostics()).sessionId).not.toBe(initialSessionId);
-    subscription.unsubscribe();
+    try {
+      await ready.promise;
+      const initial = peer.session;
+      await expect.poll(() => peer.session.generation, { timeout: 5_000 }).toBeGreaterThanOrEqual(initial.generation + 3);
+      expect(ended).toBe(false);
+      expect(sender.getPeer(receiver.id)?.session).toBe(peer.session);
+      await expect(peer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
+    } finally {
+      subscription.unsubscribe();
+    }
   });
 
-  it('publishes a fresh inbound peer after an expired subscription session is redialed', { timeout: 30_000 }, async () => {
-    // Leave enough of the renewed epoch for the reverse-call canary even on a
-    // busy CI host; this is still short enough to exercise real timer expiry.
+  it('retains one inbound peer and working reverse RPC across authentication renewal', { timeout: 30_000 }, async () => {
     const ttlMs = 750;
     const inboundPeers: Peer<Router>[] = [];
     const receiver = await makeNode(
@@ -436,32 +434,17 @@ describe('Iroh integration', () => {
     );
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: ttlMs }));
     const outboundPeer = await sender.connect<Router>(nodeTarget(receiver));
-    const ready = deferred<void>();
-    const ended = deferred<void>();
-    const subscription = outboundPeer.rpc.hold.subscribe(undefined, {
-      onData: () => ready.resolve(),
-      onComplete: () => ended.resolve(),
-      onError: () => ended.resolve()
-    });
-
-    await ready.promise;
     await expect.poll(() => inboundPeers.length).toBe(1);
-    const expiredInboundPeer = inboundPeers[0]!;
-    await expect.poll(() => sender.getPeer(receiver.id), { timeout: 5_000 }).toBeUndefined();
-    await expect.poll(() => receiver.getPeer(sender.id), { timeout: 5_000 }).toBeUndefined();
-    await ended.promise;
-    await expect(expiredInboundPeer.rpc.add.query({ left: 1, right: 1 }))
-      .rejects.toMatchObject({ cause: { code: 'DISCONNECTED' } });
-
+    const inboundPeer = inboundPeers[0]!;
+    const initial = outboundPeer.session;
+    await expect.poll(() => outboundPeer.session.generation, { timeout: 5_000 }).toBeGreaterThanOrEqual(initial.generation + 3);
+    expect(inboundPeers).toHaveLength(1);
+    expect(receiver.getPeer(sender.id)?.session).toBe(inboundPeer.session);
+    await expect(inboundPeer.rpc.add.query({ left: 20, right: 1 })).resolves.toMatchObject({ value: 21 });
     await expect(outboundPeer.rpc.add.query({ left: 40, right: 2 })).resolves.toMatchObject({ value: 42 });
-    await expect.poll(() => inboundPeers.length, { timeout: 5_000 }).toBe(2);
-    const currentInboundPeer = receiver.getPeer<Router>(sender.id);
-    expect(currentInboundPeer).toBeDefined();
-    await expect(currentInboundPeer!.rpc.add.query({ left: 20, right: 1 })).resolves.toMatchObject({ value: 21 });
-    subscription.unsubscribe();
   });
 
-  it('invalidates captured request file facades with their exact authenticated session', { timeout: 30_000 }, async () => {
+  it('invalidates captured request file facades after their RPC completes', { timeout: 30_000 }, async () => {
     const receiver = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const sender = await makeNode(undefined, dangerouslyAllowInsecureSessions({ sessionTtlMs: 500 }));
     const peer = await sender.connect<Router>(nodeTarget(receiver));
@@ -473,8 +456,8 @@ describe('Iroh integration', () => {
       name: 'stale.bin',
       size: 0,
       readChunk: async () => new Uint8Array()
-    })).toThrow(expect.objectContaining({ code: 'UNAUTHORIZED' }));
-    expect(() => capturedRequestFiles!.revoke(handle)).toThrow(expect.objectContaining({ code: 'UNAUTHORIZED' }));
+    })).toThrow(expect.objectContaining({ code: 'CANCELLED' }));
+    expect(() => capturedRequestFiles!.revoke(handle)).toThrow(expect.objectContaining({ code: 'CANCELLED' }));
   });
 });
 

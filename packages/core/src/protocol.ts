@@ -2,7 +2,10 @@ import { Packr } from 'msgpackr';
 import { P2PError } from './errors.js';
 import type { QuicRecvStream, QuicSendStream } from './transport/types.js';
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
+
+/** Every consumer must require this contract before creating a node. */
+export const SESSION_RENEWAL_CONTRACT = 1 as const;
 
 export enum StreamKind {
   Rpc = 1,

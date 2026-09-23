@@ -8,10 +8,17 @@ OIDC requires `p2prpc:connect` by default. Operations then require `p2prpc:rpc`,
 
 Request headers and file metadata are bounded but untrusted. Compare tenant assertions with the verified principal. The safe `ctx.p2p.files.share()`/`peer.files.share()` APIs automatically bind capabilities to the current endpoint and full principal; arbitrary bearer policy is available only through the advanced trust boundary.
 
-File wire v4 acknowledges publication with a fresh receiver challenge that the sender must echo before FIN. Active and acknowledgement-ambiguous pushes use hard records bounded per peer, per canonical principal across endpoint keys, and node-wide; full hard stores reject instead of evicting. Acknowledged/rejected outcomes use separate tombstone bounds at all three scopes and evict the oldest applicable tombstone. Their node-lifetime ledger survives physical connection replacement, replacement transfer managers, and same-process runtime revival, but not process restart. Expiry uses an indexed deadline queue, and node shutdown rejects new admission before preserving ledger state until owned work settles. This is reconnect/replay protection, not crash-durable exactly-once delivery.
+File wire v5 acknowledges publication with a fresh receiver challenge that the sender must echo before FIN. Active and acknowledgement-ambiguous pushes use hard records bounded per peer, per canonical principal across endpoint keys, and node-wide; full hard stores reject instead of evicting. Acknowledged/rejected outcomes use separate tombstone bounds at all three scopes and evict the oldest applicable tombstone. Their node-lifetime ledger survives physical connection replacement, replacement transfer managers, and same-process runtime revival, but not process restart. Expiry uses an indexed deadline queue, and node shutdown rejects new admission before preserving ledger state until owned work settles. This is reconnect/replay protection, not crash-durable exactly-once delivery.
 
 Capability-pull retry authority is private to the exact connection attempt. Callback-visible or stale errors, plain `DISCONNECTED` values, and untyped aborts cannot request redial; only typed current-transport loss followed by proven current-stream drain and prepared-source closure can release a reservation for retry. Peer acquisition likewise has one liveness/ownership/epoch/expiry rule after synchronous callbacks; public continuations and queued `onPeer` delivery recheck the exact selection, so callback-triggered closure rejects instead of exposing a stale handle.
 
 `@arduano/p2prpc-core/testing` is never production-safe. Every custom authenticator, transport, or registry imported from `@arduano/p2prpc-core/advanced` becomes part of the deployment trusted computing base and requires its own review and conformance evidence. Root file APIs are intentionally structural: any application-supplied `FileSource`, `PreparedFileSource`, or `FileDestination` is also trusted code and must satisfy the documented stability, integrity, commit-boundary, cancellation, and cleanup contracts.
 
 The complete threat model, lifecycle rules, and audit checklist are at <https://arduano.github.io/p2prpc/>. Follow the repository [security policy](https://github.com/arduano/p2prpc/blob/main/SECURITY.md) for private reporting.
+
+Wire v5 authenticates replacement generations before expiry on the same QUIC
+connection. Fresh mutual transcripts bind the predecessor and next generation;
+old deadlines remain active until commit. Endpoint admission, unchanged authority
+and active-operation authorization are rechecked, including idle subscriptions.
+Failure closes the connection without RPC replay. The independent candidate
+requires every p2prpc consumer to upgrade together.

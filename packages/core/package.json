@@ -1,6 +1,6 @@
 {
   "name": "@arduano/p2prpc-core",
-  "version": "0.2.1",
+  "version": "0.3.0-renewal.0",
   "private": false,
   "description": "Type-safe peer-to-peer tRPC and striped file transfer over Iroh QUIC",
   "type": "module",
@@ -54,7 +54,7 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --exclude '**/*.integration.test.ts'",
-    "test:integration": "vitest run test/node.integration.test.ts",
+    "test:integration": "vitest run integration.test.ts",
     "test:watch": "vitest",
     "prepack": "npm run build"
   },

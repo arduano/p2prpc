@@ -8,14 +8,14 @@ Possessing an address, signed ticket, endpoint ID, or open QUIC connection is in
 locator resolution (reachability only)
   -> connected Iroh endpoint equals independently expected endpoint
   -> optional endpoint-key admission
-  -> mutual v3 credential handshake
+  -> mutual v4 credential handshake
   -> exact expected-principal match (outbound)
   -> current, unexpired session
   -> operation scope + configured authorize policy
   -> tRPC middleware/procedure or file capability/destination policy
 ```
 
-The QUIC application protocol and ALPN are v4. The six-message credential handshake embedded in it remains handshake format v3.
+The QUIC application protocol and ALPN are v5. The six-message credential handshake is format v4; all consumers must upgrade together.
 
 Inbound peers do not have an outbound expected-target record, so endpoint admission, credential authentication, and operation authorization are their trust boundaries.
 
@@ -25,7 +25,7 @@ Locator authenticity is not egress authorization. Before any ticket-based dial, 
 
 ## Transcript and replay resistance
 
-The v3 handshake commits both endpoint IDs, both fresh 256-bit nonces, both timestamps, protocol identity, initiator/responder roles, credentials, grant expiries, transcript hashes, and the session ID. Credentials from one peer, role, protocol, or challenge cannot be transplanted into another transcript. Exact-key validation prevents older-version field smuggling.
+The v4 handshake commits both endpoint IDs, both fresh 256-bit nonces, both timestamps, protocol identity, initiator/responder roles, credentials, grant expiries, transcript hashes, the session ID, previous session ID and monotonic generation. Credentials from one peer, role, protocol, or challenge cannot be transplanted into another transcript. Exact-key validation prevents older-version field smuggling.
 
 Handshake frames are bounded to 64 KiB and have deadlines. The responder withholds its credential until the initiator authenticates. A failed handshake closes the physical connection; unauthenticated streams are never dispatched.
 
@@ -54,7 +54,7 @@ OIDC configuration is snapshotted through enumerable data properties, so later m
 | `ES256`, `ES384`, `ES512` | P-256, P-384, P-521 respectively |
 | `EdDSA` | Ed25519 |
 
-Remote JWKS rejects redirects and has a 5-second fetch timeout. A successful set is cached for 10 minutes; unknown-key refresh and failed-fetch retry are held to a 30-second cooldown, and non-200 bodies are cancelled. A removed key can remain usable until a successful refresh. Existing sessions are not reverified when keys change and remain valid until their own expiry, so urgent revocation needs short token/session TTLs or an authoritative online policy.
+Remote JWKS rejects redirects and has a 5-second fetch timeout. A successful set is cached for 10 minutes; unknown-key refresh and failed-fetch retry are held to a 30-second cooldown, and non-200 bodies are cancelled. A removed key can remain usable until a successful refresh. Renewal rechecks credentials using that verifier cache. Urgent revocation still needs authoritative online policy or short token/session TTLs; renewal does not bypass issuer/cache limitations.
 
 OAuth adds centralized issuance/revocation policy, short grants, audience separation, scopes, tenant/client identity, issuer key rotation, and auditable identity. Those benefits are transport-independent and are not N/A without HTTP. Compared with an API key, OAuth substantially narrows and identifies authority. It does **not** authenticate discovery, acquire tokens, guarantee immediate JWT revocation, or bind bearer tokens to QUIC without the extra `cnf`/directory rule.
 

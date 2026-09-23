@@ -10,6 +10,7 @@ import {
   createAdvancedP2PNode as createP2PNode,
   type AdvancedP2PNodeOptions as P2PNodeOptions
 } from '../src/node.js';
+import type { SessionHandshakeOptions } from '../src/security/handshake.js';
 import { StreamKind, TransferFrameKind, readFrame, writeFrame, writeStreamKind } from '../src/protocol.js';
 import type { ShareRegistry } from '../src/files/share.js';
 import type {
@@ -30,6 +31,78 @@ const router = t.router({
 const DEFAULT_MINIMUM_FILE_BUFFER = 3 * 1024 * 1024 + 2 * (4 * 1024 * 1024 + 64 * 1024);
 
 describe('node security boundaries', () => {
+  it.each(['scopes', 'claims', 'endpoint-policy'] as const)(
+    'fails renewal closed if %s changes without installing the candidate', async (change) => {
+      const connection = new AdmissionConnection(false);
+      const endpoint = new AdmissionEndpoint(connection);
+      let allowed = true;
+      const events: SecurityAuditEvent[] = [];
+      const node = await createP2PNode({
+        router, protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+        createContext: () => ({}), security: unusedSecurity(),
+        preAuthorizePeer: () => allowed,
+        onSecurityEvent: (event) => events.push(event), endpointFactory: async () => endpoint
+      });
+      const original = authenticatedSession('original', 'oauth-client-a');
+      const candidate = { ...original, id: 'replacement', generation: 1, expiresAt: original.expiresAt + 30_000,
+        principal: { ...original.principal,
+          ...(change === 'scopes' ? { scopes: new Set(['p2prpc:*']) } : {}),
+          ...(change === 'claims' ? { claims: { role: 'administrator' } } : {})
+        }
+      };
+      const internals = node as unknown as {
+        authenticate(connection: QuicConnection, direction: string, track?: (work: Promise<unknown>) => void,
+          options?: SessionHandshakeOptions): Promise<AuthenticatedSession>;
+        renewSession(runtime: unknown, epoch: unknown): Promise<void>;
+      };
+      internals.authenticate = async (_connection, _direction, _track, options) => {
+        if (!options) return original;
+        await options.prepareSession?.(candidate, new AbortController().signal);
+        return candidate;
+      };
+      try {
+        const peer = await node.connect(connectTarget(endpoint.address.ticket));
+        const runtime = (peer as unknown as { runtime: { lifecycle: { epoch: {
+          authentication: { installedAt: number; deadline: number }
+        } } } }).runtime;
+        const epoch = runtime.lifecycle.epoch;
+        epoch.authentication.installedAt = performance.now() - 10_000;
+        epoch.authentication.deadline = performance.now() + 10_000;
+        if (change === 'endpoint-policy') allowed = false;
+        await internals.renewSession(runtime, epoch);
+        expect(peer.session).toBe(original);
+        expect(node.getPeer('remote')).toBeUndefined();
+        expect(events.some((event) => event.type === 'session.renewed')).toBe(false);
+        expect(events.some((event) => event.type === 'session.rejected')).toBe(true);
+      } finally {
+        await node.close();
+      }
+    }
+  );
+
+  it('fences admission at the monotonic deadline even while the wall-clock grant is unexpired', async () => {
+    const connection = new AdmissionConnection(false);
+    const endpoint = new AdmissionEndpoint(connection);
+    const node = await createP2PNode({
+      router, protocol: { applicationId: 'node-security-test', contractVersion: '1' },
+      createContext: () => ({}), security: unusedSecurity(), endpointFactory: async () => endpoint
+    });
+    const internals = node as unknown as { authenticate(): Promise<AuthenticatedSession> };
+    internals.authenticate = async () => authenticatedSession('original', 'oauth-client-a');
+    try {
+      const peer = await node.connect(connectTarget(endpoint.address.ticket));
+      const runtime = (peer as unknown as { runtime: { lifecycle: { epoch: {
+        authentication: { deadline: number }
+      } } } }).runtime;
+      expect(peer.session.expiresAt).toBeGreaterThan(Date.now());
+      runtime.lifecycle.epoch.authentication.deadline = performance.now() - 1;
+      expect(() => peer.files.share({ name: 'deadline.bin', size: 1, readChunk: async () => Uint8Array.of(1) }))
+        .toThrow(/no longer active/);
+    } finally {
+      await node.close();
+    }
+  });
+
   it('passes a signal to peer admission and aborts it at the handshake deadline', async () => {
     const connection = new AdmissionConnection();
     const endpoint = new AdmissionEndpoint(connection);
@@ -2513,7 +2586,8 @@ describe('node security boundaries', () => {
 
   it('aborts the exact file context on connection closure and session expiry', async () => {
     const closedConnection = new AdmissionConnection(false, 'remote-closed');
-    const expiringConnection = new ThrowingCloseConnection('remote-expiring');
+    // The remote physical client deliberately never renews, exercising the expiry watchdog.
+    const expiringConnection = new ThrowingCloseConnection('remote-expiring', 'server');
     const endpoint = new AdmissionEndpoint(closedConnection, expiringConnection);
     let inspectExpiryVisibility = (): { readonly peerCount: number; readonly hasPeer: boolean } => ({
       peerCount: -1,
@@ -3148,6 +3222,7 @@ function authenticatedSession(id: string, clientId: string, ttlMs = 60_000): Aut
   const expiresAt = Date.now() + ttlMs;
   return Object.freeze({
     id,
+    generation: 0,
     establishedAt: Date.now(),
     expiresAt,
     principal: Object.freeze({
@@ -3167,6 +3242,7 @@ function sharedSecretSession(id: string, peerId: string): AuthenticatedSession {
   const expiresAt = Date.now() + 60_000;
   return Object.freeze({
     id,
+    generation: 0,
     establishedAt: Date.now(),
     expiresAt,
     principal: Object.freeze({
