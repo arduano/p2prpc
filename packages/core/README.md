@@ -14,7 +14,7 @@ instructions](https://github.com/arduano/p2prpc#install-from-github-packages) be
 ## What it guarantees
 
 - A node ID, address, locator, or signed ticket never grants application work.
-- Every connection negotiates p2prpc wire/ALPN v4 and completes the six-message v3 credential handshake before RPC/file dispatch.
+- Every connection negotiates p2prpc wire/ALPN v5 and completes the six-message v4 credential handshake before RPC/file dispatch.
 - Outbound callers independently pin both the Iroh endpoint ID and exact application principal.
 - Per-operation authorization, immutable tRPC metadata, and global/peer/principal quotas are mandatory.
 - RPCs use independent bidirectional streams; file data uses a control stream plus bounded parallel lanes.
@@ -96,7 +96,7 @@ for await (const event of transfer.progress()) observe(event);
 await transfer.result;
 ```
 
-File bytes never use tRPC serialization. Optional manifest metadata requires a Standard Schema v1 schema in node configuration. A push has a manifest-level `SendFileOptions.transferId`; a pull has a distinct `DownloadFileOptions.operationId` for reconnect/retry reconciliation. Wire v4 uses a fresh receiver completion challenge and sender receipt before closing the control halves; acknowledged pushes leave only a bounded replay tombstone instead of occupying hard reconciliation capacity. The node-lifetime receiver ledger survives physical reconnection and same-process runtime revival, but not process restart. Its hard and tombstone state has independent per-peer, canonical-principal, and node-wide bounds; hard state rejects rather than evicts, while tombstones are evictable.
+File bytes never use tRPC serialization. Optional manifest metadata requires a Standard Schema v1 schema in node configuration. A push has a manifest-level `SendFileOptions.transferId`; a pull has a distinct `DownloadFileOptions.operationId` for reconnect/retry reconciliation. Wire v5 uses a fresh receiver completion challenge and sender receipt before closing the control halves; acknowledged pushes leave only a bounded replay tombstone instead of occupying hard reconciliation capacity. The node-lifetime receiver ledger survives physical reconnection and same-process runtime revival, but not process restart. Its hard and tombstone state has independent per-peer, canonical-principal, and node-wide bounds; hard state rejects rather than evicts, while tombstones are evictable.
 
 ## Security model
 
@@ -124,7 +124,7 @@ const security = createOidcSessionSecurity({
 });
 ```
 
-Existing sessions are not reverified when JWKS changes. Cached removed keys can remain usable until refresh, and authenticated sessions remain valid until their own expiry; select token/session TTLs accordingly.
+Credentials are reverified during renewal. Cached removed keys can remain usable until refresh; urgent revocation requires authoritative online policy. The original short expiry remains enforced until replacement authentication commits.
 
 RPC headers are bounded, normalized, immutable caller assertions available at `ctx.p2p.request.headers`; they are not identity. Verified identity is `ctx.p2p.auth.principal`.
 

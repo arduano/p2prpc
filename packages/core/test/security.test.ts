@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { PublicKey } from '@momics/iroh-http-node';
 import { generateKeyPairSync, webcrypto, type KeyObject } from 'node:crypto';
 import {
@@ -295,6 +296,8 @@ describe('session security', () => {
       initiatorPresentedAt: now,
       responderPresentedAt: now + 1,
       transcriptHash: 'transcript-a',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     });
     const context: SessionAuthenticationContext = {
@@ -310,6 +313,8 @@ describe('session security', () => {
       initiatorPresentedAt: now,
       responderPresentedAt: now + 1,
       transcriptHash: 'transcript-a',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
     expect(await security.authenticate(issued, context)).toMatchObject({ subject: 'peer-a' });
@@ -420,6 +425,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
     const principal = await security.authenticate({ scheme: 'Bearer', value: token }, context);
@@ -621,6 +628,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
@@ -653,6 +662,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 
@@ -696,6 +707,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
     const createSecurity = () => createOidcSessionSecurity({
@@ -878,6 +891,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
     const createSecurity = () => createOidcSessionSecurity({
@@ -964,6 +979,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
     const authenticate = async (claims: Record<string, unknown>) => security.authenticate(
@@ -1032,6 +1049,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
 
@@ -1103,6 +1122,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
 
@@ -1173,6 +1194,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     });
     expect(principal.claims).toBe(callbackClaims);
@@ -1217,6 +1240,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
 
@@ -1286,6 +1311,8 @@ describe('session security', () => {
       initiatorPresentedAt: Date.now(),
       responderPresentedAt: Date.now(),
       transcriptHash: 'transcript',
+      generation: 0,
+      previousSessionId: null,
       signal: new AbortController().signal
     };
 
@@ -1436,14 +1463,17 @@ describe('session security', () => {
     const initiatorNonce = Buffer.alloc(32, 1).toString('base64url');
     await writeStreamKind(clientToServer, StreamKind.SessionAuth);
     await writeFrame(clientToServer, SessionFrameKind.ClientHello, {
-      version: 3,
+      version: 4,
+      maxSessionTtlMs: 60_000,
+      generation: 0,
+      previousSessionId: null,
       protocol: 'p2prpc/3/challenge-first/1',
       nonce: initiatorNonce,
       presentedAt: Date.now()
     });
     const challenge = await readFrame<Record<string, unknown>>(serverToClient);
     expect(challenge.kind).toBe(SessionFrameKind.ServerChallenge);
-    expect(Object.keys(challenge.value).sort()).toEqual(['echo', 'nonce', 'presentedAt', 'protocol', 'version']);
+    expect(Object.keys(challenge.value).sort()).toEqual(['echo', 'generation', 'maxSessionTtlMs', 'nonce', 'presentedAt', 'previousSessionId', 'protocol', 'version']);
     expect(challenge.value.echo).toBe(initiatorNonce);
     expect(credentialCalls).toBe(0);
 
@@ -1480,7 +1510,10 @@ describe('session security', () => {
     expect(await readStreamKind(clientToServer)).toBe(StreamKind.SessionAuth);
     const hello = await readFrame<Record<string, unknown>>(clientToServer);
     await writeFrame(serverToClient, SessionFrameKind.ServerChallenge, {
-      version: 3,
+      version: 4,
+      maxSessionTtlMs: 60_000,
+      generation: 0,
+      previousSessionId: null,
       protocol: 'p2prpc/3/closed-frames/1',
       nonce: Buffer.alloc(32, 2).toString('base64url'),
       echo: hello.value.nonce,
@@ -1519,7 +1552,10 @@ describe('session security', () => {
     });
     await writeStreamKind(attackerToResponder, StreamKind.SessionAuth);
     await writeFrame(attackerToResponder, SessionFrameKind.ClientHello, {
-      version: 3,
+      version: 4,
+      maxSessionTtlMs: 60_000,
+      generation: 0,
+      previousSessionId: null,
       protocol: 'p2prpc/3/closed-frames/1',
       nonce: Buffer.alloc(32, 3).toString('base64url'),
       presentedAt: Date.now(),
@@ -1657,6 +1693,136 @@ describe('session security', () => {
       expect(pipe.resetCalls).toBe(0);
       expect(pipe.stopCalls).toBe(0);
     }
+  });
+
+  it('binds three replacement generations to the previous authenticated session and fresh challenges', async () => {
+    const security = createSharedSecretSecurity('r'.repeat(32), { sessionTtlMs: 1_000, authorize: () => true });
+    let previousClient: Awaited<ReturnType<typeof authenticateConnection>> | undefined;
+    let previousServer: Awaited<ReturnType<typeof authenticateConnection>> | undefined;
+    const seen = new Set<string>();
+    for (let generation = 0; generation <= 3; generation += 1) {
+      const forward = new HandshakePipe();
+      const reverse = new HandshakePipe();
+      const common = { protocol: 'p2prpc/5/renewal/1', timeoutMs: 500, maxSessionTtlMs: 1_000,
+        clockSkewMs: 100, frameLimits: { maxControlFrameBytes: 64 * 1024 }, security };
+      const sessions = await Promise.all([
+        authenticateConnection(handshakeConnection('client', 'server-peer', { send: forward, recv: reverse }), 'outbound', {
+          ...common, localPeerId: 'client-peer', ...(previousClient ? { previousSession: previousClient } : {})
+        }),
+        authenticateConnection(handshakeConnection('server', 'client-peer', { send: reverse, recv: forward }), 'inbound', {
+          ...common, localPeerId: 'server-peer', ...(previousServer ? { previousSession: previousServer } : {})
+        })
+      ]);
+      const [client, server] = sessions;
+      expect(client.id).toBe(server.id);
+      expect(client.generation).toBe(generation);
+      expect(server.generation).toBe(generation);
+      expect(seen.has(client.id)).toBe(false);
+      seen.add(client.id);
+      expect(client.expiresAt - client.establishedAt).toBeLessThanOrEqual(1_000);
+      previousClient = client;
+      previousServer = server;
+    }
+  });
+
+  it.each(['stale', 'future', 'wrong-parent', 'clock-skew'] as const)(
+    'rejects a %s renewal before disclosing credentials', async (violation) => {
+      const forward = new HandshakePipe();
+      const reverse = new HandshakePipe();
+      const security = createSharedSecretSecurity('r'.repeat(32), { authorize: () => true });
+      let authenticated = 0;
+      let disclosed = 0;
+      const previous = { id: Buffer.alloc(32, 3).toString('base64url'), generation: 1,
+        establishedAt: Date.now() - 1_000, expiresAt: Date.now() + 1_000,
+        principal: freezePrincipal({ id: 'client-peer', subject: 'client-peer', expiresAt: Date.now() + 1_000,
+          scopes: new Set(['p2prpc:*']), claims: {} }) };
+      const authentication = authenticateConnection(
+        handshakeConnection('server', 'client-peer', { send: reverse, recv: forward }), 'inbound', {
+          protocol: 'p2prpc/5/renewal/1', localPeerId: 'server-peer', timeoutMs: 500, maxSessionTtlMs: 1_000,
+          clockSkewMs: 100, previousSession: previous, frameLimits: { maxControlFrameBytes: 64 * 1024 },
+          security: {
+            getCredential(context) { disclosed += 1; return security.getCredential(context); },
+            authenticate(credential, context) { authenticated += 1; return security.authenticate(credential, context); },
+            authorize: () => true
+          }
+        }
+      );
+      const rejected = expect(authentication).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      await writeStreamKind(forward, StreamKind.SessionAuth);
+      await writeFrame(forward, SessionFrameKind.ClientHello, {
+        version: 4, maxSessionTtlMs: 1_000, protocol: 'p2prpc/5/renewal/1', nonce: Buffer.alloc(32, 1).toString('base64url'),
+        presentedAt: Date.now() + (violation === 'clock-skew' ? 1_000 : 0),
+        generation: violation === 'stale' ? 1 : violation === 'future' ? 3 : 2,
+        previousSessionId: violation === 'wrong-parent' ? Buffer.alloc(32, 4).toString('base64url') : previous.id
+      });
+      await rejected;
+      expect(authenticated).toBe(0);
+      expect(disclosed).toBe(0);
+    }
+  );
+
+  it('negotiates the shorter TTL and translates grants conservatively across allowed clock skew', async () => {
+    const clock = new AsyncLocalStorage<number>();
+    const realNow = Date.now.bind(Date);
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (clock.getStore() ?? 0));
+    try {
+      const forward = new HandshakePipe();
+      const reverse = new HandshakePipe();
+      const common = { protocol: 'p2prpc/5/clock-skew/1', timeoutMs: 250, clockSkewMs: 1_000,
+        frameLimits: { maxControlFrameBytes: 64 * 1024 },
+        security: createSharedSecretSecurity('r'.repeat(32), { sessionTtlMs: 1_000, clockSkewMs: 1_000, authorize: () => true }) };
+      const [client, server] = await Promise.all([
+        clock.run(-200, () => authenticateConnection(
+          handshakeConnection('client', 'server-peer', { send: forward, recv: reverse }), 'outbound',
+          { ...common, localPeerId: 'client-peer', maxSessionTtlMs: 300 })),
+        clock.run(200, () => authenticateConnection(
+          handshakeConnection('server', 'client-peer', { send: reverse, recv: forward }), 'inbound',
+          { ...common, localPeerId: 'server-peer', maxSessionTtlMs: 900 }))
+      ]);
+      expect(client.id).toBe(server.id);
+      for (const session of [client, server]) {
+        expect(session.expiresAt - session.establishedAt).toBeGreaterThan(200);
+        expect(session.expiresAt - session.establishedAt).toBeLessThanOrEqual(300);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('cancels and retains unfinished generation preparation when its authentication deadline wins', async () => {
+    const forward = new HandshakePipe();
+    const reverse = new HandshakePipe();
+    const started = deferredSignal();
+    const release = deferredSignal();
+    const retained: Promise<unknown>[] = [];
+    let preparationSignal: AbortSignal | undefined;
+    const common = { protocol: 'p2prpc/5/renewal/1', timeoutMs: 40, maxSessionTtlMs: 1_000,
+      clockSkewMs: 100, frameLimits: { maxControlFrameBytes: 64 * 1024 },
+      security: createSharedSecretSecurity('r'.repeat(32), { authorize: () => true }) };
+    const both = Promise.allSettled([
+      authenticateConnection(handshakeConnection('client', 'server-peer', { send: forward, recv: reverse }), 'outbound', {
+        ...common, localPeerId: 'client-peer'
+      }),
+      authenticateConnection(handshakeConnection('server', 'client-peer', { send: reverse, recv: forward }), 'inbound', {
+        ...common, localPeerId: 'server-peer', trackWork: (work) => retained.push(work),
+        prepareSession: async (_candidate, signal) => {
+          preparationSignal = signal;
+          started.resolve();
+          await release.promise;
+        }
+      })
+    ]);
+    await started.promise;
+    const outcomes = await both;
+    expect(outcomes.every((outcome) => outcome.status === 'rejected')).toBe(true);
+    expect(preparationSignal?.aborted).toBe(true);
+    let settled = false;
+    const settlement = Promise.allSettled(retained).then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release.resolve();
+    await settlement;
+    expect(settled).toBe(true);
   });
 
   it('rejects trailing authentication bytes before granting a session', async () => {

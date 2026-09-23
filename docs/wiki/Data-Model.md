@@ -26,7 +26,7 @@ The runtime-slot registry is the sole `maxPeers` owner. Outbound connects reserv
 
 | Object | Fields that matter | Invariant |
 |---|---|---|
-| Protocol identity | wire v4, `applicationId`, `contractVersion` | Produces exact ALPN `p2prpc/4/<application>/<contract>` and domain-separates incompatible applications. |
+| Protocol identity | wire v5, `applicationId`, `contractVersion` | Produces exact ALPN `p2prpc/5/<application>/<contract>` and domain-separates incompatible applications. |
 | Locator | ticket, DNS, or mDNS selector | Selects reachability only. It never supplies trust expectations. |
 | Expected target | endpoint ID plus exact principal matcher | Validated and copied before dial; reused unchanged on reconnect. |
 | Endpoint identity | Iroh public key / node ID | Authenticated by QUIC; proves possession of the endpoint key. |

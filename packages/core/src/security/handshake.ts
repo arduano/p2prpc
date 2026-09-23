@@ -9,7 +9,7 @@ import {
   writeStreamKind,
   type FrameLimits
 } from '../protocol.js';
-import type { QuicConnection, QuicRecvStream } from '../transport/types.js';
+import type { QuicBiStream, QuicConnection, QuicRecvStream } from '../transport/types.js';
 import { exactRecord } from '../wire-schema.js';
 import {
   freezePrincipal,
@@ -20,14 +20,30 @@ import {
   type SessionSecurity
 } from './types.js';
 
-const HANDSHAKE_VERSION = 3 as const;
+const HANDSHAKE_VERSION = 4 as const;
 const MAX_CREDENTIAL_BYTES = 48 * 1024;
+const sessionDeadlines = new WeakMap<AuthenticatedSession, number>();
+
+/** Local monotonic time is never sent on the wire. A backwards clock change
+ * cannot stretch a grant between preparation, publication and admission. */
+export function sessionRemainingLifetime(session: AuthenticatedSession): number {
+  return Math.min(session.expiresAt - Date.now(),
+    (sessionDeadlines.get(session) ?? performance.now() + session.expiresAt - session.establishedAt) - performance.now());
+}
+
+function boundedSession(session: AuthenticatedSession, startedMonotonic: number): AuthenticatedSession {
+  sessionDeadlines.set(session, startedMonotonic + session.expiresAt - session.establishedAt);
+  return session;
+}
 
 interface ClientHello {
   readonly version: typeof HANDSHAKE_VERSION;
   readonly protocol: string;
   readonly nonce: string;
   readonly presentedAt: number;
+  readonly maxSessionTtlMs: number;
+  readonly generation: number;
+  readonly previousSessionId: string | null;
 }
 
 interface ServerChallenge extends ClientHello {
@@ -59,6 +75,8 @@ interface ChallengeTranscript {
   readonly responderNonce: string;
   readonly initiatorPresentedAt: number;
   readonly responderPresentedAt: number;
+  readonly generation: number;
+  readonly previousSessionId: string | null;
   readonly hash: string;
 }
 
@@ -70,6 +88,13 @@ export interface SessionHandshakeOptions<TFileMetadata = unknown> {
   readonly maxSessionTtlMs: number;
   readonly clockSkewMs: number;
   readonly frameLimits: FrameLimits;
+  /** Renewal stays on the authenticated physical connection; only its client initiates. */
+  readonly previousSession?: AuthenticatedSession;
+  /** An already discriminated inbound renewal stream. */
+  readonly stream?: QuicBiStream;
+  readonly signal?: AbortSignal;
+  /** Reauthorize active work before either side publishes the candidate. */
+  readonly prepareSession?: (session: AuthenticatedSession, signal: AbortSignal) => Promise<void>;
   /** Retains admission ownership if a timeout wins before handshake work settles. */
   readonly trackWork?: (work: Promise<unknown>) => void;
 }
@@ -85,11 +110,18 @@ export async function authenticateConnection<TFileMetadata>(
 ): Promise<AuthenticatedSession> {
   const controller = new AbortController();
   const cleanup: HandshakeCleanupState = {};
+  const abort = (): void => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener('abort', abort, { once: true });
   const task = connection.side === 'client'
     ? authenticateInitiator(connection, direction, options, controller.signal, cleanup)
     : authenticateResponder(connection, direction, options, controller.signal, cleanup);
   options.trackWork?.(task);
-  return withTimeout(task, options.timeoutMs, 'Session authentication timed out', controller);
+  try {
+    return await withTimeout(task, options.timeoutMs, 'Session authentication timed out', controller);
+  } finally {
+    options.signal?.removeEventListener('abort', abort);
+  }
 }
 
 async function authenticateInitiator<TFileMetadata>(
@@ -100,11 +132,15 @@ async function authenticateInitiator<TFileMetadata>(
   cleanup: HandshakeCleanupState
 ): Promise<AuthenticatedSession> {
   const startedAt = Date.now();
+  const startedMonotonic = performance.now();
   const hello: ClientHello = Object.freeze({
     version: HANDSHAKE_VERSION,
     protocol: options.protocol,
     nonce: nonce(),
-    presentedAt: Date.now()
+    presentedAt: Date.now(),
+    maxSessionTtlMs: options.maxSessionTtlMs,
+    generation: (options.previousSession?.generation ?? -1) + 1,
+    previousSessionId: options.previousSession?.id ?? null
   });
   const stream = await connection.openBi({ signal });
   const abortStream = (): Promise<void> => {
@@ -162,7 +198,7 @@ async function authenticateInitiator<TFileMetadata>(
       throw new P2PError('UNAUTHORIZED', 'Expected session server credential');
     }
     const serverCredential = validateServerCredential(serverCredentialFrame.value);
-    validatePrincipalExpiry(serverCredential.grantExpiresAt);
+    validateRemoteGrant(serverCredential.grantExpiresAt, challenge.presentedAt);
     const responderTranscriptHash = transcriptAfterInitiatorCredential(
       transcript.hash,
       credential,
@@ -184,7 +220,19 @@ async function authenticateInitiator<TFileMetadata>(
     validatePrincipalExpiry(principal.expiresAt);
 
     const id = sessionId(responderTranscriptHash, serverCredential.credential, principal.expiresAt);
-    const credentialExpiresAt = Math.min(principal.expiresAt, serverCredential.grantExpiresAt);
+    // Translate the peer's verifier clock through its signed challenge. Using
+    // our earlier handshake start is conservative by the network transit time;
+    // allowed wall-clock skew never adds time to a credential grant.
+    const credentialExpiresAt = Math.min(principal.expiresAt,
+      startedAt + serverCredential.grantExpiresAt - challenge.presentedAt);
+    const candidate = boundedSession(Object.freeze({ id, generation: hello.generation, establishedAt: startedAt,
+      expiresAt: Math.min(credentialExpiresAt, startedAt + Math.min(hello.maxSessionTtlMs, challenge.maxSessionTtlMs)), principal }), startedMonotonic);
+    if (options.prepareSession) {
+      const preparation = options.prepareSession(candidate, signal);
+      options.trackWork?.(preparation);
+      await preparation;
+    }
+    signal.throwIfAborted();
     await writeFrame(stream.send, SessionFrameKind.ClientFinished, {
       sessionId: id,
       grantExpiresAt: principal.expiresAt
@@ -201,17 +249,20 @@ async function authenticateInitiator<TFileMetadata>(
       throw new P2PError('UNAUTHORIZED', 'Expected session server finish');
     }
     const finished = validateServerFinished(finishedFrame.value);
+    const peerExpiresAt = startedAt + finished.expiresAt - challenge.presentedAt;
     if (
       finished.sessionId !== id ||
-      finished.expiresAt <= Date.now() ||
-      finished.expiresAt > credentialExpiresAt ||
-      finished.expiresAt > Date.now() + options.maxSessionTtlMs + options.clockSkewMs
+      peerExpiresAt <= Date.now() ||
+      finished.expiresAt > serverCredential.grantExpiresAt ||
+      finished.expiresAt > challenge.presentedAt + Math.min(hello.maxSessionTtlMs, challenge.maxSessionTtlMs)
     ) {
       throw new P2PError('UNAUTHORIZED', 'Session finish did not match the authenticated transcript');
     }
     await expectRecvEnd(stream.recv);
     signal.throwIfAborted();
-    return Object.freeze({ id, establishedAt: startedAt, expiresAt: finished.expiresAt, principal });
+    const completed = boundedSession(Object.freeze({ ...candidate, expiresAt: Math.min(candidate.expiresAt, peerExpiresAt) }), startedMonotonic);
+    if (sessionRemainingLifetime(completed) <= 0) throw new P2PError("UNAUTHORIZED", "Session expired during authentication");
+    return completed;
   } catch (cause) {
     // The node closes the physical connection after rejection. Do not let a
     // wedged native reset/stop extend the externally visible deadline.
@@ -230,7 +281,8 @@ async function authenticateResponder<TFileMetadata>(
   cleanup: HandshakeCleanupState
 ): Promise<AuthenticatedSession> {
   const startedAt = Date.now();
-  const stream = await connection.acceptBi();
+  const startedMonotonic = performance.now();
+  const stream = options.stream ?? await connection.acceptBi();
   const abortStream = (): Promise<void> => {
     if (!cleanup.current) {
       cleanup.current = abortHandshakeStream(connection, stream);
@@ -242,7 +294,7 @@ async function authenticateResponder<TFileMetadata>(
   signal.addEventListener('abort', onAbort, { once: true });
   try {
     signal.throwIfAborted();
-    if ((await readStreamKind(stream.recv)) !== StreamKind.SessionAuth) {
+    if (!options.stream && (await readStreamKind(stream.recv)) !== StreamKind.SessionAuth) {
       throw new P2PError('UNAUTHORIZED', 'Application authentication is required before opening streams');
     }
     signal.throwIfAborted();
@@ -257,7 +309,10 @@ async function authenticateResponder<TFileMetadata>(
       protocol: options.protocol,
       nonce: nonce(),
       echo: hello.nonce,
-      presentedAt: Date.now()
+      presentedAt: Date.now(),
+      maxSessionTtlMs: options.maxSessionTtlMs,
+      generation: hello.generation,
+      previousSessionId: hello.previousSessionId
     });
     const transcript = challengeTranscript(
       options.protocol,
@@ -321,7 +376,7 @@ async function authenticateResponder<TFileMetadata>(
       throw new P2PError('UNAUTHORIZED', 'Expected session client finish');
     }
     const finished = validateClientFinished(finishedFrame.value);
-    validatePrincipalExpiry(finished.grantExpiresAt);
+    validateRemoteGrant(finished.grantExpiresAt, hello.presentedAt);
     const id = sessionId(responderTranscriptHash, credential, finished.grantExpiresAt);
     if (finished.sessionId !== id) {
       throw new P2PError('UNAUTHORIZED', 'Session finish did not match the authenticated transcript');
@@ -330,16 +385,25 @@ async function authenticateResponder<TFileMetadata>(
     signal.throwIfAborted();
 
     const expiresAt = capExpiry(
-      Math.min(principal.expiresAt, finished.grantExpiresAt),
-      options.maxSessionTtlMs
+      Math.min(principal.expiresAt, startedAt + finished.grantExpiresAt - hello.presentedAt),
+      Math.max(1, startedAt + Math.min(hello.maxSessionTtlMs, challenge.maxSessionTtlMs) - Date.now())
     );
+    const candidate = boundedSession(Object.freeze({ id, generation: hello.generation, establishedAt: startedAt, expiresAt, principal }), startedMonotonic);
+    if (options.prepareSession) {
+      const preparation = options.prepareSession(candidate, signal);
+      options.trackWork?.(preparation);
+      await preparation;
+    }
+    signal.throwIfAborted();
+    validatePrincipalExpiry(expiresAt);
+    if (sessionRemainingLifetime(candidate) <= 0) throw new P2PError("UNAUTHORIZED", "Session expired during authentication");
     await writeFrame(stream.send, SessionFrameKind.ServerFinished, {
       sessionId: id,
       expiresAt
     } satisfies ServerFinished, options.frameLimits);
     signal.throwIfAborted();
     await stream.send.finish();
-    return Object.freeze({ id, establishedAt: startedAt, expiresAt, principal });
+    return candidate;
   } catch (cause) {
     // The node closes the physical connection after rejection. Do not let a
     // wedged native reset/stop extend the externally visible deadline.
@@ -395,13 +459,17 @@ function validateClientHello<TFileMetadata>(
   if (!isPlainRecord(value) || value.version !== HANDSHAKE_VERSION || value.protocol !== options.protocol) {
     throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Peer uses a different p2prpc application contract');
   }
-  exactRecord(value, ['version', 'protocol', 'nonce', 'presentedAt'], 'Session client hello');
+  exactRecord(value, ['version', 'protocol', 'nonce', 'presentedAt', 'maxSessionTtlMs', 'generation', 'previousSessionId'], 'Session client hello');
   validateNonceAndTime(value.nonce, value.presentedAt, options, 'client hello');
+  validateGeneration(value, options);
   return Object.freeze({
     version: HANDSHAKE_VERSION,
     protocol: options.protocol,
     nonce: value.nonce as string,
-    presentedAt: value.presentedAt as number
+    presentedAt: value.presentedAt as number,
+    maxSessionTtlMs: value.maxSessionTtlMs as number,
+    generation: value.generation as number,
+    previousSessionId: value.previousSessionId as string | null
   });
 }
 
@@ -413,8 +481,9 @@ function validateServerChallenge<TFileMetadata>(
   if (!isPlainRecord(value) || value.version !== HANDSHAKE_VERSION || value.protocol !== options.protocol) {
     throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Peer uses a different p2prpc application contract');
   }
-  exactRecord(value, ['version', 'protocol', 'nonce', 'echo', 'presentedAt'], 'Session server challenge');
+  exactRecord(value, ['version', 'protocol', 'nonce', 'echo', 'presentedAt', 'maxSessionTtlMs', 'generation', 'previousSessionId'], 'Session server challenge');
   validateNonceAndTime(value.nonce, value.presentedAt, options, 'server challenge');
+  validateGeneration(value, options);
   if (value.echo !== initiatorNonce) {
     throw new P2PError('UNAUTHORIZED', 'Server challenge did not match the client nonce');
   }
@@ -423,8 +492,22 @@ function validateServerChallenge<TFileMetadata>(
     protocol: options.protocol,
     nonce: value.nonce as string,
     echo: initiatorNonce,
-    presentedAt: value.presentedAt as number
+    presentedAt: value.presentedAt as number,
+    maxSessionTtlMs: value.maxSessionTtlMs as number,
+    generation: value.generation as number,
+    previousSessionId: value.previousSessionId as string | null
   });
+}
+
+function validateGeneration<TFileMetadata>(value: Record<string, unknown>, options: SessionHandshakeOptions<TFileMetadata>): void {
+  if (!Number.isSafeInteger(value.maxSessionTtlMs) || (value.maxSessionTtlMs as number) < 1 || (value.maxSessionTtlMs as number) > 24 * 60 * 60_000) {
+    throw new P2PError('UNAUTHORIZED', 'Invalid session lifetime ceiling');
+  }
+  const expected = (options.previousSession?.generation ?? -1) + 1;
+  if (!Number.isSafeInteger(value.generation) || value.generation !== expected ||
+      value.previousSessionId !== (options.previousSession?.id ?? null)) {
+    throw new P2PError('UNAUTHORIZED', 'Session generation did not match the current authenticated session');
+  }
 }
 
 function validateNonceAndTime<TFileMetadata>(
@@ -490,11 +573,13 @@ function challengeTranscript(
     initiatorNonce: hello.nonce,
     responderNonce: challenge.nonce,
     initiatorPresentedAt: hello.presentedAt,
-    responderPresentedAt: challenge.presentedAt
+    responderPresentedAt: challenge.presentedAt,
+    generation: hello.generation,
+    previousSessionId: hello.previousSessionId
   };
   return Object.freeze({
     ...transcript,
-    hash: digest('p2prpc-handshake-challenge-v3', [
+    hash: digest('p2prpc-handshake-challenge-v4', [
       HANDSHAKE_VERSION,
       protocol,
       transcript.initiatorPeerId,
@@ -502,7 +587,11 @@ function challengeTranscript(
       transcript.initiatorNonce,
       transcript.responderNonce,
       transcript.initiatorPresentedAt,
-      transcript.responderPresentedAt
+      transcript.responderPresentedAt,
+      hello.maxSessionTtlMs,
+      challenge.maxSessionTtlMs,
+      transcript.generation,
+      transcript.previousSessionId ?? ""
     ])
   });
 }
@@ -529,6 +618,8 @@ function securityContext<TFileMetadata>(
     initiatorPresentedAt: transcript.initiatorPresentedAt,
     responderPresentedAt: transcript.responderPresentedAt,
     transcriptHash,
+    generation: transcript.generation,
+    previousSessionId: transcript.previousSessionId,
     signal
   });
 }
@@ -538,7 +629,7 @@ function transcriptAfterInitiatorCredential(
   credential: SessionCredential,
   initiatorGrantExpiresAt: number
 ): string {
-  return digest('p2prpc-handshake-initiator-credential-v3', [
+  return digest('p2prpc-handshake-initiator-credential-v4', [
     challengeHash,
     credential.scheme,
     credential.value,
@@ -551,7 +642,7 @@ function sessionId(
   responderCredential: SessionCredential,
   responderGrantExpiresAt: number
 ): string {
-  return digest('p2prpc-session-v3', [
+  return digest('p2prpc-session-v4', [
     responderTranscriptHash,
     responderCredential.scheme,
     responderCredential.value,
@@ -601,6 +692,12 @@ function canonicalCredential(value: unknown, exact: boolean): SessionCredential 
   return Object.freeze({ scheme, value: credentialValue });
 }
 
+function validateRemoteGrant(expiresAt: number, presentedAt: number): void {
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= presentedAt) {
+    throw new P2PError('UNAUTHORIZED', 'Remote session credential is expired');
+  }
+}
+
 function validatePrincipalExpiry(expiresAt: number): void {
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) {
     throw new P2PError('UNAUTHORIZED', 'Session credential is expired');
@@ -644,9 +741,18 @@ async function withTimeout<T>(
   controller: AbortController
 ): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let removeAbort: (() => void) | undefined;
   try {
     return await Promise.race([
       promise,
+      new Promise<never>((_, reject) => {
+        const abort = (): void => reject(controller.signal.reason ?? new P2PError('CANCELLED', 'Authentication cancelled'));
+        if (controller.signal.aborted) abort();
+        else {
+          controller.signal.addEventListener('abort', abort, { once: true });
+          removeAbort = () => controller.signal.removeEventListener('abort', abort);
+        }
+      }),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(() => {
           const error = new P2PError('TIMEOUT', message);
@@ -665,5 +771,6 @@ async function withTimeout<T>(
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
+    removeAbort?.();
   }
 }

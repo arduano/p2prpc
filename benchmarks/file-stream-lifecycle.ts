@@ -1640,6 +1640,10 @@ function auditCounts(): AuditCounts {
 }
 
 function observeAudit(counts: AuditCounts, event: SecurityAuditEvent): void {
+  if (event.type === 'session.renewed') {
+    counts.sessionIds.add(event.sessionId);
+    return;
+  }
   if (event.type === 'session.authenticated') {
     counts.authenticated += 1;
     counts.sessionIds.add(event.sessionId);

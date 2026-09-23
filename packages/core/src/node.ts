@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { createTRPCProxyClient, type CreateTRPCClient } from '@trpc/client';
 import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
 import { P2PError, asP2PError } from './errors.js';
@@ -35,7 +36,7 @@ import {
 } from './runtime/resources.js';
 import { TaskGroup } from './runtime/task-group.js';
 import { RuntimeSlotRegistry, type RuntimeSlotClaim } from './runtime/runtime-slots.js';
-import { authenticateConnection } from './security/handshake.js';
+import { authenticateConnection, sessionRemainingLifetime, type SessionHandshakeOptions } from './security/handshake.js';
 import { dangerouslyAllowInsecureSessions } from './security/shared-secret.js';
 import {
   authorizationAllowed,
@@ -145,6 +146,16 @@ export type SecurityAuditEvent =
       readonly expiresAt: number;
     }
   | {
+      readonly type: 'session.renewed';
+      readonly timestamp: number;
+      readonly peerId: string;
+      readonly sessionId: string;
+      readonly previousSessionId: string;
+      readonly generation: number;
+      readonly principalId: string;
+      readonly expiresAt: number;
+    }
+  | {
       readonly type: 'session.rejected';
       readonly timestamp: number;
       readonly peerId: string;
@@ -212,6 +223,8 @@ export interface P2PNodeLimits {
   /** Aggregate stream quota across one principal, including all directional reserves. */
   readonly maxPrincipalInboundStreams: number;
   readonly maxPeers: number;
+  /** Independent ceiling for initial handshakes and each renewal direction.
+   * Renewal reserves add at most 2 * this value * 64 KiB to buffer budgets. */
   readonly maxPendingHandshakes: number;
   /** Aggregate buffers; includes independent directional file-control/data reserves. */
   readonly maxBufferedBytes: number;
@@ -397,9 +410,21 @@ export class Peer<TRemoteRouter extends AnyTRPCRouter, TFileMetadata = unknown> 
   }
 }
 
+interface SessionGenerationState {
+  current: AuthenticatedSession;
+  deadline: number;
+  installedAt: number;
+  renewalTimer?: ReturnType<typeof setTimeout>;
+  renewal?: { readonly previous: AuthenticatedSession; readonly settled: Promise<void>; readonly release: () => void; preparing: boolean };
+  readonly pending: Set<Promise<void>>;
+  readonly active: Map<AbortSignal, AuthorizationAction>;
+}
+
 interface ConnectionEpoch {
   readonly connection: QuicConnection;
   readonly files: FileTransferConnectionContext;
+  readonly authenticationConnection: QuicConnection;
+  readonly authentication: SessionGenerationState;
   readonly controller: AbortController;
   readonly identity: PeerIdentity;
   readonly session: AuthenticatedSession;
@@ -946,11 +971,11 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       );
       const currentFiles = fileConnectionContext(
         managedConnection,
-        session,
+        () => epoch.session,
         connectionController,
         (reason) => quarantineConnection(managedConnection, connectionController, reason)
       );
-      const epoch = connectionEpoch(managedConnection, currentFiles, connectionController, identity, session);
+      const epoch = connectionEpoch(managedConnection, currentFiles, connectionController, identity, session, connection);
       const runtimeTasks = new TaskGroup(`peer ${identity.id}`);
       const runtime: PeerRuntime<TFileMetadata> = {
         lifecycle: liveLifecycle(epoch, outboundTarget),
@@ -1001,10 +1026,10 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           peerId: identity.id,
           connection: () => runtime.fileConnection(),
           shares: this.shares,
-          authorize: (action, captured, signal) => this.authorize(runtime, {
+          authorize: (action, captured, signal, lifetimeSignal) => this.authorize(runtime, {
             id: captured.sessionId,
             principal: captured.principal
-          }, action, signal),
+          }, action, signal, lifetimeSignal),
           acquireTransfer: async (direction, signal) => {
             const lease = await this.resources.acquire(
               resourceOwner(runtime.identity.id, runtime.session.principal.id),
@@ -1161,7 +1186,8 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
   private authenticate(
     connection: QuicConnection,
     direction: PeerIdentity['direction'],
-    trackWork?: (work: Promise<unknown>) => void
+    trackWork?: (work: Promise<unknown>) => void,
+    renewal?: Pick<SessionHandshakeOptions<TFileMetadata>, "previousSession" | "stream" | "signal" | "prepareSession" | "timeoutMs">
   ): Promise<AuthenticatedSession> {
     const owner = this.options.security;
     const security: SessionSecurity<TFileMetadata> = Object.freeze({
@@ -1187,7 +1213,8 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       maxSessionTtlMs: this.limits.maxSessionTtlMs,
       clockSkewMs: this.limits.clockSkewMs,
       frameLimits: controlFrameLimits(this.limits, 64 * 1024),
-      ...(trackWork ? { trackWork } : {})
+      ...(trackWork ? { trackWork } : {}),
+      ...renewal
     });
   }
 
@@ -1265,7 +1292,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       return connection;
     }
     if (lifecycle.state === 'live' && this.peers.get(lifecycle.epoch.identity.id) === runtime) {
-      if (lifecycle.epoch.session.expiresAt > Date.now()) {
+      if (lifecycle.epoch.session.expiresAt > Date.now() && lifecycle.epoch.authentication.deadline > performance.now()) {
         return this.finalizeAdmission(this.selectAdmission(runtime, lifecycle)).current;
       }
       this.expireEpoch(runtime, lifecycle.epoch);
@@ -1413,11 +1440,11 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     );
     const currentFiles = fileConnectionContext(
       managedConnection,
-      session,
+      () => epoch.session,
       connectionController,
       (reason) => quarantineConnection(managedConnection, connectionController, reason)
     );
-    const epoch = connectionEpoch(managedConnection, currentFiles, connectionController, identity, session);
+    const epoch = connectionEpoch(managedConnection, currentFiles, connectionController, identity, session, connection);
     const outboundTarget = incumbent.outboundTarget;
     // Publish one immutable epoch before invoking any synchronous cancellation
     // listener attached to the old epoch. Reentrant close observes the new
@@ -1471,7 +1498,8 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       current.state !== 'live' ||
       current.epoch !== epoch ||
       epoch.session !== session ||
-      session.expiresAt <= Date.now()
+      session.expiresAt <= Date.now() ||
+      epoch.authentication.deadline <= performance.now()
     ) {
       throw new AdmissionFinalizationError();
     }
@@ -1480,29 +1508,31 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
 
   private async admitPeer(
     identity: PeerIdentity,
-    trackWork?: (work: Promise<unknown>) => void
+    trackWork?: (work: Promise<unknown>) => void,
+    signal?: AbortSignal
   ): Promise<void> {
     if (!this.options.preAuthorizePeer) return;
     const controller = new AbortController();
+    const abort = (): void => controller.abort(signal?.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
     const admission = this.withOwnedCallback(
       identity.id,
       controller.signal,
       () => this.options.preAuthorizePeer!(identity, controller.signal)
     );
     trackWork?.(admission);
-    const allowed = await withDeadline(
-      admission,
-      this.limits.handshakeTimeoutMs,
-      'Peer admission timed out',
-      controller
-    );
-    controller.signal.throwIfAborted();
-    if (allowed !== true) throw new P2PError('UNAUTHORIZED', `Peer ${identity.id} was rejected`);
+    try {
+      const allowed = await withDeadline(admission, this.limits.handshakeTimeoutMs, 'Peer admission timed out', controller);
+      controller.signal.throwIfAborted();
+      if (allowed !== true) throw new P2PError('UNAUTHORIZED', `Peer ${identity.id} was rejected`);
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
   }
 
   private startConnectionLoops(runtime: PeerRuntime<TFileMetadata>, epoch: ConnectionEpoch): void {
     const connection = epoch.connection;
-    const session = epoch.session;
     const fileContext = epoch.files;
     const connectionController = epoch.controller;
     // This is the terminal ownership barrier for every native stream attached
@@ -1520,8 +1550,10 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     const rpc = new RpcServer({
       router: this.options.router,
       createContext: async (request) => {
+        const session = epoch.session;
         const files: P2PRequestFiles<TFileMetadata> = Object.freeze({
           share: (source: FileSource<TFileMetadata>, policy: PeerFileShareOptions = {}) => {
+            request.signal.throwIfAborted();
             this.assertAuthorizationSession(runtime, session);
             return this.shares.shareForPeer(
               source,
@@ -1531,6 +1563,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             );
           },
           revoke: (handle: SharedFileHandle) => {
+            request.signal.throwIfAborted();
             this.assertAuthorizationSession(runtime, session);
             return this.shares.revoke(handle);
           }
@@ -1557,7 +1590,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         }
         return Object.freeze({ ...application, p2p }) as inferRouterContext<TRouter>;
       },
-      authorize: (request, signal) => this.authorize(runtime, session, {
+      authorize: (request, signal) => this.authorize(runtime, epoch.session, {
         kind: 'rpc',
         path: request.path,
         type: request.type,
@@ -1568,6 +1601,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       maxPathBytes: this.limits.maxRpcPathBytes,
       setupTimeoutMs: this.limits.streamHeaderTimeoutMs,
       sessionSignal: connectionController.signal,
+      assertActive: () => this.assertCurrentSession(runtime, connection, epoch.session),
       onError: (error) => this.reportError(asP2PError(error), runtime.identity)
     });
 
@@ -1601,11 +1635,17 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             this.limits.streamHeaderTimeoutMs,
             'Stream header timed out'
           );
-          this.assertCurrentSession(runtime, connection, session);
+          this.assertCurrentSession(runtime, connection, epoch.session);
+          if (kind === StreamKind.SessionAuth) {
+            const renewalStream = stream;
+            stream = undefined;
+            void runtime.tasks.track(this.renewSession(runtime, epoch, renewalStream));
+            continue;
+          }
           if (kind !== StreamKind.Rpc && kind !== StreamKind.TransferControl) {
             throw new P2PError('INVALID_FRAME', `Invalid bidirectional stream kind ${kind}`);
           }
-          const owner = resourceOwner(runtime.identity.id, session.principal.id);
+          const owner = resourceOwner(runtime.identity.id, epoch.session.principal.id);
           streamLease = kind === StreamKind.Rpc
             ? this.resources.tryAcquire(owner, {
               streams: 1,
@@ -1633,7 +1673,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           runtime.tasks.track((async () => {
             const ownership = retainLeaseForWork(lease);
             try {
-              this.assertCurrentSession(runtime, connection, session);
+              this.assertCurrentSession(runtime, connection, epoch.session);
               if (kind === StreamKind.Rpc) {
                 return await rpc.handle(accepted, ownership.track);
               }
@@ -1697,7 +1737,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             );
             throw cause;
           }
-          lease = await this.resources.acquire(resourceOwner(runtime.identity.id, session.principal.id), {
+          lease = await this.resources.acquire(resourceOwner(runtime.identity.id, epoch.session.principal.id), {
             streams: 1,
             bufferedBytes: fileDataBufferedBytes(this.limits),
             fileData: 'inbound'
@@ -1714,7 +1754,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
                 this.limits.streamHeaderTimeoutMs,
                 'Stream header timed out'
               );
-              this.assertCurrentSession(runtime, connection, session);
+              this.assertCurrentSession(runtime, connection, epoch.session);
               if (kind !== StreamKind.TransferData) throw new P2PError('INVALID_FRAME', `Invalid unidirectional stream kind ${kind}`);
               await runtime.transfers.handleData(accepted, fileContext);
             } catch (cause) {
@@ -1790,7 +1830,8 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       this.peers.get(lifecycle.epoch.identity.id) !== runtime ||
       lifecycle.epoch.connection !== connection ||
       lifecycle.epoch.session !== session ||
-      session.expiresAt <= Date.now()
+      session.expiresAt <= Date.now() ||
+      lifecycle.epoch.authentication.deadline <= performance.now()
     ) {
       throw new P2PError('UNAUTHORIZED', 'Authenticated session is no longer active');
     }
@@ -1800,9 +1841,41 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     runtime: PeerRuntime<TFileMetadata>,
     session: AuthorizationSession,
     action: AuthorizationAction<TFileMetadata>,
-    requestSignal?: AbortSignal
+    requestSignal?: AbortSignal,
+    lifetimeSignal: AbortSignal | undefined = requestSignal
   ): Promise<void> {
     this.assertAuthorizationSession(runtime, session);
+    const epoch = runtime.lifecycle.epoch;
+    // New operation admission waits for the single renewal. Already admitted
+    // work keeps its original stream and invocation throughout this barrier.
+    if (epoch.authentication.renewal?.preparing) {
+      await withAbortSignal(epoch.authentication.renewal.settled, requestSignal ?? epoch.controller.signal);
+      this.assertCurrentSession(runtime, epoch.connection, epoch.session);
+      session = epoch.session;
+    }
+    const evaluation = this.evaluateAuthorization(runtime, session, action, requestSignal);
+    epoch.authentication.pending.add(evaluation);
+    try {
+      await evaluation;
+      this.assertAuthorizationSession(runtime, session);
+      lifetimeSignal?.throwIfAborted();
+      if (lifetimeSignal) {
+        const checked = freezeAuthorizationAction(action);
+        epoch.authentication.active.set(lifetimeSignal, checked);
+        lifetimeSignal.addEventListener('abort', () => epoch.authentication.active.delete(lifetimeSignal), { once: true });
+      }
+    } finally {
+      epoch.authentication.pending.delete(evaluation);
+    }
+  }
+
+  private async evaluateAuthorization(
+    runtime: PeerRuntime<TFileMetadata>,
+    session: AuthorizationSession,
+    action: AuthorizationAction<TFileMetadata>,
+    requestSignal?: AbortSignal,
+    trackWork?: (work: Promise<unknown>) => void
+  ): Promise<void> {
     const checkedAction = freezeAuthorizationAction(action);
     const controller = new AbortController();
     const abortFromRequest = (): void => {
@@ -1813,8 +1886,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
 
     let decision: ReturnType<typeof authorizationAllowed>;
     try {
-      decision = authorizationAllowed(await withDeadline(
-        this.withOwnedCallback(
+      const evaluation = this.withOwnedCallback(
           resourceOwner(runtime.identity.id, session.principal.id),
           controller.signal,
           () => this.options.security.authorize(Object.freeze({
@@ -1825,13 +1897,15 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             action: checkedAction,
             signal: controller.signal
           }))
-        ),
+        );
+      trackWork?.(evaluation);
+      decision = authorizationAllowed(await withDeadline(
+        evaluation,
         this.limits.streamHeaderTimeoutMs,
         'Authorization timed out',
         controller
       ));
       controller.signal.throwIfAborted();
-      this.assertAuthorizationSession(runtime, session);
     } catch (cause) {
       this.reportSecurity({
         type: 'authorization',
@@ -1872,7 +1946,8 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       this.peers.get(lifecycle.epoch.identity.id) !== runtime ||
       lifecycle.epoch.session.id !== session.id ||
       lifecycle.epoch.session.principal !== session.principal ||
-      lifecycle.epoch.session.expiresAt <= Date.now()
+      lifecycle.epoch.session.expiresAt <= Date.now() ||
+      lifecycle.epoch.authentication.deadline <= performance.now()
     ) {
       throw new P2PError('UNAUTHORIZED', 'Authenticated session is no longer active');
     }
@@ -1899,18 +1974,19 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
     });
   }
 
-  private expireEpoch(runtime: PeerRuntime<TFileMetadata>, epoch: ConnectionEpoch): void {
+  private expireEpoch(runtime: PeerRuntime<TFileMetadata>, epoch: ConnectionEpoch, expired = true): void {
     if (!isLiveEpoch(runtime, epoch)) return;
     const outboundTarget = epochOutboundTarget(runtime, epoch);
+    const reason = expired ? 'Authenticated session expired' : 'Authenticated session renewal failed';
     if (outboundTarget) {
       runtime.lifecycle = Object.freeze({ state: 'disconnected', epoch, outboundTarget });
       if (this.peers.get(epoch.identity.id) === runtime) this.peers.delete(epoch.identity.id);
-      epoch.controller.abort(new P2PError('DISCONNECTED', 'Authenticated session expired'));
-      requestConnectionClose(epoch.connection, 4n, 'Session expired');
+      epoch.controller.abort(new P2PError(expired ? 'DISCONNECTED' : 'UNAUTHORIZED', reason));
+      requestConnectionClose(epoch.connection, 4n, reason);
     } else {
-      void this.tasks.track(runtime.close('Authenticated session expired')).catch(() => undefined);
+      void this.tasks.track(runtime.close(reason)).catch(() => undefined);
     }
-    this.reportSecurity({
+    if (expired) this.reportSecurity({
       type: 'session.expired',
       timestamp: Date.now(),
       peerId: epoch.identity.id,
@@ -1921,22 +1997,129 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
 
   private scheduleExpiry(runtime: PeerRuntime<TFileMetadata>, epoch: ConnectionEpoch): void {
     const session = epoch.session;
+    const authentication = epoch.authentication;
+    if (runtime.expiryTimer) clearTimeout(runtime.expiryTimer);
+    if (authentication.renewalTimer) clearTimeout(authentication.renewalTimer);
+    const remaining = (): number => Math.min(session.expiresAt - Date.now(), authentication.deadline - performance.now());
     const schedule = (): void => {
-      const remaining = session.expiresAt - Date.now();
-      if (remaining <= 0) {
-        if (isLiveEpoch(runtime, epoch)) {
-          // Expiry is a logical session boundary, not a transport lifecycle
-          // observation. Remove the runtime from the public live-peer view in
-          // the same timer turn; native connection ownership can continue to
-          // settle in the background without exposing an expired session.
-          this.expireEpoch(runtime, epoch);
-        }
+      if (!isLiveEpoch(runtime, epoch) || epoch.session !== session) return;
+      const duration = remaining();
+      if (duration <= 0) {
+        this.expireEpoch(runtime, epoch);
         return;
       }
-      runtime.expiryTimer = setTimeout(schedule, Math.min(remaining, 0x7fff_ffff));
+      runtime.expiryTimer = setTimeout(schedule, Math.min(duration, 0x7fff_ffff));
       runtime.expiryTimer.unref?.();
     };
     schedule();
+    if (epoch.connection.side === 'client' && isLiveEpoch(runtime, epoch)) {
+      authentication.renewalTimer = setTimeout(() => {
+        if (isLiveEpoch(runtime, epoch) && epoch.session === session) {
+          void runtime.tasks.track(this.renewSession(runtime, epoch));
+        }
+      }, Math.max(1, Math.floor(remaining() / 2)));
+      authentication.renewalTimer.unref?.();
+    }
+  }
+
+  private async renewSession(
+    runtime: PeerRuntime<TFileMetadata>,
+    epoch: ConnectionEpoch,
+    stream?: Awaited<ReturnType<QuicConnection['acceptBi']>>
+  ): Promise<void> {
+    const previous = epoch.session;
+    const state = epoch.authentication;
+    let ownership: ReturnType<typeof retainLeaseForWork> | undefined;
+    const track = (work: Promise<unknown>): void => {
+      ownership?.track(work);
+      runtime.tasks.track(work);
+    };
+    let lease: ResourceLease | undefined;
+    let gate: SessionGenerationState['renewal'];
+    try {
+      this.assertCurrentSession(runtime, epoch.connection, previous);
+      if (state.renewal || (stream !== undefined) !== (epoch.connection.side === 'server')) {
+        throw new P2PError('UNAUTHORIZED', 'Duplicate or wrong-direction session renewal');
+      }
+      // Prevent an authenticated peer from spinning an unbounded credential
+      // pipeline. Healthy clients renew halfway through their current grant.
+      if (performance.now() - state.installedAt < (state.deadline - state.installedAt) / 4) {
+        throw new P2PError('UNAUTHORIZED', 'Session renewal arrived before its bounded renewal window');
+      }
+      const ready = deferred<void>();
+      gate = { previous, settled: ready.promise, release: () => ready.resolve(), preparing: false };
+      state.renewal = gate;
+      lease = await this.resources.acquire(epoch.identity.id, {
+        handshakes: 1, bufferedBytes: HANDSHAKE_BUFFER_BYTES,
+        renewal: epoch.connection.side === 'client' ? 'initiator' : 'responder'
+      }, epoch.controller.signal);
+      ownership = retainLeaseForWork(lease);
+      await this.admitPeer(epoch.identity, track, epoch.controller.signal);
+      this.assertCurrentSession(runtime, epoch.connection, previous);
+      const candidate = await this.authenticate(epoch.authenticationConnection, epoch.identity.direction, track, {
+        previousSession: previous,
+        ...(stream ? { stream } : {}),
+        signal: epoch.controller.signal,
+        timeoutMs: Math.max(1, Math.min(this.limits.handshakeTimeoutMs, state.deadline - performance.now(), previous.expiresAt - Date.now())),
+        prepareSession: async (replacement, preparationSignal) => {
+          assertRenewalAuthority(previous.principal, replacement.principal);
+          // A cached token whose fixed expiration does not advance the useful
+          // grant cannot drive geometric reauthentication near its expiry.
+          const minimumAdvance = Math.max(1, Math.floor((previous.expiresAt - previous.establishedAt) / 4));
+          if (replacement.expiresAt < previous.expiresAt + minimumAdvance) {
+            throw new P2PError('UNAUTHORIZED', 'Replacement credential did not advance the session lifetime');
+          }
+          if (!gate || state.renewal !== gate) throw new P2PError('UNAUTHORIZED', 'Renewal lost admission ownership');
+          gate.preparing = true;
+          const target = epochOutboundTarget(runtime, epoch);
+          if (target) assertExpectedPrincipal(replacement.principal, target.expectedPrincipal);
+          await Promise.allSettled([...state.pending]);
+          this.assertCurrentSession(runtime, epoch.connection, previous);
+          for (const [signal, action] of state.active) {
+            if (signal.aborted) continue;
+            try {
+              await this.evaluateAuthorization(runtime, replacement, action as AuthorizationAction<TFileMetadata>,
+                AbortSignal.any([signal, epoch.controller.signal, preparationSignal]), track);
+            } catch (cause) {
+              if (!signal.aborted) throw cause;
+            }
+            this.assertCurrentSession(runtime, epoch.connection, previous);
+          }
+        }
+      });
+      this.assertCurrentSession(runtime, epoch.connection, previous);
+      if (state.renewal !== gate || candidate.generation !== previous.generation + 1 || sessionRemainingLifetime(candidate) <= 0) {
+        throw new P2PError('UNAUTHORIZED', 'Stale session renewal cannot commit');
+      }
+      // Single synchronous publication is the admission linearization point.
+      // The physical epoch, stream IDs, procedure invocations and cursors remain.
+      state.current = candidate;
+      state.installedAt = performance.now();
+      state.deadline = state.installedAt + Math.max(0, sessionRemainingLifetime(candidate));
+      delete state.renewal;
+      gate.release();
+      this.scheduleExpiry(runtime, epoch);
+      this.reportSecurity({ type: 'session.renewed', timestamp: Date.now(), peerId: epoch.identity.id,
+        previousSessionId: previous.id, sessionId: candidate.id, generation: candidate.generation,
+        principalId: candidate.principal.id, expiresAt: candidate.expiresAt });
+    } catch (cause) {
+      // Rejection, timeout or uncertain preparation never extends the old
+      // deadline, retries a mutation, or publishes a partially verified grant.
+      // Fail closed promptly: a peer cannot retain service after revocation.
+      if (isLiveEpoch(runtime, epoch)) {
+        this.expireEpoch(runtime, epoch, false);
+        this.reportSecurity({ type: 'session.rejected', timestamp: Date.now(), peerId: epoch.identity.id,
+          direction: epoch.identity.direction, code: asP2PError(cause, 'UNAUTHORIZED').code });
+      }
+      if (stream && !await settleStream(stream, 2n, this.limits.streamHeaderTimeoutMs)) track(physicalClosureProof(epoch.connection));
+    } finally {
+      if (gate && state.renewal === gate) {
+        delete state.renewal;
+        gate.release();
+      }
+      if (ownership) ownership.complete();
+      else lease?.release();
+    }
   }
 
   private reportError(error: P2PError, peer?: PeerIdentity): void {
@@ -2032,13 +2215,13 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
 
 function fileConnectionContext(
   connection: QuicConnection,
-  session: AuthenticatedSession,
+  session: () => AuthenticatedSession,
   controller: AbortController,
   quarantine: (reason: string) => void
 ): FileTransferConnectionContext {
   return Object.freeze({
     connection,
-    security: Object.freeze({ principal: session.principal, sessionId: session.id }),
+    get security() { const current = session(); return Object.freeze({ principal: current.principal, sessionId: current.id }); },
     signal: controller.signal,
     quarantine
   });
@@ -2049,9 +2232,20 @@ function connectionEpoch(
   files: FileTransferConnectionContext,
   controller: AbortController,
   identity: PeerIdentity,
-  session: AuthenticatedSession
+  session: AuthenticatedSession,
+  authenticationConnection: QuicConnection
 ): ConnectionEpoch {
-  return Object.freeze({ connection, files, controller, identity, session });
+  const installedAt = performance.now();
+  const authentication: SessionGenerationState = {
+    current: session, installedAt, deadline: installedAt + Math.max(0, sessionRemainingLifetime(session)),
+    pending: new Set(), active: new Map()
+  };
+  controller.signal.addEventListener('abort', () => {
+    if (authentication.renewalTimer) clearTimeout(authentication.renewalTimer);
+    authentication.active.clear();
+  }, { once: true });
+  return Object.freeze({ connection, files, controller, identity, authenticationConnection, authentication,
+    get session() { return authentication.current; } });
 }
 
 function liveLifecycle(
@@ -2281,6 +2475,20 @@ function assertSamePrincipal(current: SessionPrincipal, replacement: SessionPrin
   }
 }
 
+/** Active procedure contexts are admission snapshots, so a live renewal must
+ * preserve their authority. Token freshness fields may rotate, other verified
+ * claims and scopes must remain identical; policy is always evaluated anew. */
+function assertRenewalAuthority(current: SessionPrincipal, replacement: SessionPrincipal): void {
+  assertSamePrincipal(current, replacement);
+  const stableClaims = (principal: SessionPrincipal): Record<string, unknown> => Object.fromEntries(
+    Object.entries(principal.claims).filter(([key]) => !['exp', 'iat', 'nbf', 'jti'].includes(key))
+  );
+  if (!isDeepStrictEqual([...current.scopes].sort(), [...replacement.scopes].sort()) ||
+      !isDeepStrictEqual(stableClaims(current), stableClaims(replacement))) {
+    throw new P2PError('UNAUTHORIZED', 'Session renewal changed active authority');
+  }
+}
+
 function deferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T | PromiseLike<T>) => void;
@@ -2487,6 +2695,7 @@ function validateLimits(limits: P2PNodeLimits): P2PNodeLimits {
 function resourceLimits(limits: P2PNodeLimits): ResourceLimits {
   const fileDataBuffer = fileDataBufferedBytes(limits);
   return Object.freeze({
+    renewalQueueCapacity: limits.maxPeers,
     global: Object.freeze({
       handshakes: limits.maxPendingHandshakes,
       streams: limits.maxGlobalInboundStreams,

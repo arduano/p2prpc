@@ -19,7 +19,7 @@ export interface SharedSecretSecurityOptions<TFileMetadata = unknown> {
 /**
  * HMAC challenge authentication for deployments that have a securely
  * provisioned application secret but no OIDC issuer. Each side proves the
- * secret over the complete role-specific v3 challenge transcript, including
+ * secret over the complete role-specific v4 challenge transcript, including
  * both fresh nonces and both authenticated Iroh IDs.
  */
 export function createSharedSecretSecurity<TFileMetadata = unknown>(
@@ -122,9 +122,9 @@ function validateDuration(value: number, label: string, maximum: number): void {
 
 function mac(key: Uint8Array, context: CredentialRequestContext, timestamp: number): string {
   return createHmac('sha256', key)
-    .update('p2prpc-session-credential-v3\n')
+    .update('p2prpc-session-credential-v4\n')
     .update(JSON.stringify([
-      3,
+      4,
       context.protocol,
       context.role,
       context.initiatorPeerId,

@@ -27,7 +27,7 @@ export interface SessionPrincipal {
 
 export type SessionRole = 'initiator' | 'responder';
 
-/** Canonical immutable v3 transcript visible to credential providers and authenticators. */
+/** Canonical immutable v4 transcript visible to credential providers and authenticators. */
 export interface SessionCredentialContext {
   readonly localPeerId: string;
   readonly remotePeerId: string;
@@ -41,8 +41,10 @@ export interface SessionCredentialContext {
   readonly responderNonce: string;
   readonly initiatorPresentedAt: number;
   readonly responderPresentedAt: number;
-  /** SHA-256 commitment to every preceding v3 handshake field. */
+  /** SHA-256 commitment to every preceding v4 handshake field. */
   readonly transcriptHash: string;
+  readonly generation: number;
+  readonly previousSessionId: string | null;
   /** Aborted when the handshake times out or otherwise terminates. */
   readonly signal: AbortSignal;
 }
@@ -122,6 +124,8 @@ export function isPeerBoundSessionSecurity(value: unknown): value is PeerBoundSe
 
 export interface AuthenticatedSession {
   readonly id: string;
+  /** Monotonic on one physical connection; zero for its initial authentication. */
+  readonly generation: number;
   readonly establishedAt: number;
   readonly expiresAt: number;
   readonly principal: SessionPrincipal;

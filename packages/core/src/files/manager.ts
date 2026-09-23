@@ -669,7 +669,8 @@ export interface TransferManagerOptions<TMetadata = unknown> {
   readonly authorize: (
     action: FileTransferAuthorization<TMetadata>,
     security: FileTransferSecurityContext,
-    signal: AbortSignal
+    signal: AbortSignal,
+    lifetimeSignal: AbortSignal
   ) => Promise<void> | void;
   /**
    * Central direction-separated admission. P2PNode supplies its global,
@@ -1005,7 +1006,8 @@ export class TransferManager<TMetadata = unknown> {
           (signal) => Promise.resolve(this.options.authorize(
             { kind: 'file.push', manifest },
             context.security,
-            signal
+            signal,
+            attempt.controller.signal
           )),
           attempt.controller.signal,
           'File authorization timed out'
@@ -1055,7 +1057,8 @@ export class TransferManager<TMetadata = unknown> {
           (signal) => Promise.resolve(this.options.authorize(
             { kind: 'file.pull', capabilityId: capabilityId(pull.token) },
             context.security,
-            signal
+            signal,
+            attempt.controller.signal
           )),
           attempt.controller.signal,
           'File authorization timed out'
@@ -2657,6 +2660,7 @@ class FileConnectionAttempt {
   }
 
   dispose(): void {
+    this.controller.abort(new P2PError("CANCELLED", "File attempt completed"));
     this.operationDispose();
     this.connectionDispose?.();
   }
