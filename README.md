@@ -238,7 +238,7 @@ Supported locator forms are:
 
 Node Iroh options select default, custom, or disabled relay policy and separately enable DNS/PKARR or mDNS. A remote signed ticket containing direct candidates requires `allowDirectAddress`; a remote default-relay hint requires `allowRelayUrl`. Custom relay membership is already an explicit allowlist. The callback receives only canonical untrusted remote candidates—not local default selection or configured custom origins—and callback exceptions deny before dial.
 
-With pinned Iroh wrapper 0.6.0:
+With pinned Iroh wrapper 0.6.2:
 
 - DNS plus custom relay or candidate filtering is rejected because resolved routes cannot be inspected before dial.
 - relay-disabled mode keeps UDP networking enabled while removing relay use. A version-locked compatibility seam corrects the wrapper's accidental loopback-only normalization, restores its module export synchronously, and fails closed on dependency drift.

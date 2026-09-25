@@ -97,6 +97,7 @@ type IrohSession = Awaited<ReturnType<IrohNode['dial']>>;
 
 const TICKET_SIGNATURE_DOMAIN = Buffer.from('p2prpc-signed-ticket-v3\0', 'utf8');
 const DISCOVERY_CLEANUP_TIMEOUT_MS = 1_000;
+const MAX_DIRECT_ADDRESSES = 32;
 
 /** @internal Exported only for transport lifecycle conformance tests. */
 export class WebSendStream implements QuicSendStream {
@@ -1187,32 +1188,45 @@ function validateDirectAddresses(
   addresses: readonly unknown[],
   allowDirectAddress?: (address: string) => boolean
 ): string[] {
-  if (addresses.length > 32) throw new P2PError('INVALID_FRAME', 'Route has too many direct addresses');
-  return addresses.map((value) => {
-    if (typeof value !== 'string' || value.length < 3 || value.length > 512 || !validSocketAddress(value)) {
-      throw new P2PError('INVALID_FRAME', 'Route contains an invalid direct address');
-    }
-    if (allowDirectAddress) {
-      try {
-        if (allowDirectAddress(value) !== true) {
-          throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
-        }
-      } catch {
+  if (addresses.length > MAX_DIRECT_ADDRESSES) {
+    throw new P2PError('INVALID_FRAME', 'Route has too many direct addresses');
+  }
+  return addresses.map((value) => validateDirectAddress(value, allowDirectAddress));
+}
+
+function validateDirectAddress(
+  value: unknown,
+  allowDirectAddress?: (address: string) => boolean
+): string {
+  if (typeof value !== 'string' || value.length < 3 || value.length > 512 || !validSocketAddress(value)) {
+    throw new P2PError('INVALID_FRAME', 'Route contains an invalid direct address');
+  }
+  if (allowDirectAddress) {
+    try {
+      if (allowDirectAddress(value) !== true) {
         throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
       }
+    } catch {
+      throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
     }
-    return value;
-  });
+  }
+  return value;
 }
 
 function filterAdvertisedAddresses(
   addresses: readonly unknown[],
   allowAdvertisedAddress?: (address: string) => boolean
 ): string[] {
-  const validated = validateDirectAddresses(addresses);
-  return allowAdvertisedAddress
+  // iroh-http-node 0.6.2 reports every bound interface and can legitimately
+  // exceed the signed-ticket route limit on hosts with many virtual networks.
+  // Validate every native value, apply the deployment's publication policy,
+  // then advertise only the bounded prefix. Remote, untrusted route lists are
+  // still rejected rather than truncated by validateDirectAddresses.
+  const validated = addresses.map((value) => validateDirectAddress(value));
+  const allowed = allowAdvertisedAddress
     ? validated.filter((address) => allowAdvertisedAddress(address) === true)
     : validated;
+  return allowed.slice(0, MAX_DIRECT_ADDRESSES);
 }
 
 function validSocketAddress(value: string, allowZeroPort = false): boolean {

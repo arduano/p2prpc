@@ -8,9 +8,9 @@ import type {
 } from '@momics/iroh-http-node';
 
 const EXPECTED_NODE_PACKAGE = '@momics/iroh-http-node';
-const EXPECTED_NODE_VERSION = '0.6.0';
+const EXPECTED_NODE_VERSION = '0.6.2';
 const EXPECTED_SHARED_PACKAGE = '@momics/iroh-http-shared';
-const EXPECTED_SHARED_VERSION = '0.6.1';
+const EXPECTED_SHARED_VERSION = '0.6.2';
 
 type IrohNodeFactory = typeof createIrohNode;
 type IrohPublicKey = typeof PublicKey;
@@ -19,6 +19,7 @@ type RelayOptions = NonNullable<NodeOptions['relay']>;
 interface NormalisedRelay {
   readonly relayMode: string | undefined;
   readonly relays: string[] | null;
+  readonly relayAuthToken: string | undefined;
   readonly disableNetworking: boolean;
 }
 
@@ -40,7 +41,7 @@ interface PackageIdentity {
 }
 
 /**
- * iroh-http-node 0.6.0 maps `{ mode: 'disabled' }` to both "no relay" and
+ * iroh-http-node 0.6.2 maps `{ mode: 'disabled' }` to both "no relay" and
  * `disableNetworking: true`. The latter is an unrelated test-only switch that
  * binds the native endpoint to loopback and makes genuine relay-less LAN use
  * impossible.
@@ -99,7 +100,12 @@ export function withRelaylessNormalisation<T>(
   const replacement: RelayNormaliser = (relay) => {
     if (relay === targetRelay) {
       matched = true;
-      return { relayMode: 'disabled', relays: [], disableNetworking: false };
+      return {
+        relayMode: 'disabled',
+        relays: [],
+        relayAuthToken: undefined,
+        disableNetworking: false
+      };
     }
     return original(relay);
   };

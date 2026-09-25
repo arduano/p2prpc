@@ -1108,6 +1108,46 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('filters local routes before bounding tickets and validates every native candidate', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/bounded-local-routes/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      allowAdvertisedAddress: (address) => !address.endsWith(':4000') && !address.endsWith(':4001')
+    });
+    const internal = endpoint as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    const candidates = Array.from({ length: 35 }, (_, index) => `192.0.2.1:${4_000 + index}`);
+
+    try {
+      internal.node.discoveryInfo = async () => ({
+        nodeId: endpoint.id,
+        directAddress: candidates[0]!,
+        directAddresses: candidates,
+        relayUrl: null
+      });
+      const bounded = decodeTicketBody(await endpoint.createTicket());
+      expect(bounded.directAddresses).toEqual(candidates.slice(2, 34));
+
+      internal.node.discoveryInfo = async () => ({
+        nodeId: endpoint.id,
+        directAddress: candidates[0]!,
+        directAddresses: [...candidates.slice(0, 34), 'not-a-socket-address'],
+        relayUrl: null
+      });
+      await expect(endpoint.createTicket()).rejects.toMatchObject({ code: 'INVALID_FRAME' });
+    } finally {
+      await endpoint.close();
+    }
+  });
+
   it('requires an exact true decision from the pre-handshake peer policy', async () => {
     const connection = new AdmissionConnection();
     const endpoint = new AdmissionEndpoint(connection);
