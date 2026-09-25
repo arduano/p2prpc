@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
-const expectedHead = 'ca7bb6fb7b791813c937ddbf9bde62423d097373';
+const expectedBase = 'ca7bb6fb7b791813c937ddbf9bde62423d097373';
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-if (head !== expectedHead) throw new Error('unexpected p2prpc base');
+try { execFileSync('git', ['merge-base', '--is-ancestor', expectedBase, head], { cwd: root, stdio: 'ignore' }); }
+catch { throw new Error('unexpected p2prpc lineage'); }
+if (execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim()) throw new Error('p2prpc source must be clean');
 const artifacts = resolve(process.argv[2] ?? join(root, 'vendor', 'p2prpc'));
 const src = join(root, 'packages', 'core');
 const current = JSON.parse(await readFile(join(src, 'package.json'), 'utf8'));
