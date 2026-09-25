@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { lstat, readFile } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { expect, it, vi } from 'vitest';
 import { IrohEndpoint } from '../src/transport/iroh.js';
@@ -10,7 +11,14 @@ it.skipIf(!process.env.IROH_CUSTOM_RELAY_PROBE_URL)(
   async () => {
     const origin = new URL(process.env.IROH_CUSTOM_RELAY_PROBE_URL!);
     expect(origin.protocol).toBe('https:');
-    const token = randomBytes(32).toString('hex'); // test-only while the VPS still admits everyone
+    const tokenFile = process.env.IROH_CUSTOM_RELAY_PROBE_TOKEN_FILE;
+    let token = randomBytes(32).toString('hex');
+    if (tokenFile) {
+      const info = await lstat(tokenFile);
+      expect(info.isFile() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0).toBe(true);
+      token = (await readFile(tokenFile, 'utf8')).trim();
+      expect(/^[0-9a-f]{96}$/.test(token)).toBe(true);
+    }
     const address = Object.entries(networkInterfaces())
       .filter(([name]) => /^(en|eth|wl)/.test(name))
       .flatMap(([, values]) => values ?? [])

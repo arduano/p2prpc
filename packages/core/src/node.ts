@@ -2895,7 +2895,8 @@ function snapshotNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata>(
         ...(options.iroh.relay !== undefined
           ? {
               relay: Object.freeze(options.iroh.relay.mode === 'custom'
-                ? { mode: 'custom' as const, urls: Object.freeze([...options.iroh.relay.urls]) }
+                ? { mode: 'custom' as const, urls: Object.freeze([...options.iroh.relay.urls]),
+                    ...(options.iroh.relay.authToken === undefined ? {} : { authToken: options.iroh.relay.authToken }) }
                 : { mode: options.iroh.relay.mode })
             }
           : {}),

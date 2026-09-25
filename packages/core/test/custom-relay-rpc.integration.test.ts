@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { expect, it, vi } from 'vitest';
 import { createAdvancedP2PNode } from '../src/node.js';
 import { createSharedSecretSecurity } from '../src/security/shared-secret.js';
+import { IrohEndpoint } from '../src/transport/iroh.js';
 import type { PeerContext } from '../src/index.js';
 
 const t = initTRPC.context<PeerContext>().create();
@@ -29,7 +30,16 @@ it.skipIf(!process.env.IROH_CUSTOM_RELAY_PROBE_URL)(
       expect(/^[A-Za-z0-9._~+/=-]{32,4096}$/.test(relayToken)).toBe(true);
     }
     const secret = randomBytes(48).toString('base64');
+    let acceptStarted = 0, acceptReturned = 0, peerEvents = 0;
+    const errorCodes: string[] = [];
+    const originalAccept = IrohEndpoint.prototype.accept;
+    const acceptSpy = vi.spyOn(IrohEndpoint.prototype, 'accept').mockImplementation(function (this: IrohEndpoint) {
+      acceptStarted++;
+      return originalAccept.call(this).then(value => { if (value) acceptReturned++; return value; });
+    });
     const create = async () => createAdvancedP2PNode({
+      onError: error => { errorCodes.push(error.code); },
+      onPeer: () => { peerEvents++; },
       router, protocol: { applicationId: 'custom-relay-vps-proof', contractVersion: '1' },
       createContext: context => context,
       security: createSharedSecretSecurity(secret, { authorize: () => true }),
@@ -55,14 +65,22 @@ it.skipIf(!process.env.IROH_CUSTOM_RELAY_PROBE_URL)(
         expect(payload.relayUrl && new URL(payload.relayUrl).origin).toBe(origin.origin);
         expect(ticket).not.toContain(relayToken);
       }, { timeout: 30_000, interval: 500 });
-      const peer = await sender.connect<typeof router>({
+      // Iroh advertises the configured relay URL before its authenticated
+      // home connection has completed. Give both fresh endpoints one bounded
+      // registration interval; production nodes remain long-lived.
+      await new Promise(resolve => setTimeout(resolve, 1_500));
+      let peer;
+      try { peer = await sender.connect<typeof router>({
         locator: { kind: 'ticket', ticket }, expectedPeerId: receiver.id,
         expectedPrincipal: { id: receiver.id, subject: receiver.id, issuer: null, clientId: null, tenantId: null },
-      });
+      }); } catch (error) {
+        console.log(JSON.stringify({ phase: 'gated-dial', acceptStarted, acceptReturned, peerEvents, errorCodes }));
+        throw error;
+      }
       expect(await peer.rpc.sum.query({ a: 20, b: 22 })).toBe(42);
       const stats = await peer.stats();
       expect(stats.relay === true || stats.paths?.some(path => path.active && path.relay)).toBe(true);
       expect(stats.relayUrl && new URL(stats.relayUrl).origin).toBe(origin.origin);
-    } finally { await Promise.allSettled([sender?.close(), receiver.close()]); }
+    } finally { acceptSpy.mockRestore(); await Promise.allSettled([sender?.close(), receiver.close()]); }
   },
 );
