@@ -35,4 +35,30 @@ describe('Iroh native node options', () => {
       maxChunkSizeBytes: 1024 * 1024
     });
   });
+
+  it('passes custom relay authentication beside unchanged relay URLs', async () => {
+    const syntheticToken = 'synthetic-relay-credential-for-tests-only';
+    let captured: NodeOptions | undefined;
+    native.createNode.mockImplementationOnce(async (options: NodeOptions) => {
+      captured = options;
+      throw native.failure;
+    });
+
+    await expect(IrohEndpoint.create(
+      new TextEncoder().encode('p2prpc-relay-auth-propagation'),
+      {
+        relay: {
+          mode: 'custom',
+          urls: ['https://relay.invalid'],
+          authToken: syntheticToken
+        }
+      }
+    )).rejects.toBe(native.failure);
+
+    expect(captured?.relay).toEqual({
+      urls: ['https://relay.invalid/'],
+      authToken: syntheticToken
+    });
+    expect(JSON.stringify((captured?.relay as { urls?: string[] }).urls)).not.toContain(syntheticToken);
+  });
 });

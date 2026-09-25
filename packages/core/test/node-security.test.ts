@@ -570,6 +570,10 @@ describe('node security boundaries', () => {
     const alpn = new TextEncoder().encode('p2prpc/2/test/1');
     for (const options of [
       { relay: { mode: 'disabled', urls: ['https://relay.example'] } },
+      { relay: { mode: 'disabled', authToken: 'synthetic-token' } },
+      { relay: { mode: 'default', authToken: 'synthetic-token' } },
+      { relay: { mode: 'custom', urls: ['https://relay.example'], authToken: '' } },
+      { relay: { mode: 'custom', urls: ['https://relay.example'], authToken: 'bad\ntoken' } },
       { relay: { mode: 'custom', urls: ['https://relay.example'], fallback: true } },
       { discovery: { dns: { serverUrl: 'https://dns.example', cache: true } } },
       { discovery: { mdns: { serviceName: 'p2prpc', advertise: true, browse: true } } },

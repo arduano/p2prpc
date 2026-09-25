@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "source": {
+    "remote": "https://github.com/arduano/iroh-http.git",
+    "ref": "refs/heads/codex/relay-token-auth",
+    "commit": "d799fa3f200b8ab862bad91ecd13a4389588111c"
+  },
+  "target": {
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "toolchain": {
+    "node": "v24.19.0",
+    "npm": "11.17.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "artifacts": [
+    {
+      "file": "iroh-http-shared-0.6.2-fork.tgz",
+      "bytes": 101349,
+      "sha256": "1475bf877f3d3bfddeb01d5464220355981eedb549a81cb4fbed3457c43105bc",
+      "sri": "sha512-LI6vNhKQQZBJV+pC3w/yNxXQoP+pMpmYVHrOo9Y3IHFbMnvkWhV1qzArOn34lQ8JU/pbEMdHVHgZYwmTFnDIDQ=="
+    },
+    {
+      "file": "iroh-http-node-0.6.2-fork-linux-x64.tgz",
+      "bytes": 3489088,
+      "sha256": "fe051e3d0f7ae3d2817f16e1997c085c545bee5e0b33fe7bd7f89482c233e984",
+      "sri": "sha512-+HyZpEFnknq0aIm+LCZXtx0ebdGFokmtXBzmEuOJ62X/pJOieJ9BH4oHXkVTPX5so1ou9shhcTyoOQpOWhuQsg=="
+    }
+  ]
+}

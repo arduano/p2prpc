@@ -27,7 +27,7 @@ import type {
 export type IrohRelayConfiguration =
   | { readonly mode: 'default' }
   | { readonly mode: 'disabled' }
-  | { readonly mode: 'custom'; readonly urls: readonly string[] };
+  | { readonly mode: 'custom'; readonly urls: readonly string[]; readonly authToken?: string };
 
 export interface IrohDiscoveryConfiguration {
   /**
@@ -589,9 +589,11 @@ export class IrohEndpoint implements QuicEndpoint {
         'DNS/PKARR discovery cannot satisfy restricted resolved-route egress policy'
       );
     }
-    const nodeOptions: NodeOptions = {
-      relay: relayUrls
-        ? { urls: relayUrls }
+    const nodeOptions: NodeOptions & {
+      relay?: NodeOptions['relay'] & { authToken?: string };
+    } = {
+      relay: relay.mode === 'custom'
+        ? { urls: relayUrls!, ...(relay.authToken === undefined ? {} : { authToken: relay.authToken }) }
         : { mode: relay.mode },
       discovery: {
         dns: discoveryOptions.dns,
@@ -950,17 +952,31 @@ function validateIrohOptions(options: IrohEndpointOptions): void {
 function resolveRelayConfiguration(options: IrohEndpointOptions): IrohRelayConfiguration {
   if (options.relay) {
     if (!isPlainRecord(options.relay)) throw new P2PError('INVALID_FRAME', 'Iroh relay options must be a plain object');
-    assertOnlyKeys(options.relay, ['mode', 'urls'], 'Iroh relay options');
+    assertOnlyKeys(options.relay, ['mode', 'urls', 'authToken'], 'Iroh relay options');
     if (options.relay.mode === 'custom') {
       if (!Array.isArray(options.relay.urls)) {
         throw new P2PError('INVALID_FRAME', 'Custom Iroh relay URLs must be an array');
       }
-      return { mode: 'custom', urls: [...options.relay.urls] };
+      if (options.relay.authToken !== undefined && (
+        typeof options.relay.authToken !== 'string' ||
+        options.relay.authToken.length < 1 ||
+        options.relay.authToken.length > 8_192 ||
+        containsUnsafeDisplayCharacters(options.relay.authToken)
+      )) {
+        throw new P2PError('INVALID_FRAME', 'Custom Iroh relay auth token is invalid');
+      }
+      return {
+        mode: 'custom',
+        urls: [...options.relay.urls],
+        ...(options.relay.authToken === undefined ? {} : { authToken: options.relay.authToken })
+      };
     }
     if (options.relay.mode !== 'default' && options.relay.mode !== 'disabled') {
       throw new P2PError('INVALID_FRAME', 'Iroh relay mode is invalid');
     }
-    if ('urls' in options.relay) throw new P2PError('INVALID_FRAME', 'Only custom relay mode accepts URLs');
+    if ('urls' in options.relay || 'authToken' in options.relay) {
+      throw new P2PError('INVALID_FRAME', 'Only custom relay mode accepts URLs or authentication');
+    }
     return { mode: options.relay.mode };
   }
   if (options.relayUrls !== undefined) return { mode: 'custom', urls: [...options.relayUrls] };
