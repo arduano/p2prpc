@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
-import { readdirSync, statSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import process from 'node:process';
@@ -21,6 +21,20 @@ export function packageArtifactArgument(position = 2) {
     return join(candidate, tarballs[0]);
   }
   invariant(candidate.endsWith('.tgz'), `Package artifact must be a .tgz file: ${candidate}`);
+  return candidate;
+}
+
+export function packageInstallSourceArgument(position = 2) {
+  const value = process.argv[position] ?? process.env.P2PRPC_PACKAGE_TARBALL;
+  invariant(typeof value === 'string' && value.length > 0, 'Pass a packed tarball or portable closure directory');
+  const candidate = resolve(value);
+  if (!statSync(candidate).isDirectory()) {
+    invariant(candidate.endsWith('.tgz'), `Package install source must be a .tgz or directory: ${candidate}`);
+    return candidate;
+  }
+  const manifest = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8'));
+  invariant(manifest.name === 'p2prpc-renewal-1-portable-closure', `Portable closure identity differs: ${candidate}`);
+  invariant(statSync(join(candidate, 'package-lock.json')).isFile(), `Portable closure lock is missing: ${candidate}`);
   return candidate;
 }
 
@@ -78,6 +92,21 @@ function commandInvocation(command, args) {
 }
 
 export async function installPackedArtifact(artifact, directory) {
+  if (statSync(artifact).isDirectory()) {
+    for (const entry of readdirSync(artifact)) {
+      if (entry === 'package.json' || entry === 'package-lock.json' || entry.endsWith('.tgz')) {
+        await cp(join(artifact, entry), join(directory, entry), { force: false });
+      }
+    }
+    await run('npm', [
+      'ci',
+      '--ignore-scripts',
+      '--strict-peer-deps',
+      '--fund=false',
+      '--audit=false'
+    ], { cwd: directory });
+    return;
+  }
   await writeFile(join(directory, 'package.json'), `${JSON.stringify({
     name: 'p2prpc-packed-verification',
     version: '0.0.0',

@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import process from 'node:process';
 
 const COMMIT = 'd799fa3f200b8ab862bad91ecd13a4389588111c';
 const REMOTE = 'https://github.com/arduano/iroh-http.git';
