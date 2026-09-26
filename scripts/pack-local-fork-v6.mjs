@@ -133,7 +133,7 @@ try {
     if (lock.packages?.['']?.overrides !== undefined) fail('Unexpected lockfile root overrides field');
     const locked = lock.packages?.[`node_modules/${name}`];
     const expected = name === '@arduano/p2prpc-core' ? expectedVersion : '0.6.2';
-    if (locked?.version !== expected || locked?.resolved !== specifier) fail(`Portable lock resolution differs for ${name}`);
+    if (locked?.version !== expected || locked?.resolved !== specifier.replace('file:./', 'file:')) fail(`Portable lock resolution differs for ${name}`);
   }
 
   const componentNames = [p2prpcFile, ...transportInputs.map(input => input.filename), 'package.json', 'package-lock.json'];
