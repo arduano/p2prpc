@@ -67,6 +67,13 @@ jobs:
         run: npm run check:package-publint -- "${{ steps.package.outputs.artifact }}"
       - name: Validate packed TypeScript resolution
         run: npm run check:package-types -- "${{ steps.package.outputs.artifact }}"
+      - name: Share exact reviewed package with native jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p2prpc-reviewed-package-${{ github.sha }}
+          path: ${{ runner.temp }}/npm-artifact/
+          if-no-files-found: error
+          retention-days: 7
       - name: Prepare exact reviewed Iroh consumer
         run: npm run prepare:reviewed-consumer -- "${{ steps.package.outputs.artifact }}" "${{ runner.temp }}/reviewed-consumer"
       - name: Exercise an install-script-free packed consumer
@@ -84,6 +91,7 @@ jobs:
 
   native:
     name: Native / ${{ matrix.os }} / Node ${{ matrix.node }}
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -116,25 +124,21 @@ jobs:
         run: npm test
       - name: Run native Iroh integration tests
         run: npm run test:integration
-      - name: Set up reviewed package build Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Build package on target Node.js
+        run: npm run build
+      - name: Download exact reviewed package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          node-version: 24.19.0
-      - name: Pin reviewed npm pack version
-        run: npm install --global npm@11.17.0
-      - name: Build and pack the consumer artifact
-        run: npm run build && npm run pack:artifact -- package-artifact
+          name: p2prpc-reviewed-package-${{ github.sha }}
+          path: package-artifact
       - name: Prepare exact reviewed Iroh consumer
         run: npm run prepare:reviewed-consumer -- package-artifact "${{ runner.temp }}/reviewed-consumer"
-      - name: Restore native test Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: ${{ matrix.node }}
       - name: Exercise the tree-shaken packed native boundary
         run: npm run test:tree-shaken-native -- "${{ runner.temp }}/reviewed-consumer"
 
   minimum-runtime:
     name: Minimum runtime / Node 20.3.1
+    needs: quality
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -151,17 +155,11 @@ jobs:
         run: npm install --global npm@11.17.0
       - name: Install dependencies without undeclared lifecycle scripts
         run: npm ci --strict-allow-scripts
-      - name: Build package
-        run: npm run build
-      - name: Pack the minimum-runtime artifact
-        run: npm run pack:artifact -- package-artifact
-      - name: Preserve exact maintainer package for cross-platform comparison
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Download exact reviewed package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: p2prpc-minimum-pack-${{ github.sha }}
-          path: package-artifact/
-          if-no-files-found: error
-          retention-days: 1
+          name: p2prpc-reviewed-package-${{ github.sha }}
+          path: package-artifact
       - name: Prepare exact reviewed Iroh consumer
         run: npm run prepare:reviewed-consumer -- package-artifact "$RUNNER_TEMP/reviewed-consumer"
       - name: Set up minimum supported Node.js

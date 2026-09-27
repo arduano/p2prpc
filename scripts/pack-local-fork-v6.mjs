@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const expectedBase = 'ca7bb6fb7b791813c937ddbf9bde62423d097373';
 const expectedVersion = '0.3.0-renewal.1';
-const expectedP2prpcSha256 = '402ac559343ee99fdd3ccc99133b057037128893b4799f695b5d8baddd4decff';
+const expectedP2prpcSha256 = '26867bf16d55c3a7e1a51c72f3c36f40662cefa6a38f0689f6187b955bfa0b10';
 const expectedClosureLockSha256 = 'f7d78c2a4fea2d3cd6a834b052d0ba503d194301dd1091cea654d56cbd0715db';
 const transportInputs = Object.freeze([
   Object.freeze({
