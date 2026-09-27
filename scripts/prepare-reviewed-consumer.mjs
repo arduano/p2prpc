@@ -19,8 +19,8 @@ const fork = [
   {
     name: '@momics/iroh-http-node',
     file: 'iroh-http-node-0.6.2-fork-linux-win-x64.tgz',
-    sha256: 'c5562ade5809b2e156a6179654a0c0e46925df6973421abcd771181a527ef02a',
-    integrity: 'sha512-jLVYvRtb93CYZSQDwLr/pg2wlIfFijvaCVNN8rdP0TrHXHufhz/Ty1CS8g5E4zo3FDOsI+Kx3iXckEz+o2sLgw=='
+    sha256: '9cf8d5f1a13a7c28e4103f06921badb00b11b76d9287a3b6ecc5f9523d9d2608',
+    integrity: 'sha512-CPRn15sDElYcARIbGcdJJtQj1jH9er3ytl7xkXqUSSk6GjsL8xwLrrGKi2izP58XZMjkCQKJA7xi7Be2Z8Q99Q=='
   },
   {
     name: '@momics/iroh-http-shared',

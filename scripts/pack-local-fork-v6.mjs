@@ -10,18 +10,18 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const expectedBase = 'ca7bb6fb7b791813c937ddbf9bde62423d097373';
 const expectedVersion = '0.3.0-renewal.1';
 const expectedP2prpcSha256 = 'a53659552f97e5d10cd3ed4b7c7ab70a2fda9f2b5e06e9856c08f7399637e773';
-const expectedClosureLockSha256 = 'c55130c8c97c2f8a6864e4705cff131724493d4a64784c9a7dcfc7ffb786e7b1';
+const expectedClosureLockSha256 = 'f7d78c2a4fea2d3cd6a834b052d0ba503d194301dd1091cea654d56cbd0715db';
 const transportInputs = Object.freeze([
   Object.freeze({
     name: '@momics/iroh-http-node',
     version: '0.6.2',
     argument: 3,
     filename: 'iroh-http-node-0.6.2-fork-linux-win-x64.tgz',
-    sha256: 'c5562ade5809b2e156a6179654a0c0e46925df6973421abcd771181a527ef02a',
-    sri: 'sha512-jLVYvRtb93CYZSQDwLr/pg2wlIfFijvaCVNN8rdP0TrHXHufhz/Ty1CS8g5E4zo3FDOsI+Kx3iXckEz+o2sLgw==',
+    sha256: '9cf8d5f1a13a7c28e4103f06921badb00b11b76d9287a3b6ecc5f9523d9d2608',
+    sri: 'sha512-CPRn15sDElYcARIbGcdJJtQj1jH9er3ytl7xkXqUSSk6GjsL8xwLrrGKi2izP58XZMjkCQKJA7xi7Be2Z8Q99Q==',
     addons: Object.freeze({
       'iroh-http-node.linux-x64-gnu.node': '3d6739abfd441834d4b58b07738280653c7f70eed3649f842d27a2cfce12c550',
-      'iroh-http-node.win32-x64-msvc.node': '2dc2e9e7d0e4e946b8dbaac3d66487cf72487d46476c71f33fcc6a3a94595813'
+      'iroh-http-node.win32-x64-msvc.node': '22c0dc33aae34fb06af65cd67de3e1f7342543178fb1150512874ec7b6500273'
     })
   }),
   Object.freeze({
@@ -152,7 +152,7 @@ try {
     qualificationLimits: [
       'The p2prpc tarball alone is not a standalone local-fork installation artifact.',
       'Install this directory with npm ci so the sibling Iroh tarballs and root overrides remain authoritative.',
-      'Linux x64 native loading is qualified separately; the unchanged Windows x64 addon is hash-identified but was not executed on Windows.'
+      'Linux x64 native loading is qualified separately; the source-built Windows x64 addon and this combined package loaded in private CI run 36337753216.'
     ],
     prohibitedEffects: ['no publish', 'no push', 'no consumer edit', 'no Iroh rebuild', 'no live host or service change']
   };
