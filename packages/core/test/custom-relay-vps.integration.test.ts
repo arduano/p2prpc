@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { expect, it, vi } from 'vitest';
 import { IrohEndpoint } from '../src/transport/iroh.js';
@@ -14,9 +15,15 @@ it.skipIf(!process.env.IROH_CUSTOM_RELAY_PROBE_URL)(
     const tokenFile = process.env.IROH_CUSTOM_RELAY_PROBE_TOKEN_FILE;
     let token = randomBytes(32).toString('hex');
     if (tokenFile) {
-      const info = await lstat(tokenFile);
-      expect(info.isFile() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0).toBe(true);
-      token = (await readFile(tokenFile, 'utf8')).trim();
+      expect(typeof constants.O_NOFOLLOW).toBe('number');
+      const handle = await open(tokenFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const info = await handle.stat();
+        expect(info.isFile() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0).toBe(true);
+        token = (await handle.readFile('utf8')).trim();
+      } finally {
+        await handle.close();
+      }
       expect(/^[0-9a-f]{96}$/.test(token)).toBe(true);
     }
     const address = Object.entries(networkInterfaces())

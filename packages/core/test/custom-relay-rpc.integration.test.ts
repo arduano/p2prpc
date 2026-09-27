@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { initTRPC } from '@trpc/server';
 import { z } from 'zod';
@@ -24,9 +25,15 @@ it.skipIf(!process.env.IROH_CUSTOM_RELAY_PROBE_URL)(
     const tokenFile = process.env.IROH_CUSTOM_RELAY_PROBE_TOKEN_FILE;
     let relayToken = randomBytes(32).toString('hex'); // synthetic until the VPS enforces shared_token
     if (tokenFile) {
-      const file = await lstat(tokenFile);
-      expect(file.isFile() && !file.isSymbolicLink() && file.uid === process.getuid?.() && (file.mode & 0o077) === 0).toBe(true);
-      relayToken = (await readFile(tokenFile, 'utf8')).trim();
+      expect(typeof constants.O_NOFOLLOW).toBe('number');
+      const handle = await open(tokenFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const file = await handle.stat();
+        expect(file.isFile() && file.uid === process.getuid?.() && (file.mode & 0o077) === 0).toBe(true);
+        relayToken = (await handle.readFile('utf8')).trim();
+      } finally {
+        await handle.close();
+      }
       expect(/^[A-Za-z0-9._~+/=-]{32,4096}$/.test(relayToken)).toBe(true);
     }
     const secret = randomBytes(48).toString('base64');
