@@ -40,7 +40,7 @@ npm audit --audit-level=low
 The release workflow additionally validates packed contents/license, `publint`, Are-the-Types-Wrong, installation from the tarball, a tree-shaken native import, SBOM and dependency-registry-signature evidence, action syntax, GitHub build provenance, and post-publish byte equality. Publication consumes the immutable candidate with lifecycle scripts disabled; it does not rebuild it. A rerun never blindly republishes an immutable package version: it may recover only when registry integrity, tarball bytes, the expected `latest`/`next` distribution tag, source commit, and semver Git tag all match. GitHub release creation similarly verifies or replaces only the expected assets.
 
 For `0.3.0-renewal.1`, source and packed native checks use the exact root
-override contract in the [installation instructions](../../README.md#install-from-github-packages).
+override contract in the [installation instructions](https://github.com/arduano/p2prpc/blob/main/README.md#install-from-github-packages).
 The package itself retains numeric Iroh dependencies. The release candidate
 also carries a reviewed-consumer receipt, lockfile hash, SBOM, and registry
 signature result; the two fork tarballs are admitted by their exact owner
