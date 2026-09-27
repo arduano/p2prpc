@@ -1,4 +1,5 @@
 import { initTRPC } from '@trpc/server';
+import { PublicKey } from '@momics/iroh-http-node';
 import { describe, expect, it } from 'vitest';
 import {
   P2PError,
@@ -29,6 +30,16 @@ const router = t.router({
   ping: t.procedure.query(() => 'pong')
 });
 const DEFAULT_MINIMUM_FILE_BUFFER = 3 * 1024 * 1024 + 2 * (4 * 1024 * 1024 + 64 * 1024);
+
+function mockIrohDialEndpoint(alpn: Uint8Array, dial: () => Promise<unknown>): IrohEndpoint {
+  return Object.assign(Object.create(IrohEndpoint.prototype), {
+    id: PublicKey.fromBytes(new Uint8Array(32).fill(7)).toString(),
+    protocol: Buffer.from(alpn).toString('base64url'),
+    dnsEnabled: true,
+    node: { dial, close: async () => undefined },
+    incoming: { return: async () => ({ done: true, value: undefined }) }
+  }) as IrohEndpoint;
+}
 
 describe('node security boundaries', () => {
   it.each(['scopes', 'claims', 'endpoint-policy'] as const)(
@@ -586,21 +597,14 @@ describe('node security boundaries', () => {
 
   it('retains a cancelled late Iroh dial until native session closure is proven', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/late-dial-ownership/1');
-    const endpoint = await IrohEndpoint.create(alpn, {
-      relay: { mode: 'disabled' },
-      discovery: { dns: true }
-    });
     const dialStarted = deferred<void>();
     const dialResult = deferred<unknown>();
     const physicallyClosed = deferred<void>();
     let closeCalls = 0;
-    const internal = endpoint as unknown as {
-      node: { dial(peerId: string, options: unknown): Promise<unknown> };
-    };
-    internal.node.dial = () => {
+    const endpoint = mockIrohDialEndpoint(alpn, () => {
       dialStarted.resolve(undefined);
       return dialResult.promise;
-    };
+    });
     const session = {
       ready: Promise.resolve(undefined),
       close: () => {
@@ -642,19 +646,12 @@ describe('node security boundaries', () => {
 
   it('does not treat a rejected Iroh closed observation as physical proof', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/rejected-close-observation/1');
-    const endpoint = await IrohEndpoint.create(alpn, {
-      relay: { mode: 'disabled' },
-      discovery: { dns: true }
-    });
     const dialStarted = deferred<void>();
     const dialResult = deferred<unknown>();
-    const internal = endpoint as unknown as {
-      node: { dial(peerId: string, options: unknown): Promise<unknown> };
-    };
-    internal.node.dial = () => {
+    const endpoint = mockIrohDialEndpoint(alpn, () => {
       dialStarted.resolve(undefined);
       return dialResult.promise;
-    };
+    });
     const controller = new AbortController();
     const connecting = endpoint.connectLocator(
       { kind: 'dns' },
