@@ -155,6 +155,13 @@ jobs:
         run: npm run build
       - name: Pack the minimum-runtime artifact
         run: npm run pack:artifact -- package-artifact
+      - name: Preserve exact maintainer package for cross-platform comparison
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p2prpc-minimum-pack-${{ github.sha }}
+          path: package-artifact/
+          if-no-files-found: error
+          retention-days: 1
       - name: Prepare exact reviewed Iroh consumer
         run: npm run prepare:reviewed-consumer -- package-artifact "$RUNNER_TEMP/reviewed-consumer"
       - name: Set up minimum supported Node.js
