@@ -51,6 +51,33 @@ committing the token:
 npm install --save-exact @arduano/p2prpc-core@0.2.1 @trpc/client@11.18.0 @trpc/server@11.18.0
 ```
 
+`0.3.0-renewal.1` has a separate native install contract. Its package manifest
+keeps exact numeric Iroh `0.6.2` dependencies, but the public npm `0.6.2`
+wrapper/addon pair is incompatible. A bare install of this version is not a
+supported native runtime. The application root must declare both reviewed
+fork tarballs as direct dependencies and override their transitive edges:
+
+```json
+{
+  "dependencies": {
+    "@arduano/p2prpc-core": "0.3.0-renewal.1",
+    "@momics/iroh-http-node": "https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/iroh-http-node-0.6.2-fork-linux-win-x64.tgz",
+    "@momics/iroh-http-shared": "https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/iroh-http-shared-0.6.2-fork.tgz"
+  },
+  "overrides": {
+    "@momics/iroh-http-node": "$@momics/iroh-http-node",
+    "@momics/iroh-http-shared": "$@momics/iroh-http-shared"
+  }
+}
+```
+
+Commit a lockfile with the reviewed SHA-512 integrities. The release workflow
+checks this consumer closure before publication. The fork assets must be
+published at those exact URLs first. Substituting public npm Iroh packages does
+not satisfy the native gate. This reviewed node tarball carries Linux x64 and
+Windows x64 addons; other native targets need separately reviewed artifacts
+before qualification.
+
 GitHub Actions can use `GITHUB_TOKEN` after this package repository grants the
 consumer repository Actions access. Set `packages: read`, use
 `actions/setup-node` with `registry-url: https://npm.pkg.github.com`, and expose

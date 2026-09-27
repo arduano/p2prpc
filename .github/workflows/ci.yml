@@ -65,8 +65,10 @@ jobs:
         run: npm run check:package-publint -- "${{ steps.package.outputs.artifact }}"
       - name: Validate packed TypeScript resolution
         run: npm run check:package-types -- "${{ steps.package.outputs.artifact }}"
+      - name: Prepare exact reviewed Iroh consumer
+        run: npm run prepare:reviewed-consumer -- "${{ steps.package.outputs.artifact }}" "${{ runner.temp }}/reviewed-consumer"
       - name: Exercise an install-script-free packed consumer
-        run: npm run test:packed -- "${{ steps.package.outputs.artifact }}"
+        run: npm run test:packed -- "${{ runner.temp }}/reviewed-consumer"
       - name: Generate and validate runtime SBOM and registry signatures
         run: >-
           npm run generate:release-sbom --
@@ -89,8 +91,6 @@ jobs:
           - os: ubuntu-22.04
             node: 22
           - os: ubuntu-22.04
-            node: 24
-          - os: macos-14
             node: 24
           - os: windows-latest
             node: 24
@@ -116,8 +116,10 @@ jobs:
         run: npm run test:integration
       - name: Build and pack the consumer artifact
         run: npm run build && npm run pack:artifact -- package-artifact
+      - name: Prepare exact reviewed Iroh consumer
+        run: npm run prepare:reviewed-consumer -- package-artifact "${{ runner.temp }}/reviewed-consumer"
       - name: Exercise the tree-shaken packed native boundary
-        run: npm run test:tree-shaken-native -- package-artifact
+        run: npm run test:tree-shaken-native -- "${{ runner.temp }}/reviewed-consumer"
 
   minimum-runtime:
     name: Minimum runtime / Node 20.3.1
@@ -139,9 +141,11 @@ jobs:
         run: npm run build
       - name: Pack the minimum-runtime artifact
         run: npm run pack:artifact -- package-artifact
+      - name: Prepare exact reviewed Iroh consumer
+        run: npm run prepare:reviewed-consumer -- package-artifact "$RUNNER_TEMP/reviewed-consumer"
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20.3.1
       - name: Exercise the published runtime boundary
-        run: npm run test:minimum-runtime && npm run test:packed -- package-artifact
+        run: npm run test:minimum-runtime && npm run test:packed -- "$RUNNER_TEMP/reviewed-consumer"

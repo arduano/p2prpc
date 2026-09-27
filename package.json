@@ -26,6 +26,7 @@
     "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
     "test:packed": "node scripts/packed-install-smoke.mjs",
     "test:tree-shaken-native": "node scripts/tree-shaken-native-smoke.mjs",
+    "prepare:reviewed-consumer": "node scripts/prepare-reviewed-consumer.mjs",
     "lint": "eslint .",
     "check:docs": "node scripts/check-docs.mjs",
     "check:package-content": "node scripts/check-package-content.mjs",
@@ -64,7 +65,9 @@
     },
     "vitepress": {
       "vite": "^6.4.3"
-    }
+    },
+    "@momics/iroh-http-node": "$@momics/iroh-http-node",
+    "@momics/iroh-http-shared": "$@momics/iroh-http-shared"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -75,5 +78,9 @@
     "esbuild@0.25.12": true,
     "msgpackr-extract@3.0.4": true,
     "fsevents@2.3.3": false
+  },
+  "dependencies": {
+    "@momics/iroh-http-node": "https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/iroh-http-node-0.6.2-fork-linux-win-x64.tgz",
+    "@momics/iroh-http-shared": "https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/iroh-http-shared-0.6.2-fork.tgz"
   }
 }
