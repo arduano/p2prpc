@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const expectedBase = 'ca7bb6fb7b791813c937ddbf9bde62423d097373';
 const expectedVersion = '0.3.0-renewal.1';
+const expectedP2prpcSha256 = 'a53659552f97e5d10cd3ed4b7c7ab70a2fda9f2b5e06e9856c08f7399637e773';
+const expectedClosureLockSha256 = 'c55130c8c97c2f8a6864e4705cff131724493d4a64784c9a7dcfc7ffb786e7b1';
 const transportInputs = Object.freeze([
   Object.freeze({
     name: '@momics/iroh-http-node',
@@ -83,6 +85,10 @@ for (const input of transportInputs) {
   }
   resolvedInputs.push(Object.freeze({ ...input, source, details }));
 }
+const reviewedLock = resolve(process.argv[5] ?? fail('Pass the reviewed portable closure package-lock.json'));
+if (basename(reviewedLock) !== 'package-lock.json' || (await digest(reviewedLock)).sha256 !== expectedClosureLockSha256) {
+  fail('Reviewed portable closure lock bytes differ');
+}
 
 await mkdir(dirname(destination), { recursive: true });
 const scratch = await mkdtemp(join(dirname(destination), '.p2prpc-portable-'));
@@ -102,6 +108,7 @@ try {
   const p2prpcTarballs = (await readdir(scratch)).filter(entry => entry.endsWith('.tgz'));
   if (p2prpcTarballs.length !== 1) fail('Expected exactly one packed p2prpc tarball');
   const p2prpcFile = p2prpcTarballs[0];
+  if ((await digest(join(scratch, p2prpcFile))).sha256 !== expectedP2prpcSha256) fail('Packed p2prpc bytes differ from the reviewed candidate');
   for (const input of resolvedInputs) await cp(input.source, join(scratch, input.filename), { force: false });
 
   const dependencies = {
@@ -119,7 +126,7 @@ try {
     overrides: Object.fromEntries(Object.keys(dependencies).map(name => [name, `$${name}`]))
   };
   await writeFile(join(scratch, 'package.json'), `${JSON.stringify(closureManifest, null, 2)}\n`);
-  npm(['install', '--package-lock-only', '--ignore-scripts', '--strict-peer-deps', '--fund=false', '--audit=false'], scratch);
+  await cp(reviewedLock, join(scratch, 'package-lock.json'));
 
   const lock = JSON.parse(await readFile(join(scratch, 'package-lock.json'), 'utf8'));
   if (lock.lockfileVersion !== 3 || JSON.stringify(lock.packages?.['']?.dependencies) !== JSON.stringify(dependencies)) fail('Portable lock root dependencies differ');
