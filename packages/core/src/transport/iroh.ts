@@ -843,9 +843,10 @@ export class IrohEndpoint implements QuicEndpoint {
   }
 
   async close(): Promise<void> {
-    const stopIncoming = closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
+    // Close the iterator while its native handle is still valid. The helper
+    // bounds a stuck return and observes a late rejection.
+    await closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
     await this.node.close();
-    await stopIncoming;
   }
 }
 

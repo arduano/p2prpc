@@ -26,8 +26,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.19.0
           cache: npm
+      - name: Pin reviewed npm pack version
+        run: npm install --global npm@11.17.0
       - name: Install dependencies without undeclared lifecycle scripts
         run: npm ci --strict-allow-scripts
       - name: Validate GitHub Actions workflows
@@ -114,10 +116,20 @@ jobs:
         run: npm test
       - name: Run native Iroh integration tests
         run: npm run test:integration
+      - name: Set up reviewed package build Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+      - name: Pin reviewed npm pack version
+        run: npm install --global npm@11.17.0
       - name: Build and pack the consumer artifact
         run: npm run build && npm run pack:artifact -- package-artifact
       - name: Prepare exact reviewed Iroh consumer
         run: npm run prepare:reviewed-consumer -- package-artifact "${{ runner.temp }}/reviewed-consumer"
+      - name: Restore native test Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
       - name: Exercise the tree-shaken packed native boundary
         run: npm run test:tree-shaken-native -- "${{ runner.temp }}/reviewed-consumer"
 
@@ -133,8 +145,10 @@ jobs:
       - name: Set up maintainer Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.19.0
           cache: npm
+      - name: Pin reviewed npm pack version
+        run: npm install --global npm@11.17.0
       - name: Install dependencies without undeclared lifecycle scripts
         run: npm ci --strict-allow-scripts
       - name: Build package

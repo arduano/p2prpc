@@ -1069,6 +1069,30 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('closes the incoming iterator before closing its native node', async () => {
+    const events: string[] = [];
+    let finishReturn!: () => void;
+    const returned = new Promise<void>((resolve) => { finishReturn = resolve; });
+    const endpoint = Object.assign(Object.create(IrohEndpoint.prototype), {
+      incoming: {
+        async return() {
+          events.push('iterator-return-start');
+          await returned;
+          events.push('iterator-return-finished');
+          return { done: true, value: undefined };
+        }
+      },
+      node: { async close() { events.push('native-close'); } }
+    }) as IrohEndpoint;
+
+    const closing = endpoint.close();
+    await Promise.resolve();
+    expect(events).toEqual(['iterator-return-start']);
+    finishReturn();
+    await closing;
+    expect(events).toEqual(['iterator-return-start', 'iterator-return-finished', 'native-close']);
+  });
+
   it('creates fresh signed tickets from all current IPv4 and IPv6 route candidates', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/fresh-ticket/1');
     const endpoint = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });

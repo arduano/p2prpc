@@ -13,7 +13,7 @@ import {
 } from './package-validation-utils.mjs';
 
 const version = '0.3.0-renewal.1';
-const coreSha256 = 'a53659552f97e5d10cd3ed4b7c7ab70a2fda9f2b5e06e9856c08f7399637e773';
+const coreSha256 = '402ac559343ee99fdd3ccc99133b057037128893b4799f695b5d8baddd4decff';
 const forkRelease = 'https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/';
 const fork = [
   {

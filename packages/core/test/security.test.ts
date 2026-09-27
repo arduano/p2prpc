@@ -1764,7 +1764,9 @@ describe('session security', () => {
   it('negotiates the shorter TTL and translates grants conservatively across allowed clock skew', async () => {
     const clock = new AsyncLocalStorage<number>();
     const realNow = Date.now.bind(Date);
-    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (clock.getStore() ?? 0));
+    let tick = 0;
+    // A clock tick between expiry calculations must never extend the TTL.
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + (clock.getStore() ?? 0) + tick++);
     try {
       const forward = new HandshakePipe();
       const reverse = new HandshakePipe();
