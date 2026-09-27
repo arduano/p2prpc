@@ -68,9 +68,7 @@ if (execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8'
 const sourceManifest = JSON.parse(await readFile(join(root, 'packages/core/package.json'), 'utf8'));
 if (sourceManifest.name !== '@arduano/p2prpc-core' || sourceManifest.version !== expectedVersion) fail('Unexpected p2prpc package identity');
 for (const input of transportInputs) {
-  if (sourceManifest.dependencies?.[input.name] !== `file:../../vendor/iroh-http/${input.name.split('/')[1]}-0.6.2-fork${input.name.endsWith('-node') ? '-linux-x64' : ''}.tgz`) {
-    fail(`Source dependency is not the reviewed local ${input.name} input`);
-  }
+  if (sourceManifest.dependencies?.[input.name] !== input.version) fail(`Source dependency is not pinned to published ${input.name}@${input.version}`);
 }
 
 const resolvedInputs = [];
@@ -94,11 +92,7 @@ try {
     for (const name of ['dist', 'LICENSE', 'README.md', 'SECURITY.md', 'THIRD_PARTY_NOTICES.md']) {
       await cp(join(root, 'packages/core', name), join(coreStage, name), { recursive: true });
     }
-    const publicManifest = {
-      ...sourceManifest,
-      dependencies: { ...sourceManifest.dependencies, '@momics/iroh-http-node': '0.6.2', '@momics/iroh-http-shared': '0.6.2' }
-    };
-    await writeFile(join(coreStage, 'package.json'), `${JSON.stringify(publicManifest, null, 2)}\n`);
+    await cp(join(root, 'packages/core/package.json'), join(coreStage, 'package.json'));
     const packed = JSON.parse(npm(['pack', coreStage, '--ignore-scripts', '--json', '--pack-destination', scratch], root))[0];
     if (packed.name !== sourceManifest.name || packed.version !== expectedVersion) fail('Packed p2prpc identity differs');
   } finally {

@@ -6,6 +6,7 @@ import {
 } from '../src/transport/iroh-relayless-networking.js';
 
 type RelayOptions = NonNullable<NodeOptions['relay']>;
+type ForkRelayOptions = RelayOptions & { authToken?: string };
 type RelayNormaliser = (relay?: RelayOptions) => {
   relayMode: string | undefined;
   relays: string[] | null;
@@ -96,7 +97,7 @@ describe('Iroh relay-less networking compatibility seam', () => {
     const original = vi.fn<RelayNormaliser>((relay) => ({
       relayMode: relay?.mode,
       relays: 'urls' in (relay ?? {}) ? relay?.urls ?? null : null,
-      relayAuthToken: relay?.authToken,
+      relayAuthToken: (relay as ForkRelayOptions | undefined)?.authToken,
       disableNetworking: relay?.mode === 'disabled'
     }));
     const shared = sharedModule(original);
