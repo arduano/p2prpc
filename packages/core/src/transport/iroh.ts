@@ -27,7 +27,7 @@ import type {
 export type IrohRelayConfiguration =
   | { readonly mode: 'default' }
   | { readonly mode: 'disabled' }
-  | { readonly mode: 'custom'; readonly urls: readonly string[] };
+  | { readonly mode: 'custom'; readonly urls: readonly string[]; readonly authToken?: string };
 
 export interface IrohDiscoveryConfiguration {
   /**
@@ -97,6 +97,7 @@ type IrohSession = Awaited<ReturnType<IrohNode['dial']>>;
 
 const TICKET_SIGNATURE_DOMAIN = Buffer.from('p2prpc-signed-ticket-v3\0', 'utf8');
 const DISCOVERY_CLEANUP_TIMEOUT_MS = 1_000;
+const MAX_DIRECT_ADDRESSES = 32;
 
 /** @internal Exported only for transport lifecycle conformance tests. */
 export class WebSendStream implements QuicSendStream {
@@ -589,9 +590,11 @@ export class IrohEndpoint implements QuicEndpoint {
         'DNS/PKARR discovery cannot satisfy restricted resolved-route egress policy'
       );
     }
-    const nodeOptions: NodeOptions = {
-      relay: relayUrls
-        ? { urls: relayUrls }
+    const nodeOptions: NodeOptions & {
+      relay?: NodeOptions['relay'] & { authToken?: string };
+    } = {
+      relay: relay.mode === 'custom'
+        ? { urls: relayUrls!, ...(relay.authToken === undefined ? {} : { authToken: relay.authToken }) }
         : { mode: relay.mode },
       discovery: {
         dns: discoveryOptions.dns,
@@ -840,9 +843,10 @@ export class IrohEndpoint implements QuicEndpoint {
   }
 
   async close(): Promise<void> {
-    const stopIncoming = closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
+    // Close the iterator while its native handle is still valid. The helper
+    // bounds a stuck return and observes a late rejection.
+    await closeAsyncIterator(this.incoming, DISCOVERY_CLEANUP_TIMEOUT_MS);
     await this.node.close();
-    await stopIncoming;
   }
 }
 
@@ -950,17 +954,31 @@ function validateIrohOptions(options: IrohEndpointOptions): void {
 function resolveRelayConfiguration(options: IrohEndpointOptions): IrohRelayConfiguration {
   if (options.relay) {
     if (!isPlainRecord(options.relay)) throw new P2PError('INVALID_FRAME', 'Iroh relay options must be a plain object');
-    assertOnlyKeys(options.relay, ['mode', 'urls'], 'Iroh relay options');
+    assertOnlyKeys(options.relay, ['mode', 'urls', 'authToken'], 'Iroh relay options');
     if (options.relay.mode === 'custom') {
       if (!Array.isArray(options.relay.urls)) {
         throw new P2PError('INVALID_FRAME', 'Custom Iroh relay URLs must be an array');
       }
-      return { mode: 'custom', urls: [...options.relay.urls] };
+      if (options.relay.authToken !== undefined && (
+        typeof options.relay.authToken !== 'string' ||
+        options.relay.authToken.length < 1 ||
+        options.relay.authToken.length > 8_192 ||
+        containsUnsafeDisplayCharacters(options.relay.authToken)
+      )) {
+        throw new P2PError('INVALID_FRAME', 'Custom Iroh relay auth token is invalid');
+      }
+      return {
+        mode: 'custom',
+        urls: [...options.relay.urls],
+        ...(options.relay.authToken === undefined ? {} : { authToken: options.relay.authToken })
+      };
     }
     if (options.relay.mode !== 'default' && options.relay.mode !== 'disabled') {
       throw new P2PError('INVALID_FRAME', 'Iroh relay mode is invalid');
     }
-    if ('urls' in options.relay) throw new P2PError('INVALID_FRAME', 'Only custom relay mode accepts URLs');
+    if ('urls' in options.relay || 'authToken' in options.relay) {
+      throw new P2PError('INVALID_FRAME', 'Only custom relay mode accepts URLs or authentication');
+    }
     return { mode: options.relay.mode };
   }
   if (options.relayUrls !== undefined) return { mode: 'custom', urls: [...options.relayUrls] };
@@ -1171,32 +1189,45 @@ function validateDirectAddresses(
   addresses: readonly unknown[],
   allowDirectAddress?: (address: string) => boolean
 ): string[] {
-  if (addresses.length > 32) throw new P2PError('INVALID_FRAME', 'Route has too many direct addresses');
-  return addresses.map((value) => {
-    if (typeof value !== 'string' || value.length < 3 || value.length > 512 || !validSocketAddress(value)) {
-      throw new P2PError('INVALID_FRAME', 'Route contains an invalid direct address');
-    }
-    if (allowDirectAddress) {
-      try {
-        if (allowDirectAddress(value) !== true) {
-          throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
-        }
-      } catch {
+  if (addresses.length > MAX_DIRECT_ADDRESSES) {
+    throw new P2PError('INVALID_FRAME', 'Route has too many direct addresses');
+  }
+  return addresses.map((value) => validateDirectAddress(value, allowDirectAddress));
+}
+
+function validateDirectAddress(
+  value: unknown,
+  allowDirectAddress?: (address: string) => boolean
+): string {
+  if (typeof value !== 'string' || value.length < 3 || value.length > 512 || !validSocketAddress(value)) {
+    throw new P2PError('INVALID_FRAME', 'Route contains an invalid direct address');
+  }
+  if (allowDirectAddress) {
+    try {
+      if (allowDirectAddress(value) !== true) {
         throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
       }
+    } catch {
+      throw new P2PError('UNAUTHORIZED', 'Route direct address was rejected by egress policy');
     }
-    return value;
-  });
+  }
+  return value;
 }
 
 function filterAdvertisedAddresses(
   addresses: readonly unknown[],
   allowAdvertisedAddress?: (address: string) => boolean
 ): string[] {
-  const validated = validateDirectAddresses(addresses);
-  return allowAdvertisedAddress
+  // iroh-http-node 0.6.2 reports every bound interface and can legitimately
+  // exceed the signed-ticket route limit on hosts with many virtual networks.
+  // Validate every native value, apply the deployment's publication policy,
+  // then advertise only the bounded prefix. Remote, untrusted route lists are
+  // still rejected rather than truncated by validateDirectAddresses.
+  const validated = addresses.map((value) => validateDirectAddress(value));
+  const allowed = allowAdvertisedAddress
     ? validated.filter((address) => allowAdvertisedAddress(address) === true)
     : validated;
+  return allowed.slice(0, MAX_DIRECT_ADDRESSES);
 }
 
 function validSocketAddress(value: string, allowZeroPort = false): boolean {

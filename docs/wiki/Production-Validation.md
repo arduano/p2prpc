@@ -39,6 +39,18 @@ npm audit --audit-level=low
 
 The release workflow additionally validates packed contents/license, `publint`, Are-the-Types-Wrong, installation from the tarball, a tree-shaken native import, SBOM and dependency-registry-signature evidence, action syntax, GitHub build provenance, and post-publish byte equality. Publication consumes the immutable candidate with lifecycle scripts disabled; it does not rebuild it. A rerun never blindly republishes an immutable package version: it may recover only when registry integrity, tarball bytes, the expected `latest`/`next` distribution tag, source commit, and semver Git tag all match. GitHub release creation similarly verifies or replaces only the expected assets.
 
+For `0.3.0-renewal.1`, source and packed native checks use the exact root
+override contract in the [installation instructions](https://github.com/arduano/p2prpc/blob/main/README.md#install-from-github-packages).
+The package itself retains numeric Iroh dependencies. The release candidate
+also carries a reviewed-consumer receipt, lockfile hash, SBOM, and registry
+signature result; the two fork tarballs are admitted by their exact owner
+release URLs and SHA-512 integrities. The separate package SBOM and registry
+signature check remain in place, but its bare registry resolution is not the
+supported native graph. A bare package install is therefore not a native
+qualification result. Missing fork release assets, a changed digest, or a
+missing platform addon fail the release gate. The native CI matrix covers the
+reviewed Linux x64 and Windows x64 addons.
+
 Release governance is part of the gate: protect `main` and version tags, require review for the `github-packages` environment, and leave `packages: write` available only to the tag-triggered publish job. It authenticates with the repository-scoped `GITHUB_TOKEN`; no registry PAT is stored. The Changesets workflow may update a release PR, but it has no Actions-approval permission and cannot waive that PR's normal required checks. Lab runners must be dedicated or ephemeral, execute only protected-branch code, keep credentials outside the workspace, and start each run from a clean host boundary. Lab driver binaries are accepted only when their version, schema, and SHA-256 match the protected manifest.
 
 Public CI must complete on `main` before the matching `v<version>` tag is
@@ -64,7 +76,7 @@ configuration remains necessary even after that visibility change.
 | mDNS + relay disabled | Discovery and transfer succeed on an isolated LAN with relay egress denied; no loopback address is accepted as evidence. |
 | Relay policy negatives | Missing, false, or throwing ticket policy and disabled/custom violations reject before prohibited egress. |
 
-DNS plus custom relay or address/relay filtering is deliberately unsupported because wrapper 0.6.0 cannot expose resolved routes for inspection. Relay-disabled networking uses an exact-version compatibility seam that separates “no relay” from the wrapper's test-only loopback switch. Release evidence must still come from at least two non-loopback lab hosts, report `hostCount >= 2`, `nonLoopbackDirectPathsObserved > 0`, and `relayPathsObserved == 0`, prove `relayUrl === null`, and cover both signed-ticket and mDNS discovery; same-host tests are implementation checks only. One lifecycle run selects one locator/relay policy, so it cannot stand in for the other matrix rows. DNS evidence is necessarily limited to native success/failure and independent identity checks; it cannot claim application inspection of resolved route candidates.
+DNS plus custom relay or address/relay filtering is deliberately unsupported because wrapper 0.6.2 cannot expose resolved routes for inspection. Relay-disabled networking uses an exact-version compatibility seam that separates “no relay” from the wrapper's test-only loopback switch. Release evidence must still come from at least two non-loopback lab hosts, report `hostCount >= 2`, `nonLoopbackDirectPathsObserved > 0`, and `relayPathsObserved == 0`, prove `relayUrl === null`, and cover both signed-ticket and mDNS discovery; same-host tests are implementation checks only. One lifecycle run selects one locator/relay policy, so it cannot stand in for the other matrix rows. DNS evidence is necessarily limited to native success/failure and independent identity checks; it cannot claim application inspection of resolved route candidates.
 
 ## Mixed workload
 
@@ -111,4 +123,4 @@ The exact-pinned shared Iroh package has a narrow writer-cleanup seam: when nati
 
 A zero scheduler ledger after shutdown means every tracked logical owner released; scheduler close itself does not erase active leases. It still does not alone prove that opaque native implementations returned all handles, so retain the stream, file-descriptor, native-handle, task, and memory baselines.
 
-Retain the GitHub run, immutable artifact digests, release manifest, checksums, SBOM, dependency-registry-signature result, GitHub provenance bundle, and publication verification for the exact tag and commit. Any code, lockfile, workflow, relay-set, or package-byte change invalidates the candidate and requires the relevant gates again.
+Retain the GitHub run, immutable artifact digests, release manifest, checksums, both SBOMs, both dependency-registry-signature results, reviewed-consumer receipt, GitHub provenance bundle, and publication verification for the exact tag and commit. Any code, lockfile, workflow, relay-set, or package-byte change invalidates the candidate and requires the relevant gates again.

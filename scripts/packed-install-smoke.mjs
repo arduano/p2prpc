@@ -3,12 +3,12 @@ import { join } from 'node:path';
 import process from 'node:process';
 import {
   installPackedArtifact,
-  packageArtifactArgument,
+  packageInstallSourceArgument,
   run,
   temporaryDirectory
 } from './package-validation-utils.mjs';
 
-const artifact = packageArtifactArgument();
+const artifact = packageInstallSourceArgument();
 const directory = await temporaryDirectory('packed-install');
 try {
   await installPackedArtifact(artifact, directory);

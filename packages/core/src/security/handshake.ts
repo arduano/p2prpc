@@ -384,10 +384,12 @@ async function authenticateResponder<TFileMetadata>(
     await expectRecvEnd(stream.recv);
     signal.throwIfAborted();
 
-    const expiresAt = capExpiry(
-      Math.min(principal.expiresAt, startedAt + finished.grantExpiresAt - hello.presentedAt),
-      Math.max(1, startedAt + Math.min(hello.maxSessionTtlMs, challenge.maxSessionTtlMs) - Date.now())
+    const expiresAt = Math.min(
+      principal.expiresAt,
+      startedAt + finished.grantExpiresAt - hello.presentedAt,
+      startedAt + Math.min(hello.maxSessionTtlMs, challenge.maxSessionTtlMs)
     );
+    validatePrincipalExpiry(expiresAt);
     const candidate = boundedSession(Object.freeze({ id, generation: hello.generation, establishedAt: startedAt, expiresAt, principal }), startedMonotonic);
     if (options.prepareSession) {
       const preparation = options.prepareSession(candidate, signal);
@@ -702,12 +704,6 @@ function validatePrincipalExpiry(expiresAt: number): void {
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) {
     throw new P2PError('UNAUTHORIZED', 'Session credential is expired');
   }
-}
-
-function capExpiry(expiresAt: number, maxTtlMs: number): number {
-  const capped = Math.min(expiresAt, Date.now() + maxTtlMs);
-  validatePrincipalExpiry(capped);
-  return capped;
 }
 
 function nonce(): string {

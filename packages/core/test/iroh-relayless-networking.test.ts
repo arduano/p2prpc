@@ -6,9 +6,11 @@ import {
 } from '../src/transport/iroh-relayless-networking.js';
 
 type RelayOptions = NonNullable<NodeOptions['relay']>;
+type ForkRelayOptions = RelayOptions & { authToken?: string };
 type RelayNormaliser = (relay?: RelayOptions) => {
   relayMode: string | undefined;
   relays: string[] | null;
+  relayAuthToken: string | undefined;
   disableNetworking: boolean;
 };
 
@@ -17,6 +19,7 @@ describe('Iroh relay-less networking compatibility seam', () => {
     const original = vi.fn<RelayNormaliser>((relay) => ({
       relayMode: relay?.mode,
       relays: null,
+      relayAuthToken: undefined,
       disableNetworking: relay?.mode === 'disabled'
     }));
     const shared = sharedModule(original);
@@ -36,11 +39,13 @@ describe('Iroh relay-less networking compatibility seam', () => {
     expect(targetResult).toEqual({
       relayMode: 'disabled',
       relays: [],
+      relayAuthToken: undefined,
       disableNetworking: false
     });
     expect(unrelatedResult).toEqual({
       relayMode: 'disabled',
       relays: null,
+      relayAuthToken: undefined,
       disableNetworking: true
     });
     expect(original).toHaveBeenCalledOnce();
@@ -49,7 +54,12 @@ describe('Iroh relay-less networking compatibility seam', () => {
   });
 
   it('restores the exact export descriptor when node creation throws', () => {
-    const shared = sharedModule(() => ({ relayMode: undefined, relays: null, disableNetworking: false }));
+    const shared = sharedModule(() => ({
+      relayMode: undefined,
+      relays: null,
+      relayAuthToken: undefined,
+      disableNetworking: false
+    }));
     const before = Object.getOwnPropertyDescriptor(shared, 'normaliseRelayMode');
     const failure = new Error('native create failed');
 
@@ -62,7 +72,12 @@ describe('Iroh relay-less networking compatibility seam', () => {
   });
 
   it('fails closed for an incompatible export descriptor or normalization path', () => {
-    const normalise = () => ({ relayMode: 'disabled', relays: [], disableNetworking: true });
+    const normalise = () => ({
+      relayMode: 'disabled',
+      relays: [],
+      relayAuthToken: undefined,
+      disableNetworking: true
+    });
     const dataProperty = { PublicKey, normaliseRelayMode: normalise };
     expect(() => withRelaylessNormalisation(
       dataProperty,
@@ -82,6 +97,7 @@ describe('Iroh relay-less networking compatibility seam', () => {
     const original = vi.fn<RelayNormaliser>((relay) => ({
       relayMode: relay?.mode,
       relays: 'urls' in (relay ?? {}) ? relay?.urls ?? null : null,
+      relayAuthToken: (relay as ForkRelayOptions | undefined)?.authToken,
       disableNetworking: relay?.mode === 'disabled'
     }));
     const shared = sharedModule(original);
@@ -108,6 +124,7 @@ describe('Iroh relay-less networking compatibility seam', () => {
     const original = vi.fn<RelayNormaliser>((relay) => ({
       relayMode: relay?.mode,
       relays: null,
+      relayAuthToken: undefined,
       disableNetworking: relay?.mode === 'disabled'
     }));
     const shared = sharedModule(original);

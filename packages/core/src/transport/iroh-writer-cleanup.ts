@@ -30,7 +30,7 @@ export function consumeIrohWriterCleanupProof(cause: unknown): {
 }
 
 /**
- * Exact-pinned iroh-http-shared 0.6.1 leaves a native writer handle allocated when the
+ * Exact-pinned iroh-http-shared 0.6.2 leaves a native writer handle allocated when the
  * WritableStream sink's sendChunk call rejects. WHATWG streams transition to
  * errored before a later abort, so the sink abort callback can no longer call
  * finishBody. Finalize at the adapter boundary while the opaque handle is

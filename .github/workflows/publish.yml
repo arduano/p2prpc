@@ -31,8 +31,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.19.0
           cache: npm
+      - name: Pin reviewed npm pack version
+        run: npm install --global npm@11.17.0
       - name: Install locked dependencies without undeclared lifecycle scripts
         run: npm ci --strict-allow-scripts
       - name: Verify exact semver tag
@@ -107,14 +109,21 @@ jobs:
           npm run check:package-content -- "$artifact" release-artifact/pack.json
           npm run check:package-publint -- "$artifact"
           npm run check:package-types -- "$artifact"
-          npm run test:packed -- "$artifact"
-          npm run test:tree-shaken-native -- "$artifact"
+          npm run prepare:reviewed-consumer -- "$artifact" "$RUNNER_TEMP/reviewed-consumer"
+          npm run test:packed -- "$RUNNER_TEMP/reviewed-consumer"
+          npm run test:tree-shaken-native -- "$RUNNER_TEMP/reviewed-consumer"
+          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-receipt.json" release-artifact/
+          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-sbom.cdx.json" release-artifact/
+          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-registry-signatures.json" release-artifact/
           npm run generate:release-sbom -- \
             "$artifact" \
             release-artifact/sbom.cdx.json \
             release-artifact/registry-signatures.json
           integrity="$(jq -er '.[0].integrity' release-artifact/pack.json)"
           sha256="$(sha256sum "$artifact" | awk '{ print $1 }')"
+          reviewed_sha256="$(sha256sum release-artifact/reviewed-consumer-receipt.json | awk '{ print $1 }')"
+          jq -e --arg sha256 "$sha256" '.mode == "published-url" and .package.sha256 == $sha256' \
+            release-artifact/reviewed-consumer-receipt.json >/dev/null
           dist_tag=latest
           if [[ "$RELEASE_VERSION" == *-* ]]; then dist_tag=next; fi
           jq -n \
@@ -124,10 +133,11 @@ jobs:
             --arg tarball "$tarball" \
             --arg integrity "$integrity" \
             --arg sha256 "$sha256" \
+            --arg reviewedConsumerSha256 "$reviewed_sha256" \
             --arg distTag "$dist_tag" \
             --arg ciRunId "$CI_RUN_ID" \
             '{
-              schemaVersion: 3,
+              schemaVersion: 4,
               package: "@arduano/p2prpc-core",
               commit: $commit,
               distTag: $distTag,
@@ -136,6 +146,7 @@ jobs:
               tarball: $tarball,
               integrity: $integrity,
               sha256: $sha256,
+              reviewedConsumerSha256: $reviewedConsumerSha256,
               ciRunId: $ciRunId
             }' > release-artifact/manifest.json
           (
@@ -146,6 +157,9 @@ jobs:
               pack.json \
               sbom.cdx.json \
               registry-signatures.json \
+              reviewed-consumer-receipt.json \
+              reviewed-consumer-sbom.cdx.json \
+              reviewed-consumer-registry-signatures.json \
               > SHA256SUMS
           )
       - name: Upload immutable release candidate
@@ -189,9 +203,9 @@ jobs:
           jq -e --arg commit "$GITHUB_SHA" --arg ref "$GITHUB_REF" '
             (keys | sort) == [
               "ciRunId", "commit", "distTag", "integrity", "package",
-              "ref", "schemaVersion", "sha256", "tarball", "version"
+              "ref", "reviewedConsumerSha256", "schemaVersion", "sha256", "tarball", "version"
             ] and
-            .schemaVersion == 3 and
+            .schemaVersion == 4 and
             .package == "@arduano/p2prpc-core" and
             .commit == $commit and
             .ref == $ref and
@@ -200,8 +214,14 @@ jobs:
             (.ciRunId | test("^[1-9][0-9]*$")) and
             (.integrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$")) and
             (.sha256 | test("^[0-9a-f]{64}$")) and
+            (.reviewedConsumerSha256 | test("^[0-9a-f]{64}$")) and
             .tarball == ("arduano-p2prpc-core-" + .version + ".tgz")
           ' release-artifact/manifest.json >/dev/null
+          test "$(sha256sum release-artifact/reviewed-consumer-receipt.json | awk '{ print $1 }')" = \
+            "$(jq -er '.reviewedConsumerSha256' release-artifact/manifest.json)"
+          jq -e --arg sha256 "$(jq -er '.sha256' release-artifact/manifest.json)" \
+            '.mode == "published-url" and .package.sha256 == $sha256' \
+            release-artifact/reviewed-consumer-receipt.json >/dev/null
           tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
       - name: Attest immutable package bytes
@@ -214,6 +234,22 @@ jobs:
         with:
           name: p2prpc-provenance-${{ github.sha }}
           path: ${{ steps.provenance.outputs.bundle-path }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+      - name: Attest reviewed consumer closure
+        id: closure-provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v4.2.2
+        with:
+          subject-path: release-artifact/reviewed-consumer-receipt.json
+      - name: Preserve closure provenance bundle
+        shell: bash
+        run: cp "${{ steps.closure-provenance.outputs.bundle-path }}" reviewed-consumer-provenance.jsonl
+      - name: Upload closure provenance bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: p2prpc-closure-provenance-${{ github.sha }}
+          path: reviewed-consumer-provenance.jsonl
           if-no-files-found: error
           overwrite: true
           retention-days: 90
@@ -316,6 +352,11 @@ jobs:
         with:
           name: p2prpc-provenance-${{ github.sha }}
           path: provenance
+      - name: Download closure provenance bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: p2prpc-closure-provenance-${{ github.sha }}
+          path: closure-provenance
       - name: Verify publication
         shell: bash
         env:
@@ -347,14 +388,37 @@ jobs:
           registry_tarball="$(jq -er '.[0].filename' "$verification/registry/pack.json")"
           cmp --silent "release-artifact/$tarball" "$verification/registry/$registry_tarball"
           cd "$verification/consumer"
-          npm init --yes >/dev/null
+          REVIEWED_RECEIPT="$GITHUB_WORKSPACE/release-artifact/reviewed-consumer-receipt.json" \
+            RELEASE_VERSION="$version" node --input-type=module - <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const receipt = JSON.parse(readFileSync(process.env.REVIEWED_RECEIPT, 'utf8'));
+          const dependencies = { '@arduano/p2prpc-core': process.env.RELEASE_VERSION };
+          for (const fork of receipt.fork) dependencies[fork.name] = fork.url;
+          const overrides = Object.fromEntries(receipt.fork.map(fork => [fork.name, `$${fork.name}`]));
+          writeFileSync('package.json', JSON.stringify({
+            name: 'p2prpc-release-verification', version: '1.0.0', private: true,
+            type: 'module', dependencies, overrides
+          }, null, 2));
+          NODE
           npm install \
             --ignore-scripts \
             --strict-allow-scripts \
             --strict-peer-deps \
             --fund=false \
-            --audit=false \
-            "@arduano/p2prpc-core@$version"
+            --audit=false
+          REVIEWED_RECEIPT="$GITHUB_WORKSPACE/release-artifact/reviewed-consumer-receipt.json" \
+            EXPECTED_INTEGRITY="$expected_integrity" node --input-type=module - <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const receipt = JSON.parse(readFileSync(process.env.REVIEWED_RECEIPT, 'utf8'));
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
+          assert.equal(lock.packages['node_modules/@arduano/p2prpc-core'].integrity, process.env.EXPECTED_INTEGRITY);
+          for (const fork of receipt.fork) {
+            const entry = lock.packages[`node_modules/${fork.name}`];
+            assert.equal(entry?.resolved, fork.url);
+            assert.equal(entry?.integrity, fork.integrity);
+          }
+          NODE
           node --input-type=module - <<'NODE'
           import assert from 'node:assert/strict';
           import * as core from '@arduano/p2prpc-core';
@@ -379,6 +443,14 @@ jobs:
             --source-ref "$GITHUB_REF" \
             --deny-self-hosted-runners \
             --format json > "$verification/attestation-verification.json"
+          gh attestation verify release-artifact/reviewed-consumer-receipt.json \
+            --bundle closure-provenance/reviewed-consumer-provenance.jsonl \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners \
+            --format json > "$verification/closure-attestation-verification.json"
           jq -n \
             --arg package "@arduano/p2prpc-core@$version" \
             --arg registry "https://npm.pkg.github.com" \
@@ -387,6 +459,7 @@ jobs:
             --arg integrity "$expected_integrity" \
             --arg sha256 "$(sha256sum "release-artifact/$tarball" | awk '{ print $1 }')" \
             --slurpfile attestation "$verification/attestation-verification.json" \
+            --slurpfile closureAttestation "$verification/closure-attestation-verification.json" \
             '{
               schemaVersion: 1,
               package: $package,
@@ -395,7 +468,8 @@ jobs:
               ref: $ref,
               integrity: $integrity,
               sha256: $sha256,
-              attestation: $attestation[0]
+              attestation: $attestation[0],
+              closureAttestation: $closureAttestation[0]
             }' > "$verification/publication-verification.json"
       - name: Upload publication verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -403,6 +477,7 @@ jobs:
           name: p2prpc-publication-verification-${{ github.sha }}
           path: |
             ${{ runner.temp }}/publication/attestation-verification.json
+            ${{ runner.temp }}/publication/closure-attestation-verification.json
             ${{ runner.temp }}/publication/publication-verification.json
           if-no-files-found: error
           overwrite: true
@@ -427,6 +502,11 @@ jobs:
         with:
           name: p2prpc-provenance-${{ github.sha }}
           path: provenance
+      - name: Download closure provenance bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: p2prpc-closure-provenance-${{ github.sha }}
+          path: closure-provenance
       - name: Download publication verification
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -450,7 +530,8 @@ jobs:
               .registry == "https://npm.pkg.github.com" and
               .commit == $commit and
               .ref == $ref and
-              (.attestation | type == "array" and length >= 1)
+              (.attestation | type == "array" and length >= 1) and
+              (.closureAttestation | type == "array" and length >= 1)
             ' publication-verification/publication-verification.json >/dev/null
           bundle="$(find provenance -type f -print -quit)"
           title="@arduano/p2prpc-core $version"
@@ -461,8 +542,13 @@ jobs:
             "release-artifact/$tarball"
             release-artifact/sbom.cdx.json
             release-artifact/registry-signatures.json
+            release-artifact/reviewed-consumer-receipt.json
+            release-artifact/reviewed-consumer-sbom.cdx.json
+            release-artifact/reviewed-consumer-registry-signatures.json
             "$bundle"
+            closure-provenance/reviewed-consumer-provenance.jsonl
             publication-verification/attestation-verification.json
+            publication-verification/closure-attestation-verification.json
             publication-verification/publication-verification.json
           )
           if existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null)"; then

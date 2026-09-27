@@ -1,4 +1,5 @@
 import { initTRPC } from '@trpc/server';
+import { PublicKey } from '@momics/iroh-http-node';
 import { describe, expect, it } from 'vitest';
 import {
   P2PError,
@@ -29,6 +30,16 @@ const router = t.router({
   ping: t.procedure.query(() => 'pong')
 });
 const DEFAULT_MINIMUM_FILE_BUFFER = 3 * 1024 * 1024 + 2 * (4 * 1024 * 1024 + 64 * 1024);
+
+function mockIrohDialEndpoint(alpn: Uint8Array, dial: () => Promise<unknown>): IrohEndpoint {
+  return Object.assign(Object.create(IrohEndpoint.prototype), {
+    id: PublicKey.fromBytes(new Uint8Array(32).fill(7)).toString(),
+    protocol: Buffer.from(alpn).toString('base64url'),
+    dnsEnabled: true,
+    node: { dial, close: async () => undefined },
+    incoming: { return: async () => ({ done: true, value: undefined }) }
+  }) as IrohEndpoint;
+}
 
 describe('node security boundaries', () => {
   it.each(['scopes', 'claims', 'endpoint-policy'] as const)(
@@ -570,6 +581,10 @@ describe('node security boundaries', () => {
     const alpn = new TextEncoder().encode('p2prpc/2/test/1');
     for (const options of [
       { relay: { mode: 'disabled', urls: ['https://relay.example'] } },
+      { relay: { mode: 'disabled', authToken: 'synthetic-token' } },
+      { relay: { mode: 'default', authToken: 'synthetic-token' } },
+      { relay: { mode: 'custom', urls: ['https://relay.example'], authToken: '' } },
+      { relay: { mode: 'custom', urls: ['https://relay.example'], authToken: 'bad\ntoken' } },
       { relay: { mode: 'custom', urls: ['https://relay.example'], fallback: true } },
       { discovery: { dns: { serverUrl: 'https://dns.example', cache: true } } },
       { discovery: { mdns: { serviceName: 'p2prpc', advertise: true, browse: true } } },
@@ -582,21 +597,14 @@ describe('node security boundaries', () => {
 
   it('retains a cancelled late Iroh dial until native session closure is proven', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/late-dial-ownership/1');
-    const endpoint = await IrohEndpoint.create(alpn, {
-      relay: { mode: 'disabled' },
-      discovery: { dns: true }
-    });
     const dialStarted = deferred<void>();
     const dialResult = deferred<unknown>();
     const physicallyClosed = deferred<void>();
     let closeCalls = 0;
-    const internal = endpoint as unknown as {
-      node: { dial(peerId: string, options: unknown): Promise<unknown> };
-    };
-    internal.node.dial = () => {
+    const endpoint = mockIrohDialEndpoint(alpn, () => {
       dialStarted.resolve(undefined);
       return dialResult.promise;
-    };
+    });
     const session = {
       ready: Promise.resolve(undefined),
       close: () => {
@@ -638,19 +646,12 @@ describe('node security boundaries', () => {
 
   it('does not treat a rejected Iroh closed observation as physical proof', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/rejected-close-observation/1');
-    const endpoint = await IrohEndpoint.create(alpn, {
-      relay: { mode: 'disabled' },
-      discovery: { dns: true }
-    });
     const dialStarted = deferred<void>();
     const dialResult = deferred<unknown>();
-    const internal = endpoint as unknown as {
-      node: { dial(peerId: string, options: unknown): Promise<unknown> };
-    };
-    internal.node.dial = () => {
+    const endpoint = mockIrohDialEndpoint(alpn, () => {
       dialStarted.resolve(undefined);
       return dialResult.promise;
-    };
+    });
     const controller = new AbortController();
     const connecting = endpoint.connectLocator(
       { kind: 'dns' },
@@ -1065,6 +1066,30 @@ describe('node security boundaries', () => {
     }
   });
 
+  it('closes the incoming iterator before closing its native node', async () => {
+    const events: string[] = [];
+    let finishReturn!: () => void;
+    const returned = new Promise<void>((resolve) => { finishReturn = resolve; });
+    const endpoint = Object.assign(Object.create(IrohEndpoint.prototype), {
+      incoming: {
+        async return() {
+          events.push('iterator-return-start');
+          await returned;
+          events.push('iterator-return-finished');
+          return { done: true, value: undefined };
+        }
+      },
+      node: { async close() { events.push('native-close'); } }
+    }) as IrohEndpoint;
+
+    const closing = endpoint.close();
+    await Promise.resolve();
+    expect(events).toEqual(['iterator-return-start']);
+    finishReturn();
+    await closing;
+    expect(events).toEqual(['iterator-return-start', 'iterator-return-finished', 'native-close']);
+  });
+
   it('creates fresh signed tickets from all current IPv4 and IPv6 route candidates', { timeout: 30_000 }, async () => {
     const alpn = new TextEncoder().encode('p2prpc/2/fresh-ticket/1');
     const endpoint = await IrohEndpoint.create(alpn, { relay: { mode: 'default' } });
@@ -1099,6 +1124,46 @@ describe('node security boundaries', () => {
       expect(second.directAddresses).toEqual(['192.0.2.2:4433', '[2001:db8::2]:4433']);
       expect(second.relayUrl).toBe('https://relay-2.example/');
       expect(second.issuedAt).toBeGreaterThan(first.issuedAt);
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  it('filters local routes before bounding tickets and validates every native candidate', { timeout: 30_000 }, async () => {
+    const alpn = new TextEncoder().encode('p2prpc/2/bounded-local-routes/1');
+    const endpoint = await IrohEndpoint.create(alpn, {
+      relay: { mode: 'default' },
+      allowAdvertisedAddress: (address) => !address.endsWith(':4000') && !address.endsWith(':4001')
+    });
+    const internal = endpoint as unknown as {
+      node: {
+        discoveryInfo(): Promise<{
+          nodeId: string;
+          directAddress: string | null;
+          directAddresses: string[];
+          relayUrl: string | null;
+        }>;
+      };
+    };
+    const candidates = Array.from({ length: 35 }, (_, index) => `192.0.2.1:${4_000 + index}`);
+
+    try {
+      internal.node.discoveryInfo = async () => ({
+        nodeId: endpoint.id,
+        directAddress: candidates[0]!,
+        directAddresses: candidates,
+        relayUrl: null
+      });
+      const bounded = decodeTicketBody(await endpoint.createTicket());
+      expect(bounded.directAddresses).toEqual(candidates.slice(2, 34));
+
+      internal.node.discoveryInfo = async () => ({
+        nodeId: endpoint.id,
+        directAddress: candidates[0]!,
+        directAddresses: [...candidates.slice(0, 34), 'not-a-socket-address'],
+        relayUrl: null
+      });
+      await expect(endpoint.createTicket()).rejects.toMatchObject({ code: 'INVALID_FRAME' });
     } finally {
       await endpoint.close();
     }
