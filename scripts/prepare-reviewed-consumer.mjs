@@ -12,8 +12,8 @@ import {
   runAndCapture
 } from './package-validation-utils.mjs';
 
-const version = '0.3.0-renewal.1';
-const coreSha256 = '26867bf16d55c3a7e1a51c72f3c36f40662cefa6a38f0689f6187b955bfa0b10';
+const version = '0.3.0-renewal.2';
+const coreSha256 = '43974dce89b57e69225bd64a6d526cf75548ab17795f905d0b72800a2b078879';
 const forkRelease = 'https://github.com/arduano/iroh-http/releases/download/leo-v6-iroh-0.6.2-d799fa3/';
 const fork = [
   {
@@ -41,7 +41,7 @@ const archive = await readPackageArchive(artifact);
 const packed = JSON.parse(archive.files.get('package.json')?.content.toString('utf8') ?? '{}');
 const coreIntegrity = `sha512-${createHash('sha512').update(archive.compressed).digest('base64')}`;
 invariant(packed.name === '@arduano/p2prpc-core' && packed.version === version,
-  'The reviewed consumer requires the exact renewal.1 package');
+  'The reviewed consumer requires the exact renewal.2 package');
 invariant(sha256(archive.compressed) === coreSha256, 'The p2prpc tarball differs from the reviewed candidate');
 for (const input of fork) invariant(packed.dependencies?.[input.name] === '0.6.2',
   `The packed ${input.name} dependency must remain numeric and exact`);
@@ -70,7 +70,7 @@ try {
     } else dependencies[input.name] = forkRelease + input.file;
   }
   const manifest = {
-    name: 'p2prpc-renewal-1-portable-closure', version: '1.0.0', private: true, type: 'module',
+    name: 'p2prpc-reviewed-portable-closure', version: '1.0.0', private: true, type: 'module',
     engines: { node: '>=20' }, dependencies,
     overrides: Object.fromEntries(Object.keys(dependencies).map(name => [name, `$${name}`]))
   };
