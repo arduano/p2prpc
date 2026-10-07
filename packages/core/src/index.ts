@@ -91,3 +91,6 @@ export type {
   EndpointDiscoveryOptions,
   StreamLifecycleStats
 } from './transport/types.js';
+
+export { verifyPinnedSignedTicket } from "./transport/signed-ticket.js";
+export type { SignedTicket, SignedTicketVerification } from "./transport/signed-ticket.js";

@@ -1,5 +1,6 @@
 import { createPrivateKey, randomBytes, sign as signBytes } from 'node:crypto';
 import { BlockList, isIP } from 'node:net';
+import { decodeSignedTicket, type SignedTicket as TicketPayload } from './signed-ticket.js';
 import { createNode, PublicKey, type IrohNode, type NodeOptions } from '@momics/iroh-http-node';
 import { P2PError } from '../errors.js';
 import { containsUnsafeDisplayCharacters } from '../text.js';
@@ -76,15 +77,6 @@ export interface IrohEndpointOptions {
   readonly allowRelayUrl?: (origin: string) => boolean;
 }
 
-interface TicketPayload {
-  readonly version: 3;
-  readonly peerId: string;
-  readonly directAddresses: string[];
-  readonly relayUrl: string | null;
-  readonly protocol: string;
-  readonly issuedAt: number;
-  readonly expiresAt: number;
-}
 
 interface RelayEgressPolicy {
   readonly mode: IrohRelayConfiguration['mode'];
@@ -1125,45 +1117,7 @@ async function decodeTicket(
   allowRelayUrl?: (origin: string) => boolean
 ): Promise<TicketPayload> {
   try {
-    if (Buffer.byteLength(ticket) > 64 * 1024 || !ticket.startsWith('p2prpc3.')) throw new Error('Invalid prefix or length');
-    const parts = ticket.split('.');
-    if (parts.length !== 3) throw new Error('Invalid ticket segments');
-    const encodedBody = parts[1]!;
-    const encodedSignature = parts[2]!;
-    const body = Buffer.from(encodedBody, 'base64url');
-    const signature = Buffer.from(encodedSignature, 'base64url');
-    if (body.toString('base64url') !== encodedBody || signature.toString('base64url') !== encodedSignature || signature.byteLength !== 64) {
-      throw new Error('Non-canonical ticket encoding');
-    }
-    const decoded: unknown = JSON.parse(body.toString('utf8'));
-    if (!isPlainRecord(decoded)) throw new Error('Invalid ticket object');
-    assertOnlyKeys(
-      decoded,
-      ['version', 'peerId', 'directAddresses', 'relayUrl', 'protocol', 'issuedAt', 'expiresAt'],
-      'Ticket'
-    );
-    const value = decoded as unknown as TicketPayload;
-    if (
-      value.version !== 3 ||
-      typeof value.peerId !== 'string' ||
-      !Array.isArray(value.directAddresses) ||
-      typeof value.protocol !== 'string' ||
-      value.protocol.length < 1 ||
-      value.protocol.length > 512 ||
-      typeof value.issuedAt !== 'number' ||
-      !Number.isSafeInteger(value.issuedAt) ||
-      typeof value.expiresAt !== 'number' ||
-      !Number.isSafeInteger(value.expiresAt) ||
-      value.expiresAt <= Date.now() ||
-      value.issuedAt > value.expiresAt ||
-      value.issuedAt > Date.now() + 60_000 ||
-      value.expiresAt - value.issuedAt > 30 * 24 * 60 * 60_000 ||
-      (value.relayUrl !== null && typeof value.relayUrl !== 'string')
-    ) {
-      throw new Error('Invalid fields');
-    }
-    const publicKey = PublicKey.fromString(value.peerId);
-    if (!await publicKey.verify(ticketSignaturePayload(body), signature)) throw new Error('Invalid ticket signature');
+    const value = decodeSignedTicket(ticket);
     if (value.directAddresses.length > 0 && allowDirectAddress === undefined) {
       throw new P2PError(
         'UNAUTHORIZED',

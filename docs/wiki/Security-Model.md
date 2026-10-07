@@ -110,3 +110,22 @@ These controls bound library-owned work; applications must bound their own schem
 `onSecurityEvent` emits credential-free session and authorization records. Delivery is best effort and grants no authority, so forward it to a monitored durable sink. An event callback may synchronously close the peer or node; the final admission gate observes that terminal state before any peer is returned. Tokens, shared secrets, credentials, capability plaintext, file contents, and unsanitized peer errors are not included.
 
 Custom authenticators/transports imported from `/advanced`, token providers, directory binders, application policy, destinations, and storage are part of the deployment trusted computing base.
+
+## Offline signed locator inspection
+
+`verifyPinnedSignedTicket` verifies the signed envelope against an exact peer and
+application protocol without constructing an endpoint or dialing a route. Its
+clock and byte bound are explicit; historical expired-ticket verification must
+be requested and conveys no reachability or freshness. It shares the signature
+and structural decoder used by native connection. Actual connection separately
+requires the configured direct/relay egress policy and principal authentication.
+
+```ts
+import { verifyPinnedSignedTicket } from '@arduano/p2prpc-core';
+const locator = verifyPinnedSignedTicket(ticket, {
+  expectedPeerId: permanentPeerPin,
+  expectedProtocol: applicationProtocol,
+  now: Date.now(),
+  maximumBytes: 16_384,
+});
+```
