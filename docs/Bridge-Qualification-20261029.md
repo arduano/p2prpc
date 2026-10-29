@@ -24,7 +24,7 @@ Maintainer environment: Node24.19.0, npm11.17.0, Linux/NixOS, Chromium152.
 | Actual tarball content/license/mode/export/dependency policy | PASS:27 allowlisted files, no install scripts |
 | Strict publint and Are the Types Wrong (ESM/bundler) on actual tarball | PASS for all5 exports |
 | `npm audit --omit=dev --audit-level=low` | PASS:0 runtime vulnerabilities |
-| Full `npm audit --audit-level=low` | FAIL:10 existing development-tool dependency findings; see limits |
+| Full `npm audit --audit-level=low` | PASS:0 vulnerabilities after compatible development-tool updates |
 | `npm run test:minimum-runtime` on local Node24.19.0 | PASS; does not qualify Node20.3 |
 
 The actual browser imports `@arduano/p2prpc-core/browser` through its built
@@ -103,15 +103,16 @@ For an existing Chromium, set `P2PRPC_CHROMIUM_EXECUTABLE` when running
 `npm run test:browser`. Browser qualification is an explicit command; ordinary
 native/unit runs do not launch Chromium. CI includes the dedicated browser step.
 
-- Full dependency audit is not green. A baseline lockfile-only audit reports11
-  findings; this change fixes the existing Zod edge when promoting it to runtime,
-  and uses fixed ws8.22.0 for the new test server. The remaining10 findings are in
-  existing development/documentation tooling (including Vitest and VitePress).
-  Runtime-only audit is clean. The full audit gate remains enabled.
-- `prepare-reviewed-consumer.mjs` intentionally pins the published renewal.1
-  artifact SHA256. This candidate has different bytes, so that release/installed
-  consumer path requires a separately reviewed release transition. Its fence is
-  unchanged; no publication or updated source/native approval is implied.
+- The baseline had11 dependency findings. Compatible development-tool updates,
+  including Vitest4.1.12, remove the remaining findings; the full audit reports0.
+  The426 unit cases still pass. The full audit gate remains enabled.
+- `prepare-reviewed-consumer.ts` intentionally pins the published renewal.1
+  artifact SHA256. CI prepares source candidates through the separate
+  `prepare-candidate-consumer.ts` command, binding their bytes to the producer
+  `pack.json` and `SHA256SUMS` while retaining the same Iroh fork checks. A
+  candidate receipt cannot satisfy the published-release receipt contract.
+  Publication still requires a separately reviewed release transition; merging
+  source does not update the published package or its immutable approval.
 - Local attempts to launch an unmodified generic Linux Node20.3.1 binary were
   blocked by NixOS's dynamic-loader environment. The local smoke ran Node24;
   minimum native Node20.3 and cross-platform CI evidence remain separate. New

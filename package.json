@@ -26,7 +26,7 @@
     "test:minimum-runtime": "node scripts/minimum-runtime-smoke.mjs",
     "test:packed": "node scripts/packed-install-smoke.mjs",
     "test:tree-shaken-native": "node scripts/tree-shaken-native-smoke.mjs",
-    "prepare:reviewed-consumer": "node scripts/prepare-reviewed-consumer.mjs",
+    "prepare:reviewed-consumer": "tsx scripts/prepare-reviewed-consumer.ts",
     "lint": "eslint .",
     "check:docs": "node scripts/check-docs.mjs",
     "check:package-content": "node scripts/check-package-content.mjs",
@@ -44,7 +44,9 @@
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "node scripts/require-release-workflow.mjs",
-    "test:browser": "npm run build && npm run test:browser -w @arduano/p2prpc-core"
+    "test:browser": "npm run build && npm run test:browser -w @arduano/p2prpc-core",
+    "prepare:candidate-consumer": "tsx scripts/prepare-candidate-consumer.ts",
+    "test:consumer-preparation": "tsx --test scripts/consumer-preparation.test.ts"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
@@ -52,6 +54,7 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.0.0",
     "@types/ws": "8.18.1",
+    "cmd-ts": "0.15.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.8.1",
     "playwright-core": "1.56.1",
@@ -60,7 +63,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.67.0",
     "vitepress": "^1.6.4",
-    "vitest": "^4.1.11",
+    "vitest": "4.1.12",
     "ws": "8.22.0"
   },
   "overrides": {
