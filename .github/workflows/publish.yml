@@ -109,21 +109,27 @@ jobs:
           npm run check:package-content -- "$artifact" release-artifact/pack.json
           npm run check:package-publint -- "$artifact"
           npm run check:package-types -- "$artifact"
-          npm run prepare:reviewed-consumer -- "$artifact" "$RUNNER_TEMP/reviewed-consumer"
-          npm run test:packed -- "$RUNNER_TEMP/reviewed-consumer"
-          npm run test:tree-shaken-native -- "$RUNNER_TEMP/reviewed-consumer"
-          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-receipt.json" release-artifact/
-          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-sbom.cdx.json" release-artifact/
-          cp "$RUNNER_TEMP/reviewed-consumer/reviewed-consumer-registry-signatures.json" release-artifact/
-          npm run generate:release-sbom -- \
-            "$artifact" \
-            release-artifact/sbom.cdx.json \
-            release-artifact/registry-signatures.json
+          npm run prepare:candidate-consumer -- release-artifact "$RUNNER_TEMP/candidate-consumer"
+          npm run test:packed -- "$RUNNER_TEMP/candidate-consumer"
+          npm run test:tree-shaken-native -- "$RUNNER_TEMP/candidate-consumer"
+          cp release-artifact/SHA256SUMS release-artifact/package-SHA256SUMS
+          cp "$RUNNER_TEMP/candidate-consumer/candidate-consumer-receipt.json" release-artifact/reviewed-consumer-receipt.json
+          cp "$RUNNER_TEMP/candidate-consumer/candidate-consumer-sbom.cdx.json" release-artifact/reviewed-consumer-sbom.cdx.json
+          cp "$RUNNER_TEMP/candidate-consumer/candidate-consumer-registry-signatures.json" release-artifact/reviewed-consumer-registry-signatures.json
+          cp release-artifact/reviewed-consumer-sbom.cdx.json release-artifact/sbom.cdx.json
+          cp release-artifact/reviewed-consumer-registry-signatures.json release-artifact/registry-signatures.json
           integrity="$(jq -er '.[0].integrity' release-artifact/pack.json)"
           sha256="$(sha256sum "$artifact" | awk '{ print $1 }')"
           reviewed_sha256="$(sha256sum release-artifact/reviewed-consumer-receipt.json | awk '{ print $1 }')"
-          jq -e --arg sha256 "$sha256" '.mode == "published-url" and .package.sha256 == $sha256' \
-            release-artifact/reviewed-consumer-receipt.json >/dev/null
+          jq -e --arg version "$RELEASE_VERSION" --arg sha256 "$sha256" \
+            --arg metadataSha256 "$(sha256sum release-artifact/pack.json | awk '{ print $1 }')" \
+            --arg checksumsSha256 "$(sha256sum release-artifact/package-SHA256SUMS | awk '{ print $1 }')" '
+              .mode == "source-candidate" and
+              .package.name == "@arduano/p2prpc-core" and
+              .package.version == $version and .package.sha256 == $sha256 and
+              .candidate.metadataSha256 == $metadataSha256 and
+              .candidate.checksumsSha256 == $checksumsSha256
+            ' release-artifact/reviewed-consumer-receipt.json >/dev/null
           dist_tag=latest
           if [[ "$RELEASE_VERSION" == *-* ]]; then dist_tag=next; fi
           jq -n \
@@ -155,6 +161,7 @@ jobs:
               "$tarball" \
               manifest.json \
               pack.json \
+              package-SHA256SUMS \
               sbom.cdx.json \
               registry-signatures.json \
               reviewed-consumer-receipt.json \
@@ -219,9 +226,17 @@ jobs:
           ' release-artifact/manifest.json >/dev/null
           test "$(sha256sum release-artifact/reviewed-consumer-receipt.json | awk '{ print $1 }')" = \
             "$(jq -er '.reviewedConsumerSha256' release-artifact/manifest.json)"
-          jq -e --arg sha256 "$(jq -er '.sha256' release-artifact/manifest.json)" \
-            '.mode == "published-url" and .package.sha256 == $sha256' \
-            release-artifact/reviewed-consumer-receipt.json >/dev/null
+          jq -e --arg version "$(jq -er '.version' release-artifact/manifest.json)" \
+            --arg sha256 "$(jq -er '.sha256' release-artifact/manifest.json)" \
+            --arg metadataSha256 "$(sha256sum release-artifact/pack.json | awk '{ print $1 }')" \
+            --arg checksumsSha256 "$(sha256sum release-artifact/package-SHA256SUMS | awk '{ print $1 }')" '
+              .mode == "source-candidate" and
+              .package.name == "@arduano/p2prpc-core" and
+              .package.version == $version and .package.sha256 == $sha256 and
+              .candidate.metadataSha256 == $metadataSha256 and
+              .candidate.checksumsSha256 == $checksumsSha256
+            ' release-artifact/reviewed-consumer-receipt.json >/dev/null
+          (cd release-artifact && sha256sum --check package-SHA256SUMS)
           tarball="$(jq -er '.tarball' release-artifact/manifest.json)"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
       - name: Attest immutable package bytes
@@ -237,7 +252,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 90
-      - name: Attest reviewed consumer closure
+      - name: Attest verified native consumer closure
         id: closure-provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v4.2.2
         with:
@@ -539,6 +554,7 @@ jobs:
             release-artifact/SHA256SUMS
             release-artifact/manifest.json
             release-artifact/pack.json
+            release-artifact/package-SHA256SUMS
             "release-artifact/$tarball"
             release-artifact/sbom.cdx.json
             release-artifact/registry-signatures.json

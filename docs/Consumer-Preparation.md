@@ -47,13 +47,27 @@ npm run prepare:reviewed-consumer -- /path/to/reviewed-package.tgz /tmp/new-loca
 It still requires version `0.3.0-renewal.1` and SHA-256
 `26867bf16d55c3a7e1a51c72f3c36f40662cefa6a38f0689f6187b955bfa0b10`.
 A changed source candidate is refused. Published URL receipts retain mode
-`published-url`; local archive proofs retain mode `local-proof`. The publication
-workflow accepts only the former. There is no environment switch or argument
-which relaxes the published core hash, and no candidate receipt is publication
-approval.
+`published-url`; local archive proofs retain mode `local-proof`. There is no
+environment switch or argument which relaxes the published core hash. This
+historical CLI is not the admission policy for new releases.
 
 CI quality, native and minimum-runtime jobs prepare the same source-candidate
 artifact. Their artifact includes the actual overridden closure's SBOM and
-signature evidence. The immutable published workflow and its separately reviewed
-release transition remain unchanged. Source-candidate qualification does not
-update an installed application or a published registry version.
+signature evidence. New releases use the same candidate verifier for their new,
+unused version. The tag workflow requires successful main-branch CI for the exact
+commit and an exact tag/package-version match before preparing the release. The
+publish job retains its `github-packages` environment, immutable artifact checks,
+package and closure attestations, registry-byte verification, and downstream
+installation with the fixed Iroh overrides. Candidate qualification alone does
+not authorize publication or update an installed application.
+
+Release artifacts retain the original producer checksum as `package-SHA256SUMS`
+and hash it in the final multiasset `SHA256SUMS`. The candidate receipt binds that
+original checksum, `pack.json`, the package bytes and the prepared native closure.
+The existing `reviewed-consumer-*` asset names carry this new version's
+`source-candidate` receipt and actual closure evidence. `sbom.cdx.json` and
+`registry-signatures.json` are byte-identical compatibility aliases of that
+closure evidence; the workflow does not install a second, unoverridden graph.
+Publication verifies the receipt's exact version, core hash and producer hashes,
+then publishes only the unchanged candidate tarball. Historical renewal.1 bytes
+and the historical verifier remain unchanged.

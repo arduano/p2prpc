@@ -44,7 +44,8 @@ jobs:
           npm run check:package-content -- "$artifact" "$RUNNER_TEMP/package-artifact/pack.json"
           npm run check:package-publint -- "$artifact"
           npm run check:package-types -- "$artifact"
-          npm run test:packed -- "$artifact"
+          npm run prepare:candidate-consumer -- "$RUNNER_TEMP/package-artifact" "$RUNNER_TEMP/candidate-consumer"
+          npm run test:packed -- "$RUNNER_TEMP/candidate-consumer"
       - name: Open or update Changesets release pull request
         uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
         env:
