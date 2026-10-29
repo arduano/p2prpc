@@ -1,5 +1,6 @@
+import { byteLength } from '../platform.js';
 import type { FileManifest } from '../files/types.js';
-import type { RpcHeaders } from '../rpc/headers.js';
+import type { RpcHeaders } from '../rpc/portable-headers.js';
 import { containsUnsafeDisplayCharacters } from '../text.js';
 
 export interface SessionCredential {
@@ -53,6 +54,7 @@ export type CredentialRequestContext = SessionCredentialContext;
 export type SessionAuthenticationContext = SessionCredentialContext;
 
 export type AuthorizationAction<TFileMetadata = unknown> =
+  | { readonly kind: 'bridge'; readonly headers: RpcHeaders }
   | {
       readonly kind: 'rpc';
       readonly path: string;
@@ -223,7 +225,7 @@ function snapshotScopes(value: unknown): readonly string[] {
 function validIdentityField(value: unknown, maximumBytes: number): value is string {
   return typeof value === 'string' &&
     value.length > 0 &&
-    Buffer.byteLength(value) <= maximumBytes &&
+    byteLength(value) <= maximumBytes &&
     !containsUnsafeDisplayCharacters(value);
 }
 
@@ -262,7 +264,7 @@ function snapshotClaimValue(value: unknown, depth: number, state: ClaimSnapshotS
 
   if (value === null || typeof value === 'boolean') return value;
   if (typeof value === 'string') {
-    consumeClaimBytes(state, Buffer.byteLength(value));
+    consumeClaimBytes(state, byteLength(value));
     return value;
   }
   if (typeof value === 'number') {
@@ -312,7 +314,7 @@ function snapshotClaimValue(value: unknown, depth: number, state: ClaimSnapshotS
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       throw new TypeError('Authenticated claims contain an unsafe key');
     }
-    consumeClaimBytes(state, Buffer.byteLength(key));
+    consumeClaimBytes(state, byteLength(key));
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
       throw new TypeError('Authenticated claims must not contain accessors');

@@ -16,10 +16,10 @@ const requiredFiles = ['LICENSE', 'README.md', 'SECURITY.md', 'THIRD_PARTY_NOTIC
 for (const required of requiredFiles) invariant(archive.files.has(required), `Package is missing ${required}`);
 for (const path of paths) {
   invariant(
-    requiredFiles.includes(path) || /^dist\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/u.test(path),
+    requiredFiles.includes(path) || /^dist(?:-browser)?\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/u.test(path),
     `Package contains a file outside the public artifact allowlist: ${path}`
   );
-  if (path.startsWith('dist/')) {
+  if (path.startsWith('dist/') || path.startsWith('dist-browser/')) {
     invariant(
       /\.(?:js|mjs|d\.ts|d\.mts|js\.map|mjs\.map|d\.ts\.map|d\.mts\.map)$/u.test(path),
       `Package contains an unexpected dist file type: ${path}`
@@ -27,9 +27,9 @@ for (const path of paths) {
   }
   invariant(archive.files.get(path).mode === 0o644, `Package file must not be executable: ${path}`);
 }
-invariant(paths.some((path) => /^dist\/.+\.(?:js|mjs)$/u.test(path)), 'Package has no ESM runtime entry');
-invariant(paths.some((path) => /^dist\/.+\.d\.(?:ts|mts)$/u.test(path)), 'Package has no TypeScript declarations');
-invariant(paths.some((path) => /^dist\/.+\.(?:js|mjs)\.map$/u.test(path)), 'Package has no JavaScript source map');
+invariant(paths.some((path) => /^dist(?:-browser)?\/.+\.(?:js|mjs)$/u.test(path)), 'Package has no ESM runtime entry');
+invariant(paths.some((path) => /^dist(?:-browser)?\/.+\.d\.(?:ts|mts)$/u.test(path)), 'Package has no TypeScript declarations');
+invariant(paths.some((path) => /^dist(?:-browser)?\/.+\.(?:js|mjs)\.map$/u.test(path)), 'Package has no JavaScript source map');
 
 let manifest;
 try {
@@ -61,7 +61,8 @@ invariant(
     'README.md',
     'SECURITY.md',
     'THIRD_PARTY_NOTICES.md',
-    'dist'
+    'dist',
+    'dist-browser'
   ]),
   'Packed package files allowlist is broader than the audited public artifact'
 );
@@ -75,11 +76,13 @@ invariant(manifest.exports && typeof manifest.exports === 'object', 'Packed pack
 const expectedExports = Object.freeze({
   '.': Object.freeze({ types: './dist/index.d.ts', runtime: './dist/index.js' }),
   './advanced': Object.freeze({ types: './dist/advanced.d.ts', runtime: './dist/advanced.js' }),
-  './testing': Object.freeze({ types: './dist/testing.d.ts', runtime: './dist/testing.js' })
+  './testing': Object.freeze({ types: './dist/testing.d.ts', runtime: './dist/testing.js' }),
+  './bridge': Object.freeze({ types: './dist/bridge.d.ts', runtime: './dist/bridge.js' }),
+  './browser': Object.freeze({ types: './dist-browser/browser.d.ts', runtime: './dist-browser/browser.js' })
 });
 invariant(
   sameStrings(Object.keys(manifest.exports), Object.keys(expectedExports)),
-  'Packed package exports differ from the three reviewed public entry points'
+  'Packed package exports differ from the reviewed public entry points'
 );
 for (const [name, expected] of Object.entries(expectedExports)) {
   const entry = manifest.exports[name];
@@ -116,7 +119,7 @@ function collectExportTargets(value) {
 }
 collectExportTargets(manifest.exports);
 for (const target of exportedTargets) {
-  invariant(target.startsWith('./dist/'), `Export target must stay inside dist: ${target}`);
+  invariant((target.startsWith('./dist/') || target.startsWith('./dist-browser/')), `Export target must stay inside dist: ${target}`);
   invariant(archive.files.has(target.slice(2)), `Export target does not exist: ${target}`);
 }
 
@@ -132,6 +135,11 @@ for (const dependencies of dependencyGroups) {
   }
 }
 const reviewedRuntimeDependencies = [
+  '@chainsafe/libp2p-yamux',
+  '@libp2p/logger',
+  '@libp2p/utils',
+  '@noble/hashes',
+  'zod',
   '@momics/iroh-http-node',
   '@momics/iroh-http-shared',
   '@napi-rs/blake-hash',
@@ -153,16 +161,7 @@ invariant(
   manifest.optionalDependencies === undefined,
   'Packed package must not add unaudited direct optional dependencies'
 );
-for (const name of [
-  '@momics/iroh-http-node',
-  '@momics/iroh-http-shared',
-  '@napi-rs/blake-hash',
-  '@trpc/client',
-  '@trpc/server',
-  'jose',
-  'msgpackr',
-  'superjson'
-]) {
+for (const name of reviewedRuntimeDependencies) {
   invariant(
     /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(manifest.dependencies?.[name] ?? ''),
     `Audited runtime boundary dependency must be exact-pinned: ${name}`

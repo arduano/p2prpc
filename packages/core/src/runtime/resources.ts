@@ -1,3 +1,4 @@
+import { byteLength } from '../platform.js';
 import { P2PError } from '../errors.js';
 
 export interface ResourceRequest {
@@ -549,7 +550,7 @@ function normalizeOwner(value: string | ResourceOwner): Readonly<ResourceOwner> 
 }
 
 function validOwnerId(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 2048;
+  return typeof value === 'string' && value.length > 0 && byteLength(value) <= 2048;
 }
 
 function normalizeRequest(input: ResourceRequest): ResourceCounter {

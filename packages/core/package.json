@@ -41,10 +41,25 @@
         "default": "./dist/testing.js"
       },
       "require": null
+    },
+    "./browser": {
+      "import": {
+        "types": "./dist-browser/browser.d.ts",
+        "default": "./dist-browser/browser.js"
+      },
+      "require": null
+    },
+    "./bridge": {
+      "import": {
+        "types": "./dist/bridge.d.ts",
+        "default": "./dist/bridge.js"
+      },
+      "require": null
     }
   },
   "files": [
     "dist",
+    "dist-browser",
     "LICENSE",
     "README.md",
     "SECURITY.md",
@@ -53,28 +68,33 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test": "vitest run --exclude '**/*.integration.test.ts' --exclude '**/*.browser.test.ts'",
     "test:integration": "vitest run integration.test.ts",
     "test:watch": "vitest",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:browser": "vitest run bridge.browser.test.ts"
   },
   "dependencies": {
+    "@chainsafe/libp2p-yamux": "8.0.1",
+    "@libp2p/logger": "6.2.16",
+    "@libp2p/utils": "7.4.5",
     "@momics/iroh-http-node": "0.6.2",
     "@momics/iroh-http-shared": "0.6.2",
     "@napi-rs/blake-hash": "1.3.6",
+    "@noble/hashes": "1.8.0",
     "@trpc/client": "11.18.0",
     "@trpc/server": "11.18.0",
     "jose": "6.2.10",
     "msgpackr": "2.0.5",
-    "superjson": "2.2.6"
+    "superjson": "2.2.6",
+    "zod": "4.6.6"
   },
   "peerDependencies": {
     "@trpc/client": "11.18.0",
     "@trpc/server": "11.18.0"
   },
   "devDependencies": {
-    "tsup": "^8.5.1",
-    "zod": "^4.4.3"
+    "tsup": "^8.5.1"
   },
   "engines": {
     "node": ">=20.3.0"

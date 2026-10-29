@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { byteLength, createSha256, randomToken } from '../platform.js';
 import { P2PError } from '../errors.js';
 import type {
   FilePrincipalIdentity,
@@ -177,7 +177,7 @@ export class ShareRegistry<TMetadata = unknown> {
     let token: string;
     let key: string;
     do {
-      token = randomBytes(32).toString('base64url');
+      token = randomToken();
       key = capabilityId(token);
     } while (this.entries.has(key));
     const entry: ShareEntry<TMetadata> = {
@@ -559,7 +559,7 @@ function assertOnlyKeys(value: object, allowed: readonly string[], label: string
 function validPrincipalField(value: unknown, maximumBytes: number): value is string {
   return typeof value === 'string' &&
     value.length > 0 &&
-    Buffer.byteLength(value) <= maximumBytes &&
+    byteLength(value) <= maximumBytes &&
     !hasControlCharacters(value);
 }
 
@@ -570,7 +570,7 @@ function principalBinding(value: {
   readonly clientId: string | undefined;
   readonly tenantId: string | undefined;
 }): string {
-  return createHash('sha256')
+  return createSha256()
     .update('p2prpc-file-principal-v3\n')
     .update(JSON.stringify([
       value.principalId,
@@ -588,16 +588,16 @@ function validFingerprint(value: string): boolean {
 
 /** A non-secret stable identifier suitable for authorization and audit records. */
 export function capabilityId(token: string): string {
-  return createHash('sha256')
+  return createSha256()
     .update('p2prpc-file-capability-v3\n')
-    .update(token, 'utf8')
+    .update(token)
     .digest('base64url');
 }
 
 function operationIdHash(operationId: string): string {
-  return createHash('sha256')
+  return createSha256()
     .update('p2prpc-file-operation-v3\n')
-    .update(operationId, 'utf8')
+    .update(operationId)
     .digest('base64url');
 }
 

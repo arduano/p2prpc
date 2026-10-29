@@ -340,6 +340,8 @@ export function createOidcSessionSecurity<TFileMetadata = unknown>(
       let scopeAllowed: boolean;
       if (context.action.kind === 'rpc') {
         scopeAllowed = hasScope(scopes, 'p2prpc:rpc') || hasScope(scopes, `p2prpc:rpc:${context.action.path}`);
+      } else if (context.action.kind === 'bridge') {
+        scopeAllowed = hasScope(scopes, 'p2prpc:bridge');
       } else if (context.action.kind === 'file.push') {
         scopeAllowed = hasScope(scopes, 'p2prpc:file:push');
       } else {

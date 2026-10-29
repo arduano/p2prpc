@@ -1,3 +1,4 @@
+import { byteLength } from '../platform.js';
 import { P2PError } from '../errors.js';
 
 interface Bucket { tokens: number; updatedAt: number; }
@@ -24,7 +25,7 @@ export class HandshakeRateLimiter {
   }
 
   admit(peerId: string): void {
-    if (typeof peerId !== 'string' || peerId.length === 0 || Buffer.byteLength(peerId) > 2_048) {
+    if (typeof peerId !== 'string' || peerId.length === 0 || byteLength(peerId) > 2_048) {
       throw new P2PError('INVALID_FRAME', 'Invalid handshake peer ID');
     }
     const now = this.now();

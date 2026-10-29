@@ -1,3 +1,5 @@
+export type { PeerFiles, PeerFileShareOptions } from './files/types.js';
+import { openNativeBridge, readBridgeRequest, acceptNativeBridge, type OpenBridgeOptions, type NativeBridgeOffer } from './bridge/native.js';
 import { isDeepStrictEqual } from 'node:util';
 import { createTRPCProxyClient, type CreateTRPCClient } from '@trpc/client';
 import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
@@ -11,16 +13,13 @@ import {
 } from './files/manager.js';
 import { ShareRegistry, type ShareRegistryDiagnostics } from './files/share.js';
 import type {
-  DownloadFileOptions,
-  FileDestination,
   FileMetadataSchema,
   FileSource,
-  FileTransfer,
   IncomingFileHandler,
-  SendFileOptions,
-  PeerSharePolicy,
   SharedFileHandle,
-  TransferProgress
+  TransferProgress,
+  PeerFiles,
+  PeerFileShareOptions
 } from './files/types.js';
 import { PROTOCOL_VERSION, StreamKind, readStreamKind, type FrameLimits } from './protocol.js';
 import { irohLink } from './rpc/link.js';
@@ -270,6 +269,8 @@ export interface AdvancedP2PNodeOptions<TRouter extends AnyTRPCRouter, TFileMeta
     readonly signal: AbortSignal;
   }) => Promise<RpcHeaderInput | undefined> | RpcHeaderInput | undefined;
   readonly onIncomingFile?: IncomingFileHandler<TFileMetadata>;
+  /** Opt-in delegated stream service; callback owns the channel until settlement. */
+  readonly onBridge?: (offer: NativeBridgeOffer) => Promise<void>;
   /** Runtime schema required whenever a file manifest contains metadata. */
   readonly fileMetadataSchema?: FileMetadataSchema<TFileMetadata>;
   /** Best-effort notification. Use getPeer()/peersSnapshot() for reliable state lookup. */
@@ -300,22 +301,6 @@ export type TestingP2PNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata =
 > & {
   readonly security?: SessionSecurity<TFileMetadata>;
 };
-
-export interface PeerFiles<TFileMetadata = unknown> {
-  sendFile(source: FileSource<TFileMetadata>, options?: SendFileOptions): Promise<FileTransfer<TFileMetadata>>;
-  download(
-    handle: SharedFileHandle,
-    destination: FileDestination<TFileMetadata>,
-    options?: DownloadFileOptions
-  ): Promise<FileTransfer<TFileMetadata>>;
-  /** Issue a short-lived capability bound to this endpoint and its authenticated principal. */
-  share(source: FileSource<TFileMetadata>, policy?: PeerFileShareOptions): SharedFileHandle;
-  /** Revoke a capability previously issued by this local node. */
-  revoke(handle: SharedFileHandle): boolean;
-}
-
-/** Safe capability controls; endpoint and principal binding are automatic. */
-export type PeerFileShareOptions = Omit<PeerSharePolicy, 'allowedPrincipals'>;
 
 export interface PeerDiagnostics {
   readonly sessionId: string;
@@ -362,6 +347,11 @@ export class Peer<TRemoteRouter extends AnyTRPCRouter, TFileMetadata = unknown> 
       share: (source, policy) => runtime.share(source, policy),
       revoke: (handle) => runtime.revoke(handle)
     };
+  }
+
+  /** Open one delegated carrier; releasing it cannot close the borrowed physical peer. */
+  openBridge(options?: OpenBridgeOptions) {
+    return openNativeBridge(() => this.runtime.connection(), options ?? {}, (work) => this.runtime.tasks.track(work));
   }
 
   /** Current authenticated connection identity, including its live direction. */
@@ -1642,11 +1632,11 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             void runtime.tasks.track(this.renewSession(runtime, epoch, renewalStream));
             continue;
           }
-          if (kind !== StreamKind.Rpc && kind !== StreamKind.TransferControl) {
+          if (kind !== StreamKind.Rpc && kind !== StreamKind.Bridge && kind !== StreamKind.TransferControl) {
             throw new P2PError('INVALID_FRAME', `Invalid bidirectional stream kind ${kind}`);
           }
           const owner = resourceOwner(runtime.identity.id, epoch.session.principal.id);
-          streamLease = kind === StreamKind.Rpc
+          streamLease = kind === StreamKind.Rpc || kind === StreamKind.Bridge
             ? this.resources.tryAcquire(owner, {
               streams: 1,
               bufferedBytes: this.limits.maxControlFrameBytes
@@ -1674,6 +1664,28 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
             const ownership = retainLeaseForWork(lease);
             try {
               this.assertCurrentSession(runtime, connection, epoch.session);
+              if (kind === StreamKind.Bridge) {
+                if (!this.options.onBridge) throw new P2PError('REJECTED', 'Bridge service is disabled');
+                const headers = await withDeadline(readBridgeRequest(accepted), this.limits.streamHeaderTimeoutMs, 'Bridge opening timed out');
+                const bridgeController = new AbortController();
+                const signal = AbortSignal.any([connectionController.signal, bridgeController.signal]);
+                try {
+                  await this.authorize(runtime, epoch.session, { kind: 'bridge', headers }, signal, signal);
+                  const channel = await acceptNativeBridge(accepted);
+                  const abort = () => { void Promise.resolve(channel.close(new P2PError('DISCONNECTED', 'Upstream bridge closed'))).catch(() => undefined); };
+                  signal.addEventListener('abort', abort, { once: true });
+                  try {
+                    signal.throwIfAborted();
+                    await this.options.onBridge(Object.freeze({ localPeerId: this.id, peer: runtime.identity, auth: epoch.session, headers, signal, channel }));
+                  } finally {
+                    signal.removeEventListener('abort', abort);
+                    await channel.close();
+                  }
+                } finally {
+                  bridgeController.abort();
+                }
+                return;
+              }
               if (kind === StreamKind.Rpc) {
                 return await rpc.handle(accepted, ownership.track);
               }
@@ -2326,6 +2338,7 @@ function releaseAfterWork(lease: ResourceLease, work: readonly Promise<unknown>[
 function summarizeSecurityAction<TFileMetadata>(
   action: AuthorizationAction<TFileMetadata>
 ): Readonly<Record<string, string | number>> {
+  if (action.kind === 'bridge') return Object.freeze({ kind: action.kind });
   if (action.kind === 'rpc') return Object.freeze({ kind: action.kind, path: action.path, procedureType: action.type });
   if (action.kind === 'file.push') {
     return Object.freeze({
@@ -2340,6 +2353,7 @@ function summarizeSecurityAction<TFileMetadata>(
 function freezeAuthorizationAction<TFileMetadata>(
   action: AuthorizationAction<TFileMetadata>
 ): AuthorizationAction<TFileMetadata> {
+  if (action.kind === 'bridge') return Object.freeze({ kind: action.kind, headers: action.headers });
   if (action.kind === 'rpc') {
     return Object.freeze({ kind: action.kind, path: action.path, type: action.type, headers: action.headers });
   }
@@ -2819,6 +2833,7 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
     'preAuthorizePeer',
     'getRequestHeaders',
     'onIncomingFile',
+    'onBridge',
     'fileMetadataSchema',
     'onPeer',
     'onError',
@@ -2836,6 +2851,7 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
     'preAuthorizePeer',
     'getRequestHeaders',
     'onIncomingFile',
+    'onBridge',
     'onPeer',
     'onError',
     'onTransferProgress',

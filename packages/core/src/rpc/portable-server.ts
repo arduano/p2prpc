@@ -1,0 +1,436 @@
+import { byteLength, unrefTimer } from '../platform.js';
+import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
+import { TRPCError, callTRPCProcedure, getTRPCErrorFromUnknown } from '@trpc/server';
+import { getHTTPStatusCodeFromError } from '@trpc/server/http';
+import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
+import { P2PError, asP2PError } from '../errors.js';
+import { containsUnsafeDisplayCharacters, sanitizeBoundedDisplayText } from '../text.js';
+import {
+  DEFAULT_FRAME_LIMITS,
+  RpcFrameKind,
+  readFrame,
+  writeFrame,
+  type FrameLimits
+} from '../protocol.js';
+import type { QuicBiStream } from '../transport/types.js';
+import { exactRecord } from '../wire-schema.js';
+import { portableRpcHeaders, type RpcHeaderPolicy, type RpcHeaderLimits, type RpcHeaders } from './portable-headers.js';
+import {
+  deserializeValue,
+  isAsyncIterable,
+  serializeValue,
+  type RpcFailure,
+  type RpcRequest
+} from './wire.js';
+
+export interface RpcServerOptions<TRouter extends AnyTRPCRouter> {
+  readonly router: TRouter;
+  readonly createContext: (request: RpcServerRequest) => Promise<inferRouterContext<TRouter>> | inferRouterContext<TRouter>;
+  readonly authorize: (request: RpcRequest, signal: AbortSignal) => Promise<void> | void;
+  readonly frameLimits?: FrameLimits;
+  readonly headerLimits: RpcHeaderLimits;
+  readonly maxPathBytes: number;
+  readonly setupTimeoutMs: number;
+  /** Aborts every request on the authenticated physical session when it is replaced or closed. */
+  readonly sessionSignal?: AbortSignal;
+  /** Check the current authenticated generation before dispatch and delivery. */
+  readonly assertActive?: () => void;
+  /** Per QUIC read/write/finish deadline. Defaults to setupTimeoutMs. */
+  readonly ioTimeoutMs?: number;
+  readonly onError?: (error: Error, request?: RpcRequest) => void;
+}
+
+export interface RpcServerRequest {
+  readonly id: number;
+  readonly path: string;
+  readonly type: RpcRequest['type'];
+  readonly headers: RpcHeaders;
+  readonly signal: AbortSignal;
+}
+
+/**
+ * Registers application-owned work which may outlive wire cancellation.
+ * The caller must retain its admission lease until every registered promise
+ * actually settles; aborting a signal cannot terminate an arbitrary promise.
+ */
+export type RpcWorkTracker = (work: Promise<unknown>) => void;
+
+export class RpcServer<TRouter extends AnyTRPCRouter> {
+  private readonly ioTimeoutMs: number;
+
+  constructor(
+    private readonly options: RpcServerOptions<TRouter>,
+    private readonly headerPolicy: RpcHeaderPolicy = portableRpcHeaders
+  ) {
+    validateTimeout(options.setupTimeoutMs, 'RPC setup timeout');
+    this.ioTimeoutMs = options.ioTimeoutMs ?? options.setupTimeoutMs;
+    validateTimeout(this.ioTimeoutMs, 'RPC I/O timeout');
+  }
+
+  async handle(stream: QuicBiStream, trackWork: RpcWorkTracker = ignoreWork): Promise<void> {
+    let request: RpcRequest | undefined;
+    let context: inferRouterContext<TRouter> | undefined;
+    const controller = new AbortController();
+    let cancelTask: Promise<void> | undefined;
+    let terminal = false;
+    let sendFinished = false;
+    let operationFailed = false;
+    let operationFailure: unknown;
+    const requestSignal = this.options.sessionSignal
+      ? AbortSignal.any([controller.signal, this.options.sessionSignal])
+      : controller.signal;
+
+    try {
+      try {
+      requestSignal.throwIfAborted();
+      await this.ioOperation(
+        stream.send.setPriority(100),
+        'RPC stream priority timed out',
+        controller,
+        requestSignal,
+        this.ioTimeoutMs,
+        trackWork
+      );
+      const first = await this.ioOperation(
+        readFrame<RpcRequest>(stream.recv, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS),
+        'RPC request frame timed out',
+        controller,
+        requestSignal,
+        this.options.setupTimeoutMs,
+        trackWork
+      );
+      if (first.kind !== RpcFrameKind.Request) throw new Error('RPC stream must begin with a request frame');
+      request = validateRequest(first.value, this.options.headerLimits, this.options.maxPathBytes, this.headerPolicy);
+      const currentRequest = request;
+      cancelTask = (async () => {
+        try {
+          const frame = await readFrame(stream.recv, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS);
+          if (terminal) return;
+          if (frame.kind !== RpcFrameKind.Cancel || !hasRequestId(frame.value, currentRequest.id)) {
+            throw new P2PError('INVALID_FRAME', 'Invalid RPC cancellation frame');
+          }
+          controller.abort(new P2PError('CANCELLED', 'Remote cancelled RPC'));
+        } catch (cause) {
+          if (!terminal && !requestSignal.aborted) controller.abort(asP2PError(cause, 'DISCONNECTED'));
+        }
+      })();
+      trackWork(cancelTask);
+
+      const authorization = ownedWork(
+        () => this.options.authorize(currentRequest, requestSignal),
+        trackWork
+      );
+      await withDeadline(
+        authorization,
+        this.options.setupTimeoutMs,
+        'RPC authorization timed out',
+        controller,
+        requestSignal
+      );
+      const contextCreation = ownedWork(
+        () => this.options.createContext(Object.freeze({
+          id: currentRequest.id,
+          path: currentRequest.path,
+          type: currentRequest.type,
+          headers: currentRequest.headers,
+          signal: requestSignal
+        })),
+        trackWork
+      );
+      context = await withDeadline(
+        contextCreation,
+        this.options.setupTimeoutMs,
+        'RPC context creation timed out',
+        controller,
+        requestSignal
+      );
+
+      this.options.assertActive?.();
+      const procedure = ownedWork(() => callTRPCProcedure({
+          router: this.options.router,
+          path: currentRequest.path,
+          type: currentRequest.type,
+          ctx: context!,
+          batchIndex: 0,
+          signal: requestSignal,
+          getRawInput: async () => deserializeValue(
+            currentRequest.input,
+            this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
+          )
+        }), trackWork);
+      const result = await withAbort(procedure, requestSignal);
+
+      if (isAsyncIterable(result)) {
+        const iterator = result[Symbol.asyncIterator]();
+        let iteratorCompleted = false;
+        try {
+          while (true) {
+            const next = ownedWork(() => iterator.next(), trackWork);
+            const item = await withAbort(next, requestSignal);
+            if (item.done) {
+              iteratorCompleted = true;
+              break;
+            }
+            this.options.assertActive?.();
+            await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
+              id: currentRequest.id,
+              data: serializeValue(item.value, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
+            }, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+          }
+        } finally {
+          // Serialization, transport writes, and local teardown can all end a
+          // subscription without first aborting its request signal. Always
+          // close an iterator which did not naturally report completion.
+          if (!iteratorCompleted && iterator.return) {
+            const returned = ownedWork(() => iterator.return!(), trackWork);
+            void settleWithin(returned, cleanupTimeout(this.ioTimeoutMs));
+          }
+        }
+      } else {
+        requestSignal.throwIfAborted();
+        this.options.assertActive?.();
+        await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
+          id: currentRequest.id,
+          data: serializeValue(result, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
+        }, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+      }
+
+      requestSignal.throwIfAborted();
+      this.options.assertActive?.();
+      terminal = true;
+      await this.ioOperation(writeFrame(
+        stream.send,
+        RpcFrameKind.Complete,
+        { id: currentRequest.id },
+        this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
+      ), 'RPC completion write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+      await this.ioOperation(stream.send.finish(), 'RPC response finish timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+      sendFinished = true;
+      } catch (cause) {
+        terminal = true;
+        const error = cause instanceof P2PError && cause.code === 'UNAUTHORIZED'
+          ? new TRPCError({ code: 'FORBIDDEN', message: 'Operation is not authorized' })
+          : getTRPCErrorFromUnknown(cause);
+        // Derive the wire response before notifying diagnostics. Observability
+        // callbacks must not be able to mutate an error or request into a leak.
+        const shape = request ? safeErrorShape(error, request.path) : undefined;
+        try {
+          const delivered = this.options.onError?.(error, request);
+          void Promise.resolve(delivered).catch(() => undefined);
+        } catch {
+          // Observability failures cannot affect protocol state.
+        }
+        if (request && !requestSignal.aborted) {
+          const failure: RpcFailure = { id: request.id, shape };
+          try {
+            await this.ioOperation(writeFrame(
+              stream.send,
+              RpcFrameKind.Error,
+              failure,
+              this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
+            ), 'RPC error write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+            await this.ioOperation(stream.send.finish(), 'RPC error finish timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+            sendFinished = true;
+          } catch (writeCause) {
+            throw asP2PError(writeCause, 'DISCONNECTED');
+          }
+        }
+      }
+    } catch (cause) {
+      operationFailed = true;
+      operationFailure = cause;
+    }
+
+    terminal = true;
+    if (!controller.signal.aborted) controller.abort(new P2PError('CANCELLED', 'RPC stream completed'));
+    const timeoutMs = cleanupTimeout(this.ioTimeoutMs);
+    const stop = ownedWork(() => stream.recv.stop(sendFinished ? 0n : 1n), trackWork);
+    const cleanup: Array<Promise<boolean>> = [settleWithin(stop, timeoutMs)];
+    if (!sendFinished) {
+      const reset = ownedWork(() => stream.send.reset(1n), trackWork);
+      cleanup.push(settleWithin(reset, timeoutMs));
+    }
+    // stop() owns cancellation of the pending read. The watcher already has
+    // a terminal catch path, so it cannot surface an unhandled rejection.
+    void cancelTask;
+    const cleaned = await Promise.all(cleanup);
+    if (!cleaned.every(Boolean)) {
+      throw new P2PError('INTERNAL', 'RPC stream cleanup could not be confirmed', {
+        ...(operationFailed ? { cause: operationFailure } : {})
+      });
+    }
+    if (operationFailed) throw operationFailure;
+  }
+
+  private async ioOperation<T>(
+    promise: Promise<T>,
+    message: string,
+    controller: AbortController,
+    signal: AbortSignal = controller.signal,
+    timeoutMs = this.ioTimeoutMs,
+    trackWork: RpcWorkTracker = ignoreWork
+  ): Promise<T> {
+    trackWork(promise);
+    return withDeadline(promise, timeoutMs, message, controller, signal);
+  }
+}
+
+function ownedWork<T>(operation: () => Promise<T> | T, track: RpcWorkTracker): Promise<T> {
+  const work = Promise.resolve().then(operation);
+  track(work);
+  return work;
+}
+
+function ignoreWork(work: Promise<unknown>): void {
+  // Promise.race/await paths attach rejection handlers. Callers which need
+  // admission accounting supply a tracker; standalone use retains old shape.
+  void work;
+}
+
+function validateRequest(
+  value: RpcRequest,
+  headerLimits: RpcHeaderLimits,
+  maxPathBytes: number,
+  policy: RpcHeaderPolicy
+): RpcRequest {
+  exactRecord(value, ['id', 'path', 'type', 'headers', 'input'], 'RPC request');
+  if (
+    !Number.isSafeInteger(value.id) ||
+    value.id < 0 ||
+    typeof value.path !== 'string' ||
+    value.path.length < 1 ||
+    byteLength(value.path) > maxPathBytes ||
+    hasPathControlOrSpace(value.path) ||
+    !['query', 'mutation', 'subscription'].includes(value.type) ||
+    !Object.hasOwn(value, 'headers')
+  ) {
+    throw new Error('Invalid RPC request');
+  }
+  return Object.freeze({
+    id: value.id,
+    path: value.path,
+    type: value.type,
+    headers: policy.normalizeRpcHeaders(value.headers, headerLimits),
+    input: value.input
+  });
+}
+
+function hasPathControlOrSpace(value: string): boolean {
+  return containsUnsafeDisplayCharacters(value) || value.includes(' ');
+}
+
+function hasRequestId(value: unknown, expected: number): boolean {
+  try {
+    exactRecord(value, ['id'], 'RPC cancellation');
+    return value.id === expected;
+  } catch {
+    return false;
+  }
+}
+
+async function withDeadline<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+  controller?: AbortController,
+  signal: AbortSignal | undefined = controller?.signal
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbortListener: (() => void) | undefined;
+  try {
+    const tasks: Array<Promise<T>> = [
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new P2PError('TIMEOUT', message);
+          controller?.abort(error);
+          reject(error);
+        }, timeoutMs);
+        unrefTimer(timer);
+      })
+    ];
+    if (signal) {
+      tasks.push(new Promise<never>((_, reject) => {
+        const onAbort = (): void => reject(signal.reason ?? new P2PError('CANCELLED', 'RPC setup cancelled'));
+        if (signal.aborted) onAbort();
+        else {
+          signal.addEventListener('abort', onAbort, { once: true });
+          removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+        }
+      }));
+    }
+    return await Promise.race(tasks);
+  } finally {
+    if (timer) clearTimeout(timer);
+    removeAbortListener?.();
+  }
+}
+
+async function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  let removeAbortListener: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        const onAbort = (): void => reject(signal.reason ?? new P2PError('CANCELLED', 'RPC cancelled'));
+        if (signal.aborted) onAbort();
+        else {
+          signal.addEventListener('abort', onAbort, { once: true });
+          removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+        }
+      })
+    ]);
+  } finally {
+    removeAbortListener?.();
+  }
+}
+
+async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => false),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        unrefTimer(timer);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function cleanupTimeout(ioTimeoutMs: number): number {
+  return Math.min(ioTimeoutMs, 1_000);
+}
+
+function validateTimeout(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 10 * 60_000) {
+    throw new P2PError('RESOURCE_LIMIT', `${label} must be between 1 ms and 10 minutes`);
+  }
+}
+
+export function safeErrorShape(error: TRPCError, path: string): unknown {
+  const code = trustedErrorCode(error.code);
+  return {
+    code: TRPC_ERROR_CODES_BY_KEY[code],
+    message: code === 'INTERNAL_SERVER_ERROR'
+      ? 'Internal server error'
+      : sanitizePublicErrorMessage(error.message),
+    data: {
+      code,
+      httpStatus: getHTTPStatusCodeFromError(new TRPCError({ code })),
+      path
+    }
+  };
+}
+
+function trustedErrorCode(value: unknown): keyof typeof TRPC_ERROR_CODES_BY_KEY {
+  return typeof value === 'string' && Object.hasOwn(TRPC_ERROR_CODES_BY_KEY, value)
+    ? value as keyof typeof TRPC_ERROR_CODES_BY_KEY
+    : 'INTERNAL_SERVER_ERROR';
+}
+
+function sanitizePublicErrorMessage(value: string): string {
+  return sanitizeBoundedDisplayText(value, 8 * 1024, 'Remote procedure failed');
+}

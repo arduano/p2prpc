@@ -10,7 +10,7 @@ Before the first registry release, only `main` is supported. After releases begi
 
 p2prpc treats the network, locators, DNS/PKARR and mDNS results, remote endpoint, request metadata/input, file manifest/metadata/content, and capability presenter as hostile.
 
-An Iroh endpoint ID proves possession of a transport key. A signed ticket proves which endpoint signed route hints. Neither authorizes application work. The current QUIC application protocol/ALPN is v4; the credential-handshake format remains v3. p2prpc dispatches RPC or file streams only after:
+An Iroh endpoint ID proves possession of a transport key. A signed ticket proves which endpoint signed route hints. Neither authorizes application work. The current QUIC application protocol/ALPN is v5; the credential-handshake format is v4. p2prpc dispatches RPC or file streams only after:
 
 1. the connected endpoint matches an independently trusted expectation for outbound calls;
 2. optional endpoint-key admission succeeds;
@@ -79,6 +79,32 @@ p2prpc is a resource server, not an authorization server: applications own brows
 - Failed native stream cleanup quarantines/closes the physical connection.
 - Initial install, replacement, duplicate arbitration, runtime revival, and reconnect share one final admission-success gate after synchronous callbacks. Public promise continuations recheck it after their last `await`, and queued `onPeer` delivery is conditional on the exact selection remaining current. A peer is returned only while its node, registry slot, live-map entry, epoch, and session remain current; callback-triggered closure rejects acquisition instead of returning a stale handle.
 - Receiver reconciliation expiry uses a deadline index and removes only due records, rather than scanning all retained peer/principal state on each operation. Node close first rejects new ledger admission; it clears retained state only after all ledger-owning work settles, even when the public close deadline expires first.
+
+## Optional trusted browser bridge
+
+Bridge stream service admission requires current native `bridge` authorization
+(OIDC `p2prpc:bridge` or `p2prpc:*`) and an explicit `onBridge` callback.
+`createBridgeHost` requires a delegation policy that verifies the actual Gateway
+endpoint/principal before resolving the browser user. Browser-controlled IDs or
+headers never constitute identity proof. RPC and files share that same verified
+user and Gateway provenance. Grant expiry is bounded by both principals.
+
+The Gateway owns login, upgrade origin/CSRF checks, and allowed Host selection.
+It is trusted to assert users and can inspect/change bytes; TLS and Iroh protect
+individual hops, not browser-to-Host cryptographic E2E confidentiality/identity.
+Resume secrets are random server-issued capabilities, stored hashed by the Host,
+held privately by the browser owner, and tied to complete stable user identity.
+Log neither secrets nor delegated credential assertions. Positive prior-carrier
+closure is required before replacement. Revocation/expiry close only the logical
+Peer. Failed cleanup or noncooperative callbacks retain accounting rather than
+producing false quiescence; RPCs are never replayed on reconnect.
+
+The browser entry has no native/Node filesystem runtime dependency. Its Blob
+source uses the existing verified file protocol; its memory destination requires
+an explicit limit of at most 64 MiB and verifies whole-file BLAKE3 before in-memory
+publication. Browser crash persistence, OPFS, unbounded cache and durable disk
+commit are not promised. See [Browser bridge](./docs/wiki/Browser-Bridge.md) for
+module contracts, lifecycle ownership and compatibility limits.
 
 ## Deployment requirements
 

@@ -4,6 +4,7 @@
 - [Lifecycles](Lifecycles.md)
 - [Security model](Security-Model.md)
 - [File transfers](File-Transfers.md)
+- [Browser bridge](Browser-Bridge.md)
 - [Audit guide](Audit-Guide.md)
 - [Production validation](Production-Validation.md)
 - [Full security policy](../../SECURITY.md)

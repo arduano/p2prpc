@@ -32,7 +32,10 @@ The [architecture and security wiki](https://arduano.github.io/p2prpc/) is the c
 - matching application ID and contract version on both peers
 - peer-bound shared-secret or OIDC security on every production node
 
-CommonJS, browsers, and React Native are outside this release.
+CommonJS and React Native are outside this release. Browser clients use the
+opt-in [trusted Gateway bridge](./docs/wiki/Browser-Bridge.md) through the explicit
+`@arduano/p2prpc-core/browser` entry; Hosts/Gateways use `/bridge`. The browser
+retains the actual Host router type and the existing binary file protocol.
 
 ## Install from GitHub Packages
 

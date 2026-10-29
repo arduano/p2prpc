@@ -33,7 +33,7 @@ export function packageInstallSourceArgument(position = 2) {
     return candidate;
   }
   const manifest = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8'));
-  invariant(manifest.name === 'p2prpc-renewal-1-portable-closure', `Portable closure identity differs: ${candidate}`);
+  invariant(['p2prpc-renewal-1-portable-closure', 'p2prpc-source-candidate-portable-closure'].includes(manifest.name), `Portable closure identity differs: ${candidate}`);
   invariant(statSync(join(candidate, 'package-lock.json')).isFile(), `Portable closure lock is missing: ${candidate}`);
   return candidate;
 }

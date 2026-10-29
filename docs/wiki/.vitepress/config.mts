@@ -81,6 +81,7 @@ export default defineConfig({
         items: [
           { text: 'Security model', link: '/Security-Model' },
           { text: 'File transfers', link: '/File-Transfers' },
+          { text: 'Browser bridge', link: '/Browser-Bridge' },
           { text: 'Audit guide', link: '/Audit-Guide' },
           { text: 'Production validation', link: '/Production-Validation' }
         ]

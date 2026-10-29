@@ -1,3 +1,4 @@
+import { byteLength } from './platform.js';
 /** Unicode controls which can reorder, hide, or forge security-relevant display text. */
 export function isUnsafeDisplayCodePoint(code: number): boolean {
   return code <= 0x1f ||
@@ -22,7 +23,7 @@ export function sanitizeBoundedDisplayText(value: string, maximumBytes: number, 
   let bytes = 0;
   for (const character of value) {
     const safe = isUnsafeDisplayCodePoint(character.codePointAt(0)!) ? '?' : character;
-    const size = Buffer.byteLength(safe);
+    const size = byteLength(safe);
     if (bytes + size > maximumBytes) break;
     output += safe;
     bytes += size;

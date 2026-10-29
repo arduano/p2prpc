@@ -1,3 +1,4 @@
+import { byteLength } from '../platform.js';
 import { P2PError } from '../errors.js';
 
 interface RuntimeSlotState<TRuntime> {
@@ -139,7 +140,7 @@ export class RuntimeSlotClaim<TRuntime> {
 }
 
 function validatePeerId(value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0 || Buffer.byteLength(value) > 2_048) {
+  if (typeof value !== 'string' || value.length === 0 || byteLength(value) > 2_048) {
     throw new P2PError('INVALID_FRAME', 'Invalid runtime-slot peer ID');
   }
 }
