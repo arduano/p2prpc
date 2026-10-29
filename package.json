@@ -43,21 +43,25 @@
     "stress:files:help": "node --import tsx benchmarks/file-stream-lifecycle.ts --help",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "node scripts/require-release-workflow.mjs"
+    "release": "node scripts/require-release-workflow.mjs",
+    "test:browser": "npm run build && npm run test:browser -w @arduano/p2prpc-core"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
     "@changesets/cli": "^3.0.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.0.0",
+    "@types/ws": "8.18.1",
     "esbuild": "^0.28.2",
     "eslint": "^10.8.1",
+    "playwright-core": "1.56.1",
     "publint": "^0.3.24",
     "tsx": "^4.23.12",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.67.0",
     "vitepress": "^1.6.4",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "ws": "8.22.0"
   },
   "overrides": {
     "tsup": {

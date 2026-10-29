@@ -176,3 +176,19 @@ export interface DownloadFileOptions extends FileTransferOptions {
   /** Stable capability-redemption operation ID used across reconnect/retry. */
   readonly operationId?: string;
 }
+
+export interface PeerFiles<TFileMetadata = unknown> {
+  sendFile(source: FileSource<TFileMetadata>, options?: SendFileOptions): Promise<FileTransfer<TFileMetadata>>;
+  download(
+    handle: SharedFileHandle,
+    destination: FileDestination<TFileMetadata>,
+    options?: DownloadFileOptions
+  ): Promise<FileTransfer<TFileMetadata>>;
+  /** Issue a short-lived capability bound to this endpoint and its authenticated principal. */
+  share(source: FileSource<TFileMetadata>, policy?: PeerFileShareOptions): SharedFileHandle;
+  /** Revoke a capability previously issued by this local node. */
+  revoke(handle: SharedFileHandle): boolean;
+}
+
+/** Safe capability controls; endpoint and principal binding are automatic. */
+export type PeerFileShareOptions = Omit<PeerSharePolicy, 'allowedPrincipals'>;

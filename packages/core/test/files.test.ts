@@ -2,6 +2,8 @@ import { lstat, mkdtemp, readFile, rename, rm, stat, symlink, utimes, writeFile 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import process from 'node:process';
+import { createHash } from 'node:crypto';
+import { blake3 } from '@napi-rs/blake-hash';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chunkDigest, createManifest, fileDestination, fileSource } from '../src/files/fs.js';
 import {
@@ -34,6 +36,8 @@ import {
   validateManifest
 } from '../src/files/validation.js';
 import { P2PError } from '../src/errors.js';
+import { blobSource, memoryDestination } from '../src/files/browser.js';
+import { byteLength, createSha256, isByteArray } from '../src/platform.js';
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -354,6 +358,18 @@ describe('filesystem transfers', () => {
     await writeFile(input, bytes);
     const source = await fileSource(input, { kind: 'test' });
     const manifest = await createManifest(source, { chunkSize: 64 * 1024, transferId: 'test-transfer' });
+    const browserSource = blobSource(new Blob([bytes]), { name: source.name, metadata: { kind: 'test' } });
+    expect(await createManifest(browserSource, { chunkSize: 64 * 1024, transferId: 'test-transfer' })).toEqual(manifest);
+    expect(manifest.digest).toBe(blake3(bytes).toString('hex'));
+    for (const value of ['ascii', '\u00e9\u6f22\ud83e\uddf0', '\ud800x\udfff']) {
+      expect(byteLength(value)).toBe(Buffer.byteLength(value));
+      expect(createSha256().update('prefix\n').update(value).digest('base64url'))
+        .toBe(createHash('sha256').update('prefix\n').update(value).digest('base64url'));
+    }
+    class ByteSubclass extends Uint8Array {}
+    expect(isByteArray(new Uint8Array(1))).toBe(true);
+    expect(isByteArray(Buffer.alloc(1))).toBe(true);
+    expect(isByteArray(new ByteSubclass(1))).toBe(false);
     const destination = fileDestination<{ kind: string }>(output);
     expect(await destination.prepare(manifest)).toEqual(new Set());
     for (let index = 0; index < manifest.chunkCount; index += 1) {
@@ -361,6 +377,65 @@ describe('filesystem transfers', () => {
     }
     await destination.finalize(manifest, finalizeContext());
     expect(await readFile(output)).toEqual(bytes);
+  });
+
+  it('receives striped Blob bytes through the existing engine and publishes only verified bounded staging', async () => {
+    const chunkSize = 64 * 1024;
+    const bytes = Uint8Array.from({ length: chunkSize + 3 }, (_, index) => index % 251);
+    const source = blobSource(new Blob([bytes]), { name: 'browser.bin' });
+    const destination = memoryDestination({ maxBytes: bytes.byteLength });
+    const original = await createManifest(source, { chunkSize, transferId: 'browser-download' });
+    await expect(memoryDestination({ maxBytes: bytes.byteLength - 1 }).prepare(original))
+      .rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(source.readChunk(0, chunkSize, cancelled.signal)).rejects.toMatchObject({ code: 'CANCELLED' });
+
+    const control = duplexPair();
+    const context = testContext(testConnection(control.left, new AsyncPipe()));
+    const manager = new TransferManager({
+      peerId: 'peer-a', connection: async () => context,
+      shares: new ShareRegistry(), authorize: () => undefined,
+      limits: { chunkSize, lanes: 2 }
+    });
+    try {
+      const downloading = manager.download('a'.repeat(43), destination, {
+        operationId: original.transferId, chunkSize, lanes: 2
+      });
+      await control.right.recv.readExact(1);
+      const pull = await readFrame<Record<string, unknown>>(control.right.recv);
+      expect(pull.value.requestId).toBe(original.transferId);
+      await writeFrame(control.right.send, TransferFrameKind.Offer, original);
+      const transfer = await downloading;
+      const accepted = await readFrame<Record<string, unknown>>(control.right.recv);
+      expect(destination.blob()).toBeNull();
+      // Actual engine receives the second stripe before the first.
+      await manager.handleData(await completedChunkLane(original, accepted.value, 1, 1,
+        await source.readChunk(1, chunkSize)), context);
+      await manager.handleData(await completedChunkLane(original, accepted.value, 0, 0,
+        await source.readChunk(0, chunkSize)), context);
+      expect(destination.blob()).toBeNull();
+      await completeLocalReceiver(control.right, {
+        transferId: original.transferId, attemptId: accepted.value.attemptId
+      });
+      await expect(transfer.result).resolves.toMatchObject({ manifest: original });
+      expect(new Uint8Array(await destination.blob()!.arrayBuffer())).toEqual(bytes);
+    } finally { manager.close(); }
+
+    const corrupt = memoryDestination({ maxBytes: bytes.byteLength });
+    await corrupt.prepare(original);
+    await corrupt.writeChunk(original, 0, await source.readChunk(0, chunkSize));
+    await corrupt.abort(original, { discard: false });
+    expect(await corrupt.prepare(original)).toEqual(new Set([0]));
+    await corrupt.writeChunk(original, 1, new Uint8Array(3));
+    let committed = false;
+    await expect(corrupt.finalize(original, { markCommitted: () => { committed = true; } }))
+      .rejects.toMatchObject({ code: 'INTEGRITY_FAILED' });
+    expect(committed).toBe(false);
+    expect(corrupt.blob()).toBeNull();
+    await corrupt.abort(original, { discard: true }, cancelled.signal);
+    expect(await corrupt.prepare(original)).toEqual(new Set());
+    await corrupt.abort(original, { discard: true });
   });
 
   it('persists completed chunks and resumes into the same partial file', async () => {

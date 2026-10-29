@@ -1,3 +1,4 @@
+import { byteLength, isByteArray } from '../platform.js';
 import { pack } from 'msgpackr';
 import { P2PError } from '../errors.js';
 import { containsUnsafeDisplayCharacters } from '../text.js';
@@ -283,10 +284,7 @@ function clonePlainData(
     return value;
   }
   if (value instanceof Uint8Array) {
-    if (
-      Object.getPrototypeOf(value) !== Uint8Array.prototype &&
-      Object.getPrototypeOf(value) !== Buffer.prototype
-    ) throw new P2PError('INVALID_FRAME', 'File metadata must contain only plain byte arrays');
+    if (!isByteArray(value)) throw new P2PError('INVALID_FRAME', 'File metadata must contain only plain byte arrays');
     if (
       Object.getOwnPropertyDescriptor(value, 'byteLength') ||
       Object.getOwnPropertyDescriptor(value, 'constructor') ||
@@ -348,7 +346,7 @@ function clonePlainData(
     if (typeof key !== 'string') {
       throw new P2PError('INVALID_FRAME', 'File metadata contains an invalid key');
     }
-    const keyBytes = Buffer.byteLength(key);
+    const keyBytes = byteLength(key);
     if (
       keyBytes > 1024 ||
       hasControlCharacters(key) ||
@@ -402,7 +400,7 @@ function consumeMetadataBudget(
 }
 
 function encodedMetadataLength(value: string): number {
-  return checkedMetadataLength(Buffer.byteLength(value));
+  return checkedMetadataLength(byteLength(value));
 }
 
 function checkedMetadataLength(length: number): number {

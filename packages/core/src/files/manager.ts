@@ -1,5 +1,4 @@
-import { createHash, randomBytes, type Hash } from 'node:crypto';
-import { setTimeout as delay } from 'node:timers/promises';
+import { byteLength, createSha256, delay, randomToken, unrefTimer, type Sha256Hasher } from '../platform.js';
 import { P2PError, asP2PError } from '../errors.js';
 import {
   DEFAULT_FRAME_LIMITS,
@@ -15,7 +14,7 @@ import {
 import type { QuicBiStream, QuicConnection, QuicRecvStream, QuicSendStream } from '../transport/types.js';
 import type { SessionPrincipal } from '../security/types.js';
 import { sanitizeBoundedDisplayText } from '../text.js';
-import { chunkDigest, createManifest } from './fs.js';
+import { chunkDigest, createManifest } from './digest.js';
 import { capabilityId, type ShareRegistry, type ShareReservation } from './share.js';
 import { Transfer } from './transfer.js';
 import type {
@@ -1659,7 +1658,7 @@ export class TransferManager<TMetadata = unknown> {
       // transfer while a lane handler still owns a receive stream.
       await session.lanesDrained();
       session.touch();
-      const receiptToken = randomBytes(32).toString('base64url');
+      const receiptToken = randomToken();
       const commitOperation = pushOperation
         ? this.prepareCommitOperation(manifest, context.security.principal, pushOperation)
         : undefined;
@@ -1831,7 +1830,7 @@ export class TransferManager<TMetadata = unknown> {
       const acceptance: TransferAccept = {
         transferId: manifest.transferId,
         attemptId: randomOpaqueId(),
-        laneToken: randomBytes(32).toString('base64url'),
+        laneToken: randomToken(),
         missingRanges: [],
         missingCount: 0,
         lanes: 1
@@ -1846,7 +1845,7 @@ export class TransferManager<TMetadata = unknown> {
         { transferId: manifest.transferId, attemptId: acceptance.attemptId },
         context,
         signal,
-        randomBytes(32).toString('base64url'),
+        randomToken(),
         () => this.acknowledgeOperation(manifest, context.security.principal, operation),
         trackWork
       );
@@ -2019,7 +2018,7 @@ export class TransferManager<TMetadata = unknown> {
       if (outcome.kind === 'success') return outcome.value;
       if (outcome.kind !== 'retryable-transport-loss' || retryCount >= 5) throw outcome.error;
       try {
-        await delay(Math.min(500 * 2 ** retryCount, 8_000), undefined, { signal });
+        await delay(Math.min(500 * 2 ** retryCount, 8_000), signal);
       } catch (delayCause) {
         if (signal.aborted) throw signalError(signal);
         throw delayCause;
@@ -2522,7 +2521,7 @@ function createSession<TMetadata>(
     idleTimer = setTimeout(() => linked.controller.abort(
       new P2PError('TIMEOUT', 'File transfer made no progress before its idle deadline')
     ), idleTimeoutMs);
-    idleTimer.unref?.();
+    unrefTimer(idleTimer);
   };
   touch();
   return {
@@ -2532,7 +2531,7 @@ function createSession<TMetadata>(
     inFlight: new Set(),
     claimedLanes: new Set(),
     attemptId: randomOpaqueId(),
-    laneToken: randomBytes(32).toString('base64url'),
+    laneToken: randomToken(),
     allowedLanes,
     totalMissing: missing.size,
     resumed,
@@ -3044,7 +3043,7 @@ function metadataEqual(left: unknown, right: unknown): boolean {
 }
 
 function manifestFingerprint(manifest: FileManifest): string {
-  const hash = createHash('sha256');
+  const hash = createSha256();
   hashField(hash, 'transfer', manifest.transferId);
   hashField(hash, 'name', manifest.name);
   hashField(hash, 'size', String(manifest.size));
@@ -3069,7 +3068,7 @@ function receiverOperationKey(principal: SessionPrincipal, transferId: string): 
   return JSON.stringify([receiverPrincipalBinding(principal), transferId]);
 }
 
-function hashMetadata(hash: Hash, value: unknown): void {
+function hashMetadata(hash: Sha256Hasher, value: unknown): void {
   if (value === undefined) {
     hash.update('u');
     return;
@@ -3115,9 +3114,9 @@ function hashMetadata(hash: Hash, value: unknown): void {
   }
 }
 
-function hashField(hash: Hash, tag: string, value: string): void {
+function hashField(hash: Sha256Hasher, tag: string, value: string): void {
   hash.update(tag);
-  hash.update(String(Buffer.byteLength(value)));
+  hash.update(String(byteLength(value)));
   hash.update(':');
   hash.update(value);
 }
@@ -3168,7 +3167,7 @@ function validateLaneToken(value: unknown): string {
 }
 
 function randomOpaqueId(): string {
-  return randomBytes(16).toString('base64url');
+  return randomToken(16);
 }
 
 function randomTransferId(): string {
@@ -3331,7 +3330,7 @@ async function boundedOperation<T>(
   });
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new P2PError('TIMEOUT', message)), timeoutMs);
-    timer.unref?.();
+    unrefTimer(timer);
   });
   const aborted = new Promise<never>((_, reject) => {
     detachAbort = onAbort(signal, () => reject(signal ? signalError(signal) : cancelledError()));
@@ -3390,7 +3389,7 @@ async function cooperativeOperation<T>(
     detachAbort = onAbort(linked.controller.signal, () => resolve({ kind: 'aborted' }));
   });
   const timer = setTimeout(() => linked.controller.abort(timeoutError), timeoutMs);
-  timer.unref?.();
+  unrefTimer(timer);
   try {
     const outcome = await Promise.race([task, aborted]);
     if (outcome.kind === 'result') return outcome.value;
@@ -3419,7 +3418,7 @@ async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, message: 
       promise,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new P2PError('TIMEOUT', message)), timeoutMs);
-        timer.unref?.();
+        unrefTimer(timer);
       })
     ]);
   } finally {

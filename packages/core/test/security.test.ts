@@ -496,6 +496,14 @@ describe('session security', () => {
       action: { kind: 'file.push', manifest: emptyManifest() },
       signal: new AbortController().signal
     })).toBe(false);
+    // A file-pull grant is not authority to delegate a browser connection.
+    expect(await security.authorize({ principal, localPeerId: 'local-peer', remotePeerId: peerId,
+      sessionId: 'session', action: { kind: 'bridge', headers: {} }, signal: new AbortController().signal
+    })).toBe(false);
+    expect(await security.authorize({ principal: { ...principal, scopes: new Set(['p2prpc:bridge']) },
+      localPeerId: 'local-peer', remotePeerId: peerId, sessionId: 'session',
+      action: { kind: 'bridge', headers: {} }, signal: new AbortController().signal
+    })).toBe(true);
     const customPolicy = createOidcSessionSecurity({
       issuers: [{
         issuer,

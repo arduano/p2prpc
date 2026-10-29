@@ -22,3 +22,19 @@ old deadlines remain active until commit. Endpoint admission, unchanged authorit
 and active-operation authorization are rechecked, including idle subscriptions.
 Failure closes the connection without RPC replay. The independent candidate
 requires every p2prpc consumer to upgrade together.
+
+
+## Optional browser bridge
+
+Bridge admission is explicit and disabled without `onBridge`. Native OIDC
+requires `p2prpc:bridge` or `p2prpc:*`; Host delegation must verify the actual
+Gateway endpoint/principal and resolve the delegated browser user before work.
+The same immutable user/provenance is authorized for RPC and files, with expiry
+bounded by both grants. The application owns authenticated/origin-checked WSS
+upgrades, permitted Host routing and credential storage. The trusted Gateway
+can inspect/change traffic; this is hop encryption, not browser-to-Host E2E proof.
+Resume secrets are private capabilities, stored hashed and tied to full stable
+user identity. Log neither secrets nor delegated assertions. Carrier loss never
+replays RPCs or closes the shared outer Peer. Unfinished callbacks and unproved
+cleanup retain custody. Browser memory destinations require an explicit quota,
+verify complete BLAKE3 before publication and have no durable disk/crash promise.

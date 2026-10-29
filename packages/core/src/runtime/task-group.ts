@@ -1,3 +1,4 @@
+import { unrefTimer } from '../platform.js';
 import { P2PError } from '../errors.js';
 
 /** Structured ownership for every asynchronous task started by the library. */
@@ -118,7 +119,7 @@ async function boundedJoin(
       timer = setTimeout(() => reject(
         new P2PError('TIMEOUT', `${name} did not settle during shutdown`)
       ), options.timeoutMs);
-      timer.unref?.();
+      unrefTimer(timer);
     }));
   }
   if (options.signal) {

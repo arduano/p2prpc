@@ -1,7 +1,8 @@
+import { byteLength } from '../platform.js';
 import SuperJSON, { type SuperJSONResult, type SuperJSONValue } from 'superjson';
 import { P2PError } from '../errors.js';
 import { DEFAULT_FRAME_LIMITS, type FrameLimits } from '../protocol.js';
-import type { RpcHeaders } from './headers.js';
+import type { RpcHeaders } from './portable-headers.js';
 
 export interface RpcRequest {
   readonly id: number;
@@ -490,7 +491,7 @@ function validateSimpleAnnotationTarget(annotation: string, target: unknown): vo
     case 'bigint':
       if (
         typeof target !== 'string' ||
-        Buffer.byteLength(target) > 16 * 1024 ||
+        byteLength(target) > 16 * 1024 ||
         !/^-?(?:0|[1-9]\d*)$/.test(target)
       ) throw invalidEnvelope();
       return;
@@ -507,13 +508,13 @@ function validateSimpleAnnotationTarget(annotation: string, target: unknown): vo
         Object.keys(target).length > 3 ||
         Object.keys(target).some((key) => !['name', 'message', 'cause'].includes(key)) ||
         typeof target.name !== 'string' ||
-        Buffer.byteLength(target.name) > 256 ||
+        byteLength(target.name) > 256 ||
         typeof target.message !== 'string' ||
-        Buffer.byteLength(target.message) > 8 * 1024
+        byteLength(target.message) > 8 * 1024
       ) throw invalidEnvelope();
       return;
     case 'regexp': {
-      if (typeof target !== 'string' || Buffer.byteLength(target) > 64 * 1024 || !target.startsWith('/')) {
+      if (typeof target !== 'string' || byteLength(target) > 64 * 1024 || !target.startsWith('/')) {
         throw invalidEnvelope();
       }
       const separator = target.lastIndexOf('/');
@@ -541,7 +542,7 @@ function validateSimpleAnnotationTarget(annotation: string, target: unknown): vo
       if (!['NaN', 'Infinity', '-Infinity', '-0'].includes(target as string)) throw invalidEnvelope();
       return;
     case 'URL':
-      if (typeof target !== 'string' || Buffer.byteLength(target) > 8 * 1024) throw invalidEnvelope();
+      if (typeof target !== 'string' || byteLength(target) > 8 * 1024) throw invalidEnvelope();
       try {
         const url = new URL(target);
         if (URL.prototype.toString.call(url) !== target) throw invalidEnvelope();
@@ -788,7 +789,7 @@ function reserveFixedBytes(state: ValidationState, bytes: number): void {
 }
 
 function reserveOutboundString(state: ValidationState, value: string): void {
-  const bytes = Buffer.byteLength(value);
+  const bytes = byteLength(value);
   reserveFixedBytes(state, bytes + 5);
 }
 
@@ -804,12 +805,12 @@ function reserveAnnotation(
   reserve(state, depth, 4);
   reserveFixedBytes(
     state,
-    (path.segments === 0 ? 0 : path.bytes + 5) + Buffer.byteLength(annotation) + 32
+    (path.segments === 0 ? 0 : path.bytes + 5) + byteLength(annotation) + 32
   );
 }
 
 function appendWirePath(path: WirePathBudget, segment: string): WirePathBudget {
-  let escapedBytes = Buffer.byteLength(segment);
+  let escapedBytes = byteLength(segment);
   for (const character of segment) {
     if (character === '.' || character === '\\') escapedBytes += 1;
   }
@@ -826,7 +827,7 @@ function checkedProduct(left: number, right: number): number {
 }
 
 function reserveBytes(state: ValidationState, value: string): void {
-  const bytes = Buffer.byteLength(value);
+  const bytes = byteLength(value);
   if (bytes > state.maxBytes - state.bytes) throw resourceLimit('RPC value exceeds the configured byte limit');
   state.bytes += bytes;
 }

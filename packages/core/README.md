@@ -131,3 +131,23 @@ RPC headers are bounded, normalized, immutable caller assertions available at `c
 Full documentation and production constraints: <https://arduano.github.io/p2prpc/>.
 
 MIT licensed. Report vulnerabilities through the repository security policy, not a public issue.
+
+## Browser clients through a trusted Gateway
+
+Import `connectBridge<HostRouter>()`, `blobSource()` and the explicitly bounded
+`memoryDestination({maxBytes})` from `@arduano/p2prpc-core/browser`. Import the
+router type with `import type`; no Gateway router copy is required. Host and
+Gateway applications use `createBridgeHost` and `relayBridge` from `/bridge`,
+with an explicit native `onBridge` handler and per-operation authorization.
+
+The optional Host/Gateway `/bridge` API requires Node 22+; native root usage
+retains Node 20.3+. Browser consumers need modern WebSocket, WebCrypto, Blob and
+`Promise.withResolvers` support. The browser entry reuses the existing RPC and binary file engines. Its retained
+logical Peer survives carrier replacement, but interrupted RPCs are not replayed
+and subscriptions/history require application reconciliation. Browser file IO is
+immutable Blob input and verified in-memory output (explicit quota, maximum
+64 MiB), without durable browser crash recovery. The trusted Gateway terminates
+hop encryption and must authorize both upgrades and Host routing.
+
+See [Browser bridge contracts and examples](https://arduano.github.io/p2prpc/Browser-Bridge)
+for delegation, lifetime, cleanup, limits and known compatibility boundaries.

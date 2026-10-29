@@ -91,3 +91,5 @@ export type {
   EndpointDiscoveryOptions,
   StreamLifecycleStats
 } from './transport/types.js';
+
+export type { NativeBridgeOffer, OpenBridgeOptions } from './bridge/native.js';

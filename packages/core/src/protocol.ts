@@ -1,3 +1,4 @@
+import { byteLength, isByteArray } from './platform.js';
 import { Packr } from 'msgpackr';
 import { P2PError } from './errors.js';
 import type { QuicRecvStream, QuicSendStream } from './transport/types.js';
@@ -12,7 +13,9 @@ export enum StreamKind {
   TransferControl = 2,
   TransferData = 3,
   /** The only stream permitted before application authentication completes. */
-  SessionAuth = 4
+  SessionAuth = 4,
+  /** Opt-in delegated browser connection service. */
+  Bridge = 5
 }
 
 export enum RpcFrameKind {
@@ -82,7 +85,8 @@ export async function readStreamKind(recv: QuicRecvStream): Promise<StreamKind> 
     value !== StreamKind.Rpc &&
     value !== StreamKind.TransferControl &&
     value !== StreamKind.TransferData &&
-    value !== StreamKind.SessionAuth
+    value !== StreamKind.SessionAuth &&
+    value !== StreamKind.Bridge
   ) {
     throw new P2PError('INVALID_FRAME', `Unknown stream kind: ${String(value)}`);
   }
@@ -301,7 +305,7 @@ function assertPlainArray(value: readonly unknown[], state: OutboundShapeState):
 }
 
 function encodedStringUpperBound(value: string): number {
-  return checkedEncodedLength(Buffer.byteLength(value));
+  return checkedEncodedLength(byteLength(value));
 }
 
 function checkedEncodedLength(length: number): number {
@@ -545,9 +549,7 @@ function invalidMessagePackShape(): P2PError {
 }
 
 function isWireByteArray(value: unknown): value is Uint8Array {
-  if (typeof value !== 'object' || value === null) return false;
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Uint8Array.prototype && prototype !== Buffer.prototype) return false;
+  if (!isByteArray(value)) return false;
   if (
     Object.getOwnPropertyDescriptor(value, 'byteLength') ||
     Object.getOwnPropertyDescriptor(value, 'constructor') ||
