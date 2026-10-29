@@ -65,9 +65,11 @@ jobs:
           artifact_directory="$RUNNER_TEMP/npm-artifact"
           npm run pack:artifact -- "$artifact_directory"
           tarball="$(jq -er '.[0].filename' "$artifact_directory/pack.json")"
-          echo "artifact=$artifact_directory/$tarball" >> "$GITHUB_OUTPUT"
-          echo "metadata=$artifact_directory/pack.json" >> "$GITHUB_OUTPUT"
-          echo "directory=$artifact_directory" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact=$artifact_directory/$tarball"
+            echo "metadata=$artifact_directory/pack.json"
+            echo "directory=$artifact_directory"
+          } >> "$GITHUB_OUTPUT"
       - name: Enforce package content and license policy
         run: npm run check:package-content -- "${{ steps.package.outputs.artifact }}" "${{ steps.package.outputs.metadata }}"
       - name: Lint packed package metadata
