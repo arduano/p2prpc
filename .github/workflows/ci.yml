@@ -24,7 +24,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.19.0
           cache: npm
@@ -125,7 +125,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -158,7 +158,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up maintainer Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.19.0
           cache: npm
@@ -176,7 +176,7 @@ jobs:
       - name: Prepare the exact source-candidate Iroh consumer
         run: npm run prepare:candidate-consumer -- package-artifact "$RUNNER_TEMP/candidate-consumer"
       - name: Set up minimum supported Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20.3.1
       - name: Exercise the minimum source and candidate-package runtime boundaries
