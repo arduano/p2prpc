@@ -78,7 +78,8 @@ const expectedExports = Object.freeze({
   './advanced': Object.freeze({ types: './dist/advanced.d.ts', runtime: './dist/advanced.js' }),
   './testing': Object.freeze({ types: './dist/testing.d.ts', runtime: './dist/testing.js' }),
   './bridge': Object.freeze({ types: './dist/bridge.d.ts', runtime: './dist/bridge.js' }),
-  './browser': Object.freeze({ types: './dist-browser/browser.d.ts', runtime: './dist-browser/browser.js' })
+  './browser': Object.freeze({ types: './dist-browser/browser.d.ts', runtime: './dist-browser/browser.js' }),
+  './files': Object.freeze({ types: './dist-browser/files.d.ts', runtime: './dist-browser/files.js' })
 });
 invariant(
   sameStrings(Object.keys(manifest.exports), Object.keys(expectedExports)),

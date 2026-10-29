@@ -32,6 +32,20 @@ alternate codec, or browser transport polyfill. Import browser runtime code from
 `@arduano/p2prpc-core/browser`, and router definitions with `import type`.
 Native Host/Gateway helpers are in `@arduano/p2prpc-core/bridge`.
 
+For a portable file-only library, import contracts and Blob/memory helpers from
+`@arduano/p2prpc-core/files` instead. This leaf excludes RPC and native endpoint
+dependencies from both JavaScript and declarations:
+
+```ts
+import { blobSource, memoryDestination } from '@arduano/p2prpc-core/files';
+import type { PeerFiles, FileMetadataSchema } from '@arduano/p2prpc-core/files';
+```
+
+It uses the same `PeerFiles` and transfer contracts as the native and browser
+Peers. It adds no transport, transfer engine, or filesystem adapter. CI compiles
+an actual built-entry consumer with DOM libraries and no ambient Node types, and
+bundles its runtime for the browser while rejecting Node, tRPC and Iroh imports.
+
 ## Host and Gateway composition
 
 ```ts

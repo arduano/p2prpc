@@ -12,7 +12,7 @@ export default defineConfig([
     external: ['@momics/iroh-http-node', '@momics/iroh-http-shared']
   },
   {
-    entry: { browser: 'src/browser.ts' },
+    entry: { browser: 'src/browser.ts', files: 'src/files.ts' },
     outDir: 'dist-browser', platform: 'browser', target: 'es2022',
     format: ['esm'], dts: true, sourcemap: true, clean: true, treeshake: true
   }

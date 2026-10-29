@@ -46,7 +46,8 @@
     "release": "node scripts/require-release-workflow.mjs",
     "test:browser": "npm run build && npm run test:browser -w @arduano/p2prpc-core",
     "prepare:candidate-consumer": "tsx scripts/prepare-candidate-consumer.ts",
-    "test:consumer-preparation": "tsx --test scripts/consumer-preparation.test.ts"
+    "test:consumer-preparation": "tsx --test scripts/consumer-preparation.test.ts",
+    "test:files-entry": "tsx --test scripts/files-entry.test.ts"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",

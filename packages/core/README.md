@@ -140,6 +140,12 @@ router type with `import type`; no Gateway router copy is required. Host and
 Gateway applications use `createBridgeHost` and `relayBridge` from `/bridge`,
 with an explicit native `onBridge` handler and per-operation authorization.
 
+File-only libraries can instead import `PeerFiles`, file source/destination,
+manifest, metadata and capability types, plus `blobSource` and
+`memoryDestination`, from `@arduano/p2prpc-core/files`. This entry's JavaScript
+and declarations exclude tRPC, Iroh and Node APIs. It exposes the existing file
+contracts without opening a Peer, importing an RPC client, or adding filesystem IO.
+
 The optional Host/Gateway `/bridge` API requires Node 22+; native root usage
 retains Node 20.3+. Browser consumers need modern WebSocket, WebCrypto, Blob and
 `Promise.withResolvers` support. The browser entry reuses the existing RPC and binary file engines. Its retained
