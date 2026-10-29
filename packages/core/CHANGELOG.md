@@ -1,5 +1,11 @@
 # @arduano/p2prpc-core
 
+## 0.3.1
+
+- Expose the existing portable file contracts and Blob/memory IO through `/files`.
+  File-only browser consumers no longer load typed RPC or Node declaration
+  dependencies. Transfer algorithms and wire formats are unchanged.
+
 ## 0.3.0
 
 ### Minor Changes

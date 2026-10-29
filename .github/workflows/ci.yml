@@ -54,6 +54,8 @@ jobs:
         run: npm run test:consumer-preparation
       - name: Build package
         run: npm run build
+      - name: Verify the portable files public entry
+        run: npm run test:files-entry
       - name: Install Chromium for the real browser bridge journey
         run: npx playwright-core install --with-deps chromium
       - name: Run browser / WSS / Iroh bridge qualification

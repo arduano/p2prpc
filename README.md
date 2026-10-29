@@ -37,6 +37,12 @@ opt-in [trusted Gateway bridge](./docs/wiki/Browser-Bridge.md) through the expli
 `@arduano/p2prpc-core/browser` entry; Hosts/Gateways use `/bridge`. The browser
 retains the actual Host router type and the existing binary file protocol.
 
+File-only consumers can import `@arduano/p2prpc-core/files`: it exports the same
+`PeerFiles`, source/destination, manifest, metadata and capability contracts, plus
+`blobSource` and bounded `memoryDestination`. Its runtime and declarations do not
+import tRPC, Iroh, or Node APIs. Use `/browser` when you also need `connectBridge`
+and inferred RPC; `/files` does not create a Peer or provide filesystem IO.
+
 ## Install from GitHub Packages
 
 The package is hosted on GitHub Packages, which requires authentication even
