@@ -93,7 +93,9 @@ export function webSocketDuplex(socket: BinaryWebSocket, options: WebSocketCarri
         await wait(() => socket.readyState === 1 && socket.bufferedAmount + copy.length <= maxBufferedBytes);
         if (closing) throw error ?? new P2PError('DISCONNECTED', 'WebSocket closed');
         socket.send(copy);
-        await wait(() => socket.bufferedAmount === 0);
+        // WebSocket.send copies/enqueues the bytes. Backpressure belongs to
+        // admission against the bounded native buffer, not a full flush after
+        // every fragment (which serializes tiny Yamux window updates on TLS).
       }).catch((reason: unknown) => {
         const failure = reason instanceof Error ? reason : new P2PError('DISCONNECTED', 'WebSocket write failed');
         close(failure); throw failure;

@@ -59,6 +59,7 @@ describe.skipIf(!yamuxAvailable)('logical Yamux carrier', () => {
       await incoming.send.finish();
       expect(await outgoing.recv.readExact(8)).toEqual(text.encode('response'));
       await outgoing.recv.expectEnd();
+      await expect(outgoing.recv.readExact(1)).rejects.toMatchObject({ code: 'DISCONNECTED' });
       const send = await b.openUni();
       const receive = await a.acceptUni();
       await send.writeAll(text.encode('independent'));
@@ -176,7 +177,7 @@ class Socket implements BinaryWebSocket {
     if (type === 'message') this.messages.delete(listener);
     else this.events.get(type)?.delete(listener as () => void);
   }
-  send(bytes: Uint8Array): void { this.sent.push(bytes.slice()); }
+  send(bytes: Uint8Array): void { this.sent.push(bytes.slice()); this.bufferedAmount += bytes.length; }
   close(code = 1000): void {
     // Browser WebSocket.close permits only1000 or application codes3000–4999.
     if (code !== 1000 && (code < 3000 || code > 4999)) throw new Error('Invalid WebSocket close code');
@@ -193,6 +194,18 @@ it('WebSocket binary carrier bounds admission and closes from actual socket evid
   expect((await reader.next()).value).toEqual(Uint8Array.of(1, 2));
   await carrier.write(Uint8Array.of(3));
   expect(socket.sent).toEqual([Uint8Array.of(3)]);
+  // TLS and browser sockets retain accepted bytes after send. A write owns
+  // admission, not a full socket flush; only lack of capacity blocks the next.
+  expect(socket.bufferedAmount).toBe(1);
+  await carrier.write(new Uint8Array(8));
+  let admitted = false;
+  const blocked = carrier.write(new Uint8Array(8)).then(() => { admitted = true; });
+  await Promise.resolve();
+  expect(admitted).toBe(false);
+  expect(socket.bufferedAmount).toBe(9);
+  socket.bufferedAmount = 0;
+  await blocked;
+  expect(socket.bufferedAmount).toBe(8);
   await expect(carrier.write(new Uint8Array(9))).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
   socket.message('text is not a byte frame');
   await expect(reader.next()).rejects.toMatchObject({ code: 'INVALID_FRAME' });

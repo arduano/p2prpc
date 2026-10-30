@@ -2,7 +2,7 @@ import { unrefTimer } from '../platform.js';
 import { TRPCClientError, type TRPCLink } from '@trpc/client';
 import type { AnyTRPCRouter } from '@trpc/server';
 import { observable } from '@trpc/server/observable';
-import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
+import { TRPC_ERROR_CODES_BY_KEY, TRPC_ERROR_CODES_BY_NUMBER, type TRPCErrorShape } from '@trpc/server/rpc';
 import { P2PError, asP2PError } from '../errors.js';
 import { sanitizeBoundedDisplayText } from '../text.js';
 import {
@@ -255,7 +255,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
               active = false;
               removeAbortListener();
               await cleanup(stream, 'terminal');
-              observer.error(new TRPCClientError(shape.message, { result: { error: shape as never } }));
+              observer.error(TRPCClientError.from<TRouter>({ error: shape }));
               return;
             } else {
               throw new P2PError('INVALID_FRAME', `Unexpected RPC frame kind ${frame.kind}`);
@@ -322,49 +322,43 @@ function assertResponseId(value: unknown, expected: number): void {
   }
 }
 
-function normalizeErrorShape(shape: unknown, expectedPath: string): Readonly<{
-  code: number;
-  message: string;
-  data: Readonly<{ code: string; httpStatus: number; path: string }>;
-}> {
-  exactRecord(shape, ['code', 'message', 'data'], 'RPC error shape');
-  exactRecord(shape.data, ['code', 'httpStatus', 'path'], 'RPC error data');
-  if (typeof shape.code !== 'number' || !Number.isSafeInteger(shape.code)) {
-    throw new P2PError('INVALID_FRAME', 'RPC error code must be a safe integer');
+function normalizeErrorShape(shape: unknown, expectedPath: string): Readonly<TRPCErrorShape> {
+  // readFrame already bounds and validates the entire data tree. tRPC permits
+  // formatter-defined fields, including data that replaces DefaultErrorData.
+  if (typeof shape !== 'object' || shape === null || Array.isArray(shape) ||
+    !('code' in shape) || !('message' in shape) || !('data' in shape)) {
+    throw new P2PError('INVALID_FRAME', 'RPC error shape is invalid');
+  }
+  if (typeof shape.code !== 'number' || !Object.hasOwn(TRPC_ERROR_CODES_BY_NUMBER, shape.code)) {
+    throw new P2PError('INVALID_FRAME', 'RPC error code is invalid');
   }
   if (typeof shape.message !== 'string') {
     throw new P2PError('INVALID_FRAME', 'RPC error message must be a string');
   }
-  if (typeof shape.data.code !== 'string' || !Object.hasOwn(TRPC_ERROR_CODES_BY_KEY, shape.data.code)) {
-    throw new P2PError('INVALID_FRAME', 'RPC error data code is invalid');
+  const data = shape.data;
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new P2PError('INVALID_FRAME', 'RPC error data must be an object');
   }
-  const errorCode = shape.data.code as keyof typeof TRPC_ERROR_CODES_BY_KEY;
-  if (shape.code !== TRPC_ERROR_CODES_BY_KEY[errorCode]) {
-    throw new P2PError('INVALID_FRAME', 'RPC error codes are inconsistent');
+  if ('code' in data) {
+    if (typeof data.code !== 'string' || !Object.hasOwn(TRPC_ERROR_CODES_BY_KEY, data.code)) {
+      throw new P2PError('INVALID_FRAME', 'RPC error data code is invalid');
+    }
+    if (shape.code !== TRPC_ERROR_CODES_BY_KEY[data.code as keyof typeof TRPC_ERROR_CODES_BY_KEY]) {
+      throw new P2PError('INVALID_FRAME', 'RPC error codes are inconsistent');
+    }
   }
-  if (
-    typeof shape.data.httpStatus !== 'number' ||
-    !Number.isSafeInteger(shape.data.httpStatus) ||
-    shape.data.httpStatus < 100 ||
-    shape.data.httpStatus > 599
-  ) {
+  if ('httpStatus' in data && (typeof data.httpStatus !== 'number' ||
+    !Number.isSafeInteger(data.httpStatus) || data.httpStatus < 100 || data.httpStatus > 599)) {
     throw new P2PError('INVALID_FRAME', 'RPC error HTTP status is invalid');
   }
-  if (
-    typeof shape.data.path !== 'string' ||
-    shape.data.path !== expectedPath
-  ) {
+  if ('path' in data && data.path !== undefined && data.path !== expectedPath) {
     throw new P2PError('INVALID_FRAME', 'RPC error path does not match request');
   }
-  const data = Object.freeze({
-    code: shape.data.code,
-    httpStatus: shape.data.httpStatus,
-    path: shape.data.path
-  });
   return Object.freeze({
-    code: shape.code,
+    ...shape,
+    code: shape.code as TRPCErrorShape['code'],
     message: sanitizeBoundedDisplayText(shape.message, 8 * 1024, 'Remote procedure failed'),
-    data
+    data: Object.freeze(data)
   });
 }
 

@@ -1,6 +1,7 @@
 import { byteLength, unrefTimer } from '../platform.js';
 import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
 import { TRPCError, callTRPCProcedure, getTRPCErrorFromUnknown } from '@trpc/server';
+import { defaultFormatter, getErrorShape } from '@trpc/server/unstable-core-do-not-import';
 import { getHTTPStatusCodeFromError } from '@trpc/server/http';
 import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
 import { P2PError, asP2PError } from '../errors.js';
@@ -70,6 +71,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
   async handle(stream: QuicBiStream, trackWork: RpcWorkTracker = ignoreWork): Promise<void> {
     let request: RpcRequest | undefined;
     let context: inferRouterContext<TRouter> | undefined;
+    let decodedInput: unknown;
     const controller = new AbortController();
     let cancelTask: Promise<void> | undefined;
     let terminal = false;
@@ -153,7 +155,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
           ctx: context!,
           batchIndex: 0,
           signal: requestSignal,
-          getRawInput: async () => deserializeValue(
+          getRawInput: async () => decodedInput = deserializeValue(
             currentRequest.input,
             this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
           )
@@ -213,7 +215,18 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
           : getTRPCErrorFromUnknown(cause);
         // Derive the wire response before notifying diagnostics. Observability
         // callbacks must not be able to mutate an error or request into a leak.
-        const shape = request ? safeErrorShape(error, request.path) : undefined;
+        // An explicitly configured formatter owns its public error contract,
+        // just as on official tRPC transports. The default retains p2prpc's
+        // sanitized shape; diagnostic callbacks do not own wire disclosure.
+        const config = this.options.router._def._config;
+        const shape = request
+          ? config.errorFormatter === defaultFormatter
+            ? safeErrorShape(error, request.path)
+            : getErrorShape({
+                config, error, type: request.type, path: request.path,
+                input: decodedInput, ctx: context
+              })
+          : undefined;
         try {
           const delivered = this.options.onError?.(error, request);
           void Promise.resolve(delivered).catch(() => undefined);

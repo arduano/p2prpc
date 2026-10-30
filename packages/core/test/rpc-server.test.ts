@@ -151,16 +151,17 @@ describe('RPC server security boundaries', () => {
     });
   });
 
-  it('does not expose values injected by a router error formatter', async () => {
+  it('preserves the configured tRPC error contract before diagnostics run', async () => {
     const secret = 'formatter-secret-must-not-cross-the-wire';
     const t = initTRPC.create({
-      errorFormatter() {
+      isDev: false,
+      errorFormatter({ shape, path, type }) {
+        expect(path).toBe('fail');
+        expect(type).toBe('query');
         return {
-          code: secret,
-          message: secret,
-          data: { code: secret, httpStatus: secret, path: secret },
-          custom: secret
-        } as never;
+          ...shape,
+          data: { ...shape.data, admission: 'not-admitted' as const }
+        };
       }
     });
     const router = t.router({
@@ -199,7 +200,7 @@ describe('RPC server security boundaries', () => {
       shape: {
         code: -32600,
         message: 'Public validation failure',
-        data: { code: 'BAD_REQUEST', httpStatus: 400, path: 'fail' }
+        data: { code: 'BAD_REQUEST', httpStatus: 400, path: 'fail', admission: 'not-admitted' }
       }
     });
   });

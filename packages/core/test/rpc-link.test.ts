@@ -1,8 +1,9 @@
-import { createTRPCProxyClient } from '@trpc/client';
-import { initTRPC } from '@trpc/server';
-import { describe, expect, it } from 'vitest';
-import { RpcFrameKind, readFrame, writeFrame } from '../src/protocol.js';
+import { createTRPCProxyClient, isTRPCClientError } from '@trpc/client';
+import { initTRPC, TRPCError } from '@trpc/server';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import { RpcFrameKind, StreamKind, readStreamKind, readFrame, writeFrame } from '../src/protocol.js';
 import { irohLink } from '../src/rpc/link.js';
+import { RpcServer } from '../src/rpc/server.js';
 import { serializeValue, type RpcRequest } from '../src/rpc/wire.js';
 import type {
   ConnectionStats,
@@ -341,16 +342,53 @@ describe('RPC link flow-control boundaries', () => {
     expect(Buffer.byteLength(outcome.message)).toBeLessThanOrEqual(8 * 1024);
   });
 
+  it.each([false, true])('preserves the inferred router formatter through the actual server and link (replace data: %s)', async (replaceData) => {
+    const t = initTRPC.create({
+      isDev: false,
+      errorFormatter: ({ shape }) => ({
+        ...shape,
+        reference: 'public-error-reference',
+        data: {
+          ...(replaceData ? {} : shape.data),
+          admission: 'not-admitted' as const,
+          details: { fields: ['prompt'], limit: 1024 }
+        }
+      })
+    });
+    const router = t.router({ fail: t.procedure.query(() => {
+      throw new TRPCError({ code: 'BAD_REQUEST', message: 'Prompt exceeds limit' });
+    }) });
+    const request = new BufferedRecv(), response = new BufferedRecv();
+    const server = new RpcServer({
+      router, createContext: () => ({}), authorize: () => undefined,
+      headerLimits: { maxCount: 8, maxBytes: 1024 }, maxPathBytes: 256,
+      setupTimeoutMs: 1_000
+    });
+    const handling = (async () => {
+      expect(await readStreamKind(request)).toBe(StreamKind.Rpc);
+      await server.handle({ send: response, recv: request });
+    })();
+    const client = createTRPCProxyClient<typeof router>({ links: [irohLink({
+      connection: async () => testConnection(async () => ({ send: request, recv: response })),
+      ioTimeoutMs: 1_000
+    })] });
+    try {
+      const error: unknown = await client.fail.query().catch((cause: unknown) => cause);
+      if (!isTRPCClientError<typeof router>(error)) throw new Error('Expected typed tRPC error');
+      expectTypeOf(error.data?.admission).toEqualTypeOf<'not-admitted' | undefined>();
+      expect(error.message).toBe('Prompt exceeds limit');
+      expect(error.shape?.reference).toBe('public-error-reference');
+      expect(error.data).toEqual({
+        ...(replaceData ? {} : { code: 'BAD_REQUEST', httpStatus: 400, path: 'fail' }),
+        admission: 'not-admitted', details: { fields: ['prompt'], limit: 1024 }
+      });
+      expect(error.cause).toBeUndefined();
+      await handling;
+    } finally { await request.stop(); await response.stop(); await handling; }
+  });
+
   it.each([
     { message: 'missing nested fields', shape: { message: 'bad' } },
-    {
-      message: 'unknown nested fields',
-      shape: {
-        code: -32600,
-        message: 'bad',
-        data: { code: 'BAD_REQUEST', httpStatus: 400, path: 'ping', secret: 'smuggled' }
-      }
-    },
     {
       message: 'invalid nested types',
       shape: {

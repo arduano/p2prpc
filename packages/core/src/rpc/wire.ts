@@ -1,7 +1,7 @@
 import { byteLength } from '../platform.js';
 import SuperJSON, { type SuperJSONResult, type SuperJSONValue } from 'superjson';
 import { P2PError } from '../errors.js';
-import { DEFAULT_FRAME_LIMITS, type FrameLimits } from '../protocol.js';
+import { DEFAULT_FRAME_LIMITS, MAX_CONTROL_FRAME_BYTES, type FrameLimits } from '../protocol.js';
 import type { RpcHeaders } from './portable-headers.js';
 
 export interface RpcRequest {
@@ -144,7 +144,7 @@ function validationState(limits: FrameLimits): ValidationState {
   const maxBytes = limits.maxControlFrameBytes;
   const maxItems = limits.maxControlFrameItems ?? DEFAULT_FRAME_LIMITS.maxControlFrameItems!;
   const maxDepth = limits.maxControlFrameDepth ?? DEFAULT_FRAME_LIMITS.maxControlFrameDepth!;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 16 * 1024 * 1024) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_CONTROL_FRAME_BYTES) {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid RPC wire byte limit');
   }
   if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 1_000_000) {

@@ -30,6 +30,7 @@ function deferred() {
 function makeRouter(state: { calls: number; subscriptions: number; released: ReturnType<typeof deferred>; entered: ReturnType<typeof deferred> }) {
   const t = initTRPC.context<BridgeContext>().create();
   return t.router({
+    large: t.procedure.query(() => 'x'.repeat(33 * 1024 * 1024)),
     inspect: t.procedure.query(({ ctx }) => ({ principal: ctx.bridge.principal.id, peer: ctx.bridge.peerId,
       gateway: ctx.bridge.via.peerId, calls: state.calls })),
     once: t.procedure.input(z.object({ originalId: z.literal('observation-loss') })).mutation(async ({ input }) => {
@@ -54,6 +55,7 @@ function makeRouter(state: { calls: number; subscriptions: number; released: Ret
 }
 type Router = ReturnType<typeof makeRouter>;
 interface BrowserHarness {
+  large(): Promise<number>;
   inspect(): Promise<{ principal: string; peer: string; gateway: string; calls: number }>;
   subscribe(): void;
   snapshot(): { watch: string[]; watchErrors: number; lost: string; connected: boolean };
@@ -79,9 +81,12 @@ async function browserMain(
   duplex: typeof webSocketDuplex,
   config: { url: string; expectedHostId: string }
 ): Promise<void> {
+  // 64 MiB frames reserve one frame per RPC plus independent file-control
+  // and data lanes; this profile admits a subscription and concurrent query.
   const errors: string[] = [];
   const carriers: Array<{ socket: WebSocket; closeCalls: number }> = [];
   const peer = await connect<Router>({ ...config,
+    frameLimits: { maxControlFrameBytes: 64 * 1024 * 1024 },
     onError: error => { errors.push(error.message); },
     socket(url) {
       const socket = new WebSocket(url);
@@ -91,7 +96,7 @@ async function browserMain(
       carriers.push(carrier);
       return socket;
     },
-    limits: { setupTimeoutMs: 10_000, ioTimeoutMs: 15_000 }
+    limits: { setupTimeoutMs: 10_000, ioTimeoutMs: 15_000, maxBufferedBytes: 512 * 1024 * 1024 }
   });
   const watch: string[] = [];
   let watchErrors = 0;
@@ -100,6 +105,7 @@ async function browserMain(
   let shared: Awaited<ReturnType<typeof peer.rpc.file.query>> | undefined;
   let push: Promise<{ id: string; resumed: boolean; size: number }> | undefined;
   const harness: BrowserHarness = {
+    large: async () => (await peer.rpc.large.query()).length,
     inspect: () => peer.rpc.inspect.query(),
     subscribe() {
       subscription?.unsubscribe();
@@ -174,10 +180,12 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
   let paused = false;
   const router = makeRouter(state);
   const n = initTRPC.context<PeerContext>().create();
-  const nativeRouter = n.router({ health: n.procedure.query(() => 'outer-peer-alive') });
+  const nativeRouter = n.router({ health: n.procedure.query(() => 'outer-peer-alive'), large: n.procedure.query(() => 'x'.repeat(33 * 1024 * 1024)) });
   const nodes: Array<P2PNode<typeof nativeRouter>> = [];
   let gatewayId = '';
   const hostService = createBridgeHost({
+    onError: error => { nativeErrors.push(error.message); },
+    frameLimits: { maxControlFrameBytes: 64 * 1024 * 1024 },
     router, createContext: context => context,
     authorizeDelegation(offer) {
       if (offer.peer.id !== gatewayId || offer.auth.principal.id !== gatewayId) throw new Error('Untrusted Gateway');
@@ -199,13 +207,14 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
         abort: (manifest, options, signal) => received.abort(manifest, options, signal)
       } };
     },
-    limits: { maxPeers: 2, setupTimeoutMs: 10_000, shutdownTimeoutMs: 10_000, ioTimeoutMs: 15_000 }
+    limits: { maxPeers: 2, setupTimeoutMs: 10_000, shutdownTimeoutMs: 10_000, ioTimeoutMs: 15_000, maxBufferedBytes: 512 * 1024 * 1024 }
   });
   const makeNode = async (host: boolean) => {
     const node = await createAdvancedP2PNode({ router: nativeRouter, createContext: context => context,
+      limits: { maxControlFrameBytes: 64 * 1024 * 1024, maxBufferedBytes: 512 * 1024 * 1024, maxPeerBufferedBytes: 512 * 1024 * 1024, maxPrincipalBufferedBytes: 512 * 1024 * 1024 },
       protocol: { applicationId: 'bridge-owned-integration', contractVersion: '1' },
       security: createSharedSecretSecurity('owned-disposable-bridge-lab-key-32-bytes', { authorize: () => true }),
-      onError: error => { nativeErrors.push(`${error.code}: ${error.message}`); },
+      onError: error => { nativeErrors.push(error.message); },
       ...(host ? { onBridge: async offer => {
         try { await hostService.accept(offer); } catch (cause) {
           if (cause instanceof Error && cause.message === 'Unknown Bridge resumption') deniedResumptions.push(cause.message);
@@ -232,6 +241,8 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     const outer = await gateway.connect<typeof nativeRouter>({ locator: { kind: 'ticket', ticket: host.ticket() }, expectedPeerId: host.id,
       expectedPrincipal: { id: host.id, subject: host.id, issuer: null, clientId: null, tenantId: null } });
     expect(await outer.rpc.health.query()).toBe('outer-peer-alive');
+    expect((await outer.rpc.large.query()).length).toBe(33 * 1024 * 1024);
+    proven.push('native-node-opt-in-33MiB-RPC-envelope');
     await promisify(execFile)('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
       '-subj', '/CN=localhost', '-keyout', join(directory, 'key.pem'), '-out', join(directory, 'cert.pem')], { timeout: 10_000 });
     let program = '';
@@ -270,6 +281,8 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     const first = await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.inspect());
     expect(first).toMatchObject({ principal: 'owner-a', gateway: gateway.id, calls: 0 });
     proven.push('typed-browser-query-and-authenticated-context');
+    expect(await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.large())).toBe(33 * 1024 * 1024);
+    proven.push('typed-browser-gateway-native-host-33MiB-RPC-envelope');
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.subscribe());
     await expect.poll(() => page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watch)).toEqual(['watch-ready']);
     proven.push('browser-subscription');
