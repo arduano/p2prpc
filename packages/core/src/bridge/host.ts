@@ -17,6 +17,10 @@ export interface BridgeHostOptions<R extends AnyTRPCRouter, M = unknown> {
   readonly authorizeOperation: BridgePeerOptions<R, M>['authorize'];
   readonly onIncomingFile?: BridgePeerOptions<R, M>['incoming'];
   readonly fileMetadataSchema?: BridgePeerOptions<R, M>['fileMetadataSchema'];
+  /** Same logical RPC envelope limit as the browser peer. Carrier chunks and
+   * authentication frames keep their independent small bounds. */
+  readonly frameLimits?: BridgePeerOptions<R, M>['frameLimits'];
+  readonly onError?: BridgePeerOptions<R, M>['onError'];
   readonly limits?: BridgePeerOptions<R, M>['limits'] & { readonly maxPeers?: number };
 }
 interface Entry<M> {
@@ -121,7 +125,9 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
               },
               authorize: options.authorizeOperation, local: { router: options.router, createContext: options.createContext },
               ...(options.onIncomingFile ? { incoming: options.onIncomingFile } : {}),
-              ...(options.fileMetadataSchema ? { fileMetadataSchema: options.fileMetadataSchema } : {}), limits });
+              ...(options.fileMetadataSchema ? { fileMetadataSchema: options.fileMetadataSchema } : {}),
+              ...(options.frameLimits ? { frameLimits: options.frameLimits } : {}),
+              ...(options.onError ? { onError: options.onError } : {}), limits });
             entry = { peerId, identity: identity(user), engine, expiresAt, attaching: false };
             entries.set(key, entry);
             expire(key, entry);
@@ -137,7 +143,11 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
             principal: { id: offer.localPeerId, subject: offer.localPeerId, expiresAt },
             gateway: { peerId: offer.peer.id, principal: publicPrincipal(offer.auth.principal) } });
           admissionSignal.throwIfAborted();
-          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId });
+          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId,
+            ...(options.frameLimits ? { limits: {
+              maxReadBytes: Math.max(1024 * 1024, options.frameLimits.maxControlFrameBytes),
+              maxBufferedBytes: limits.maxBufferedBytes ?? 32 * 1024 * 1024
+            } } : {}) });
           entry.engine.attach(raw, { id: sessionId, principal: user, expiresAt, via: { peerId: offer.peer.id, principal: offer.auth.principal } });
           entry.connection = raw;
           entry.expiresAt = expiresAt;

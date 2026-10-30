@@ -3,6 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { deserializeValue, serializeValue } from '../src/rpc/wire.js';
 
 describe('private RPC value codec', () => {
+  it('keeps the default bound and rejects an opt-in envelope above its configured bound', () => {
+    const value = 'x'.repeat(1024 * 1024 + 1);
+    expect(() => serializeValue(value)).toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }));
+    const limits = { maxControlFrameBytes: 64 * 1024 * 1024 };
+    expect(deserializeValue(serializeValue(value, limits), limits)).toBe(value);
+    expect(() => serializeValue(null, { maxControlFrameBytes: 64 * 1024 * 1024 + 1 }))
+      .toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }));
+  });
   it('round-trips the supported built-in SuperJSON data model', () => {
     const input = {
       date: new Date('2026-01-02T03:04:05.000Z'),

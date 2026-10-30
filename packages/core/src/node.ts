@@ -21,7 +21,7 @@ import type {
   PeerFiles,
   PeerFileShareOptions
 } from './files/types.js';
-import { PROTOCOL_VERSION, StreamKind, readStreamKind, type FrameLimits } from './protocol.js';
+import { PROTOCOL_VERSION, MAX_CONTROL_FRAME_BYTES, StreamKind, readStreamKind, type FrameLimits } from './protocol.js';
 import { irohLink } from './rpc/link.js';
 import type { RpcHeaderInput } from './rpc/headers.js';
 import { RpcServer, type RpcServerRequest } from './rpc/server.js';
@@ -2606,7 +2606,7 @@ function validateLimits(limits: P2PNodeLimits): P2PNodeLimits {
       throw new P2PError('RESOURCE_LIMIT', `${name} must be between ${minimum} and ${maximum}`);
     }
   };
-  integer('maxControlFrameBytes', 1024, 16 * 1024 * 1024);
+  integer('maxControlFrameBytes', 1024, MAX_CONTROL_FRAME_BYTES);
   integer('maxControlFrameItems', 1, 1_000_000);
   integer('maxControlFrameDepth', 1, 256);
   integer('fileChunkSize', 64 * 1024, 16 * 1024 * 1024);

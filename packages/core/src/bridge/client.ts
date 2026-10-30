@@ -57,7 +57,11 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
             throw new P2PError('UNAUTHORIZED', 'Unexpected Bridge Host or resumption identity');
           }
           if (closed) throw new P2PError('DISCONNECTED', 'Browser Bridge closed');
-          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId });
+          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId,
+            ...(options.frameLimits ? { limits: {
+              maxReadBytes: Math.max(1024 * 1024, options.frameLimits.maxControlFrameBytes),
+              maxBufferedBytes: options.limits?.maxBufferedBytes ?? 32 * 1024 * 1024
+            } } : {}) });
           engine ??= createBridgePeer<R, L, M>({ ...options,
             localId: ready.peerId, remoteId: ready.hostId, connection,
             authorize: options.authorize ?? (context => context.action.kind === 'file.pull' ||

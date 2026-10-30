@@ -8,6 +8,10 @@ export const PROTOCOL_VERSION = 5;
 /** Every consumer must require this contract before creating a node. */
 export const SESSION_RENEWAL_CONTRACT = 1 as const;
 
+/** Configurable ceiling, not the default allocation. Larger RPC envelopes must
+ * also fit the peer's existing aggregate buffer reservations. */
+export const MAX_CONTROL_FRAME_BYTES = 64 * 1024 * 1024;
+
 export enum StreamKind {
   Rpc = 1,
   TransferControl = 2,
@@ -166,7 +170,7 @@ function validateFrameLimits(limits: FrameLimits): MessagePackShapeLimits {
   if (
     !Number.isSafeInteger(limits.maxControlFrameBytes) ||
     limits.maxControlFrameBytes < 0 ||
-    limits.maxControlFrameBytes > 16 * 1024 * 1024
+    limits.maxControlFrameBytes > MAX_CONTROL_FRAME_BYTES
   ) {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid control-frame size limit');
   }

@@ -164,6 +164,12 @@ idempotency/history remains authoritative across either process boundary.
 
 ## Resource and compatibility limits
 
+An explicitly configured tRPC `errorFormatter` defines the public error shape
+on both native and bridged RPC, including its client-inferred custom fields.
+It owns which error details are safe to disclose. Routers using tRPC's default
+formatter keep p2prpc's sanitized error response. Diagnostic `onError` callbacks
+run after the response shape is derived and cannot change that disclosure.
+
 - The native root entry retains Node 20.3+. The new optional `/bridge` Host and
   Gateway API requires Node 22+; its upstream message-stream engine uses
   `Promise.withResolvers`. Browser consumers require modern WebSocket, WebCrypto,
@@ -178,8 +184,25 @@ idempotency/history remains authoritative across either process boundary.
   Two Yamux directions implement one logical bidirectional stream so send reset
   and receive stop remain independent. Numeric QUIC reset codes are not carried;
   stream priority is advisory because standard Yamux has no matching scheduler.
+- RPC/control frames default to 1 MiB; both `connectBridge` and
+  `createBridgeHost` may opt into `frameLimits.maxControlFrameBytes` up to 64 MiB.
+  Configure both ends consistently. This also raises the logical exact-read
+  allowance; it does not raise the retained peer's buffer budget automatically.
+  With frame allowance `F`, maximum file chunk `C`, and
+  `limits.maxBufferedBytes = B`, the logical scheduler reserves `2F + 2(C + 1024)`
+  for independent file-control/data directions. Each concurrent general RPC
+  (including a retained subscription) reserves another `F`; choose
+  `B >= 2F + 2(C + 1024) + N*F` for `N` general RPCs. For example, 64 MiB frames,
+  default 4 MiB file chunks and a 512 MiB budget admit five general RPCs alongside
+  the reserved file lanes; 256 MiB admits only one. These are admission
+  reservations, not eager allocations or a process RSS guarantee. Native Peer
+  RPC uses its own global/per-peer/per-principal budgets and must be configured
+  separately when it also carries large RPC frames.
 - Binary WebSocket queues, messages and native carrier packets are bounded.
-  Write promises provide backpressure. The Gateway does not retain whole files.
+  A write resolves after bounded socket admission; it waits when capacity is
+  unavailable, without requiring a complete socket flush after every fragment.
+  This is not delivery or remote-effect evidence. The Gateway does not retain
+  whole files.
 - `memoryDestination` requires an explicit quota, at most 64 MiB; publication can
   temporarily use twice that quota plus protocol lane buffers. It verifies the
   complete BLAKE3 digest immediately before publishing and marking committed.
@@ -191,3 +214,12 @@ idempotency/history remains authoritative across either process boundary.
 - Native Iroh/ALPN/auth/file pins remain unchanged. Release qualification of
   relay reachability, proxies, mobile browsers or cross-machine loads is separate
   from local real-browser/Iroh integration evidence.
+
+The `test/bridge.browser.test.ts` gate runs Chromium over WSS through a real Iroh
+Gateway/Host pair, using disposable local identities and no model providers. Its
+explicit 64 MiB frame / 512 MiB reservation profile verifies a 33 MiB typed RPC
+response, concurrent subscription/query use, observation loss without mutation
+replay, retained file capabilities, exact-byte interrupted-upload recovery, and
+owned cleanup while the borrowed outer Peer stays alive. The transport unit gate
+also checks bounded WebSocket admission and the same premature-EOF classification
+as native streams. These local gates do not qualify public relays or fleet rollout.
