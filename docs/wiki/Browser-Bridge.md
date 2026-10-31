@@ -157,6 +157,13 @@ p2prpc wire codec. This bridge does not claim tRPC HTTP JSONL transport parity.
    Host retains disconnected entries until expiry/revocation, within `maxPeers`.
    Browser close is transport close, not immediate remote-registry deletion.
 
+`peer.expiresAt` exposes the latest verified `BrowserReady` admission deadline in
+Unix milliseconds. Successful carrier reattachment updates it; disconnection or
+close does not invent a later deadline. Once it expires, close the retained
+browser peer and authorize a fresh logical lifetime with `connectBridge` rather
+than keep resending an expired resume secret. Application originals and history
+remain authoritative; a new bridge lifetime never authorizes replaying a mutation.
+
 A full browser reload loses the private owner/secret and creates a new logical
 Peer. There is no durable browser crash/secret recovery promise. A Host process
 restart loses its in-memory bridge registry and file ledgers. Durable application

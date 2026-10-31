@@ -56,7 +56,7 @@ type Router = ReturnType<typeof makeRouter>;
 interface BrowserHarness {
   inspect(): Promise<{ principal: string; peer: string; gateway: string; calls: number }>;
   subscribe(): void;
-  snapshot(): { watch: string[]; watchErrors: number; lost: string; connected: boolean };
+  snapshot(): { watch: string[]; watchErrors: number; lost: string; connected: boolean; expiresAt: number };
   startLost(): void;
   rememberShare(): Promise<void>;
   reconnect(): Promise<void>;
@@ -105,7 +105,7 @@ async function browserMain(
       subscription?.unsubscribe();
       subscription = peer.rpc.watch.subscribe(undefined, { onData: value => { watch.push(value); }, onError: () => { watchErrors += 1; } });
     },
-    snapshot: () => ({ watch: [...watch], watchErrors, lost, connected: peer.diagnostics().connected }),
+    snapshot: () => ({ watch: [...watch], watchErrors, lost, connected: peer.diagnostics().connected, expiresAt: peer.expiresAt }),
     startLost() {
       lost = 'pending';
       void peer.rpc.once.mutate({ originalId: 'observation-loss' }).then(() => { lost = 'completed'; }, () => { lost = 'interrupted'; });
@@ -269,6 +269,9 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     phase = 'rpc';
     const first = await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.inspect());
     expect(first).toMatchObject({ principal: 'owner-a', gateway: gateway.id, calls: 0 });
+    const firstExpiry = await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().expiresAt);
+    expect(firstExpiry).toBe(hostService.diagnostics().entries.find(entry => entry.peerId === first.peer)?.expiresAt);
+    expect(firstExpiry).toBeGreaterThan(Date.now());
     proven.push('typed-browser-query-and-authenticated-context');
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.subscribe());
     await expect.poll(() => page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watch)).toEqual(['watch-ready']);
@@ -284,6 +287,10 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.reconnect());
     const after = await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.inspect());
     expect(after).toMatchObject({ principal: 'owner-a', peer: first.peer, calls: 1 });
+    const reattachedExpiry = await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().expiresAt);
+    expect(reattachedExpiry).toBe(hostService.diagnostics().entries.find(entry => entry.peerId === first.peer)?.expiresAt);
+    expect(reattachedExpiry).toBeGreaterThan(firstExpiry);
+    proven.push('verified-browser-admission-deadline-tracks-carrier-reattachment');
     expect(state.calls).toBe(1);
     proven.push('reply-loss-no-mutation-replay-and-same-logical-peer');
     phase = 'retained-capability-pull';
