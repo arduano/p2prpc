@@ -1,6 +1,6 @@
 {
   "name": "@arduano/p2prpc-core",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": false,
   "description": "Type-safe peer-to-peer tRPC and striped file transfer over Iroh QUIC",
   "type": "module",

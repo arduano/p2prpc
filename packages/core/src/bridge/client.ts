@@ -18,7 +18,12 @@ export interface ConnectBridgeOptions<L extends AnyTRPCRouter = AnyTRPCRouter, M
 
 /** One browser-owned engine and resumption secret, never a persisted identity.
  * Reconnection admits a carrier only; an interrupted RPC is never replayed. */
-export interface BrowserBridgePeer<R extends AnyTRPCRouter, M = unknown> extends Pick<BridgePeer<R, M>, 'rpc' | 'files' | 'diagnostics' | 'close'> { reconnect(): Promise<void>; }
+export interface BrowserBridgePeer<R extends AnyTRPCRouter, M = unknown> extends Pick<BridgePeer<R, M>, 'rpc' | 'files' | 'diagnostics' | 'close'> {
+  /** Latest verified admission deadline (Unix milliseconds). Carrier reattachment
+   * can replace it; expiry requires a new logical browser lifetime, not replay. */
+  readonly expiresAt: number;
+  reconnect(): Promise<void>;
+}
 function publicIdentity(value: z.output<typeof publicPrincipalSchema>) {
   return freezePrincipal({ id: value.id, subject: value.subject, expiresAt: value.expiresAt,
     ...(value.issuer === undefined ? {} : { issuer: value.issuer }),
@@ -33,6 +38,7 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
   let closing: Promise<void> | undefined;
   let resume: string | undefined;
   let peerId: string | undefined;
+  let expiresAt = 0;
   let closed = false;
   const connection = (): Promise<QuicConnection> => {
     if (closed) return Promise.reject(new P2PError('DISCONNECTED', 'Browser Bridge closed'));
@@ -65,7 +71,7 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
           engine.attach(raw, { id: ready.sessionId, expiresAt: ready.expiresAt,
             principal: publicIdentity(ready.principal),
             via: { peerId: ready.gateway.peerId, principal: publicIdentity(ready.gateway.principal) } });
-          resume = ready.resume; peerId = ready.peerId; current = raw;
+          resume = ready.resume; peerId = ready.peerId; expiresAt = ready.expiresAt; current = raw;
           void raw.closed().then(() => { if (current === raw) current = undefined; }, () => {});
           return raw;
         }, channel, undefined, options.limits?.setupTimeoutMs);
@@ -81,6 +87,7 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
   return {
     rpc: admitted.rpc,
     files: admitted.files,
+    get expiresAt() { return expiresAt; },
     diagnostics: () => admitted.diagnostics(),
     reconnect: async (): Promise<void> => { await connection(); },
     close(): Promise<void> {
