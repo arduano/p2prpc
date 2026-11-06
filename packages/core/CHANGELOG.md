@@ -1,5 +1,11 @@
 # @arduano/p2prpc-core
 
+## 0.3.3
+
+### Patch Changes
+
+- Keep unrelated RPCs and subscriptions connected when an observer cancels a pending stream acquisition. Retain late allocation and resource custody until cleanup is proved; real I/O deadlines, transport failures and failed cleanup still retire the connection.
+
 ## 0.3.2
 
 ### Patch Changes
