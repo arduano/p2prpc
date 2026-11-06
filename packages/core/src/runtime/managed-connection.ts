@@ -60,12 +60,9 @@ export class ManagedConnection implements QuicConnection {
     try {
       stream = await abortable(pending, signal, () => {
         cancelled = true;
-        this.quarantine('Bidirectional stream opening was cancelled');
       });
       if (signal.aborted || this.closedForOpens) {
         cancelled = true;
-        this.quarantine('Bidirectional stream opening was cancelled');
-        this.settleLateBi(Promise.resolve(stream), lease);
         throw abortReason(signal);
       }
       // Read adapter-owned properties before transferring the lease to a
@@ -75,8 +72,6 @@ export class ManagedConnection implements QuicConnection {
       const recv = stream.recv;
       if (signal.aborted || this.closedForOpens) {
         cancelled = true;
-        this.quarantine('Bidirectional stream adoption was cancelled');
-        this.settleLateBi(Promise.resolve({ send, recv }), lease);
         throw abortReason(signal);
       }
       const wrapped = this.wrapBi(send, recv, lease);
@@ -86,7 +81,8 @@ export class ManagedConnection implements QuicConnection {
       // Before a native stream exists, rejection settles the owned operation.
       // After one exists, a failed terminal cleanup remains owned until the
       // physical connection's closed() promise confirms teardown.
-      if (cancelled && !stream) {
+      if (cancelled) {
+        this.cancelOpening(signal);
         this.settleLateBi(pending, lease);
       } else if (!stream) {
         this.opening.delete(lease);
@@ -131,12 +127,9 @@ export class ManagedConnection implements QuicConnection {
     try {
       stream = await abortable(pending, signal, () => {
         cancelled = true;
-        this.quarantine('Unidirectional stream opening was cancelled');
       });
       if (signal.aborted || this.closedForOpens) {
         cancelled = true;
-        this.quarantine('Unidirectional stream adoption was cancelled');
-        this.settleLateUni(Promise.resolve(stream), lease);
         throw abortReason(signal);
       }
       const scope = new StreamLease(lease, 1, this.openScopes);
@@ -144,7 +137,8 @@ export class ManagedConnection implements QuicConnection {
       this.opening.delete(lease);
       return wrapped;
     } catch (cause) {
-      if (cancelled && !stream) {
+      if (cancelled) {
+        this.cancelOpening(signal);
         this.settleLateUni(pending, lease);
       } else if (!stream) {
         this.opening.delete(lease);
@@ -210,6 +204,14 @@ export class ManagedConnection implements QuicConnection {
     });
   }
 
+  /** Caller cancellation retires only its acquisition. Real I/O deadlines and
+   * owner shutdown still retire the carrier; late streams remain charged. */
+  private cancelOpening(signal: AbortSignal): void {
+    if (this.signal.aborted || (signal.reason instanceof P2PError && signal.reason.code === 'TIMEOUT')) {
+      this.quarantine('Stream opening timed out or its owner ended');
+    }
+  }
+
   private settleLateBi(pending: Promise<QuicBiStream>, lease: ResourceLease): void {
     void pending.then(async (stream) => {
       const outcomes = await Promise.allSettled([
@@ -219,10 +221,10 @@ export class ManagedConnection implements QuicConnection {
       if (outcomes.every((outcome) => outcome.status === 'fulfilled')) {
         this.releaseOpening(lease);
       } else {
-        this.requestPhysicalClose('Late bidirectional stream cleanup failed');
+        this.quarantine('Late bidirectional stream cleanup failed');
       }
     }, () => this.releaseOpening(lease)).catch(() => {
-      this.requestPhysicalClose('Late bidirectional stream cleanup failed');
+      this.quarantine('Late bidirectional stream cleanup failed');
     });
   }
 
@@ -232,10 +234,10 @@ export class ManagedConnection implements QuicConnection {
         await stream.reset(2n);
         this.releaseOpening(lease);
       } catch {
-        this.requestPhysicalClose('Late unidirectional stream cleanup failed');
+        this.quarantine('Late unidirectional stream cleanup failed');
       }
     }, () => this.releaseOpening(lease)).catch(() => {
-      this.requestPhysicalClose('Late unidirectional stream cleanup failed');
+      this.quarantine('Late unidirectional stream cleanup failed');
     });
   }
 

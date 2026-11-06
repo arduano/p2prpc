@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { HandshakeRateLimiter } from '../src/runtime/rate-limit.js';
+import { P2PError } from '../src/errors.js';
 import { ManagedConnection } from '../src/runtime/managed-connection.js';
 import { DEFAULT_RESOURCE_LIMITS, ResourceScheduler } from '../src/runtime/resources.js';
 import { TaskGroup } from '../src/runtime/task-group.js';
@@ -773,7 +774,7 @@ describe('structured runtime ownership', () => {
     });
   });
 
-  it('promptly rejects a cancelled hung BI open and retains admission until physical closure', async () => {
+  it('retains a cancelled hung BI open without closing unrelated streams', async () => {
     const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
     const nativeOpenStarted = deferred<void>();
     const physicallyClosed = deferred<string>();
@@ -802,9 +803,11 @@ describe('structured runtime ownership', () => {
     controller.abort(new Error('cancel hung BI open'));
 
     await expect(opening).rejects.toThrow('cancel hung BI open');
-    expect(closeRequests).toBe(1);
+    expect(closeRequests).toBe(0);
     expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
 
+    managed.close(0n, new Uint8Array());
+    expect(closeRequests).toBe(1);
     physicallyClosed.resolve('closed');
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
     expect(scheduler.snapshot()).toMatchObject({ peers: 0, principals: 0 });
@@ -877,7 +880,7 @@ describe('structured runtime ownership', () => {
     await expect(managed.closed()).resolves.toBe('stale native session replaced');
   });
 
-  it('promptly rejects a cancelled hung UNI open and retains admission until physical closure', async () => {
+  it('retains a cancelled hung UNI open without closing unrelated streams', async () => {
     const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
     const nativeOpenStarted = deferred<void>();
     const physicallyClosed = deferred<string>();
@@ -907,9 +910,11 @@ describe('structured runtime ownership', () => {
     controller.abort(new Error('cancel hung UNI open'));
 
     await expect(opening).rejects.toThrow('cancel hung UNI open');
-    expect(closeRequests).toBe(1);
+    expect(closeRequests).toBe(0);
     expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
 
+    managed.close(0n, new Uint8Array());
+    expect(closeRequests).toBe(1);
     physicallyClosed.resolve('closed');
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
     expect(scheduler.snapshot()).toMatchObject({ peers: 0, principals: 0 });
@@ -952,10 +957,10 @@ describe('structured runtime ownership', () => {
 
     biController.abort(new Error('cancel late opens'));
     await expect(openingBi).rejects.toThrow('cancel late opens');
-    // Quarantining one physical multiplexed connection cancels every opening
-    // stream on it, independently of which operation first detected failure.
-    await expect(openingUni).rejects.toMatchObject({ code: 'DISCONNECTED' });
-    expect(closeRequests).toBe(1);
+    expect(uniController.signal.aborted).toBe(false);
+    uniController.abort(new Error('cancel other open'));
+    await expect(openingUni).rejects.toThrow('cancel other open');
+    expect(closeRequests).toBe(0);
     expect(scheduler.snapshot().active).toMatchObject({ streams: 2, bufferedBytes: 32 });
 
     biOpened.resolve(biStream);
@@ -965,6 +970,40 @@ describe('structured runtime ownership', () => {
     await expect.poll(() => uniStream.resetCalls).toBe(1);
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
     expect(scheduler.snapshot()).toMatchObject({ peers: 0, principals: 0 });
+  });
+
+  it('quarantines a timed-out managed open and a cancelled late stream whose cleanup fails', async () => {
+    for (const timeout of [true, false]) {
+      const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+      const started = deferred<void>();
+      const opened = deferred<QuicBiStream>();
+      const closed = deferred<string>();
+      let closeRequests = 0;
+      const stream = recordingStream();
+      const managed = new ManagedConnection({
+        ...testConnection(() => { started.resolve(); return opened.promise; }),
+        close: () => { closeRequests++; },
+        closed: () => closed.promise
+      }, scheduler, { peerId: 'peer', principalId: 'principal' }, new AbortController().signal, 16, 16);
+      const controller = new AbortController();
+      const opening = managed.openBi({ signal: controller.signal });
+      const rejected = expect(opening).rejects.toBeDefined();
+      await started.promise;
+      controller.abort(new P2PError(timeout ? 'TIMEOUT' : 'CANCELLED', 'test cancellation'));
+      await rejected;
+      expect(closeRequests).toBe(timeout ? 1 : 0);
+      if (!timeout) {
+        stream.send.reset = async () => { throw new Error('reset failed'); };
+        opened.resolve(stream);
+        await expect.poll(() => closeRequests).toBe(1);
+      }
+      await expect(managed.openBi()).rejects.toMatchObject({ code: 'DISCONNECTED' });
+      expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+      closed.resolve('closed');
+      await scheduler.whenIdle();
+      expect(scheduler.snapshot().active.streams).toBe(0);
+      if (timeout) opened.resolve(stream);
+    }
   });
 
   it('releases a pending stream-open lease and closes a stream which arrives after connection close', async () => {

@@ -143,11 +143,12 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           try {
             stream = await withDeadline(opening, ioTimeoutMs, 'RPC stream opening timed out', controller);
           } catch (cause) {
-            // A native open which has not settled cannot be cancelled safely at
-            // the JavaScript seam. Quarantine even custom/raw transports; a
-            // ManagedConnection additionally retains its admission lease until
-            // native rejection, terminal late-stream cleanup, or physical close.
-            if (!openingSettled) requestConnectionClose(connection, 'RPC stream opening was cancelled');
+            // Observer cancellation does not retire a shared carrier. Keep the
+            // pending acquisition owned and clean any late stream below. A real
+            // I/O timeout still fences a transport which cannot finish opening.
+            if (!openingSettled && cause instanceof P2PError && cause.code === 'TIMEOUT') {
+              requestConnectionClose(connection, 'RPC stream opening timed out');
+            }
             void opening.then(
               async (lateStream) => {
                 const cleaned = await cleanupRpcStream(

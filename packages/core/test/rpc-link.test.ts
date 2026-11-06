@@ -2,6 +2,8 @@ import { createTRPCProxyClient } from '@trpc/client';
 import { initTRPC } from '@trpc/server';
 import { describe, expect, it } from 'vitest';
 import { RpcFrameKind, readFrame, writeFrame } from '../src/protocol.js';
+import { ManagedConnection } from '../src/runtime/managed-connection.js';
+import { DEFAULT_RESOURCE_LIMITS, ResourceScheduler } from '../src/runtime/resources.js';
 import { irohLink } from '../src/rpc/link.js';
 import { serializeValue, type RpcRequest } from '../src/rpc/wire.js';
 import type {
@@ -122,6 +124,65 @@ describe('RPC link flow-control boundaries', () => {
     expect(closeCalls).toBe(1);
     opened.resolve(stream);
     await waitUntil(() => stream.send.resetCalls === 1 && stream.recv.stopCalls === 1);
+  });
+
+  it.each([false, true])('isolates a cancelled pending query from an active subscription (managed: %s)', async (managed) => {
+    const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+    const waiting = deferred<QuicBiStream>();
+    const started = deferred<void>();
+    const watched = testStream();
+    const late = testStream();
+    const reply = testStream();
+    respondWithPong(reply);
+    let request: RpcRequest;
+    watched.send.afterWrite = async (index, bytes) => {
+      if (index !== 3) return;
+      request = (await readFrame<RpcRequest>(new BufferedRecv(bytes.slice(1)))).value;
+      await writeFrame(watched.recv, RpcFrameKind.Data, { id: request.id, data: serializeValue('before') });
+    };
+    let opens = 0;
+    let closes = 0;
+    const raw = testConnection(async () => {
+      if (++opens === 1) return watched;
+      if (opens === 2) { started.resolve(); return waiting.promise; }
+      return reply;
+    });
+    raw.close = () => { closes++; };
+    const connection = managed
+      ? new ManagedConnection(raw, scheduler, { peerId: 'remote', principalId: 'viewer' }, new AbortController().signal, 1024, 1024)
+      : raw;
+    const client = testClient({ connection: async () => connection, ioTimeoutMs: 1000 });
+    const values: string[] = [];
+    const errors: unknown[] = [];
+    const subscription = client.stream.subscribe(undefined, {
+      onData: value => values.push(value), onError: error => errors.push(error)
+    });
+    try {
+      await waitUntil(() => values.length === 1);
+      const controller = new AbortController();
+      const cancelled = client.ping.query(undefined, { signal: controller.signal });
+      const rejected = expect(cancelled).rejects.toBeDefined();
+      await started.promise;
+      controller.abort();
+      await rejected;
+      expect(closes).toBe(0);
+      if (managed) expect(scheduler.snapshot().active.streams).toBe(2);
+      await writeFrame(watched.recv, RpcFrameKind.Data, { id: request!.id, data: serializeValue('after') });
+      await expect(client.ping.query()).resolves.toBe('pong');
+      await waitUntil(() => values.length === 2);
+      expect(values).toEqual(['before', 'after']);
+      expect(errors).toEqual([]);
+      waiting.resolve(late);
+      await waitUntil(() => late.send.resetCalls === 1 && late.recv.stopCalls === 1);
+      expect(late.send.writeCalls).toBe(0);
+      expect(closes).toBe(0);
+      if (managed) expect(scheduler.snapshot().active.streams).toBe(1);
+    } finally {
+      waiting.resolve(late);
+      subscription.unsubscribe();
+      await waitUntil(() => watched.send.resetCalls === 1 && watched.recv.stopCalls === 1);
+      if (managed) await scheduler.whenIdle();
+    }
   });
 
   it('bounds stalled stream-priority setup and closes both stream halves', async () => {

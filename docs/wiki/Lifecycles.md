@@ -92,7 +92,7 @@ The client never automatically retries an RPC. Cancellation before a complete re
 
 Setup and individual transport operations have deadlines. Waiting for a long-running procedure or the next subscription item is controlled by the caller's `AbortSignal`; there is no hidden 30-second response-liveness timer or protocol heartbeat.
 
-RPC and file deadlines propagate into stream admission. Cancellation while queued removes the request without opening QUIC. If it races a native open that JavaScript cannot revoke, the caller still fails promptly, the physical connection is quarantined, and the stream/buffer lease remains owned until the native open rejects, a late stream is reset/stopped, or physical closure fulfills. This prevents repeated timed-out opens from silently exhausting a long-lived connection's capacity.
+RPC and file deadlines propagate into stream admission. Cancellation while queued removes the request without opening QUIC. If observer cancellation races a native open that JavaScript cannot revoke, the caller still fails promptly while unrelated streams stay connected. The pending open and stream/buffer lease remain owned until native rejection, terminal reset/stop of a late stream, or fulfilled physical closure. Cancellation never claims that allocation disappeared. Real I/O deadlines, native-open failure, owner shutdown and failed late-stream cleanup still quarantine the physical connection; retained cancellation leases remain bounded by the existing scheduler.
 
 ## Push transfer
 

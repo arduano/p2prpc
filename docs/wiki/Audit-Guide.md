@@ -51,7 +51,7 @@ For every asynchronous start, answer:
 4. Which success, failure, timeout, cancellation, late-result, and shutdown paths terminate it?
 5. Is release exact-once, and does a timed-out underlying promise remain accounted until settlement?
 
-For outbound BI and UNI opens, test four distinct boundaries: pre-abort performs no native call or admission; cancellation of a never-settling native open rejects promptly and requests physical close; its lease stays visible until fulfilled closure; and a late stream is terminally reset/stopped before the lease disappears. A rejected `closed()` promise must never release the lease.
+For outbound BI and UNI opens, test four distinct boundaries: pre-abort performs no native call or admission; cancellation of a never-settling native open rejects promptly while unrelated operations remain usable; its lease stays visible until native settlement or fulfilled closure; and a late stream is terminally reset/stopped before the lease disappears. Separately prove that true I/O timeout, native opening failure and failed late cleanup retire the carrier. A rejected `closed()` promise must never release the lease.
 
 Inspect requests larger than each per-principal ceiling: they must reject immediately rather than queue forever. Verify fair queues are bounded and active scheduler leases remain visible until their actual logical owners settle.
 
