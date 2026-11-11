@@ -10,9 +10,9 @@ export const publicPrincipalSchema = z.object({
   id, subject: id, issuer: id.optional(), clientId: id.optional(), tenantId: id.optional(),
   expiresAt: z.number().int().positive()
 }).strict();
-export const helloSchema = z.object({ version: z.literal(1), resume: z.string().min(32).max(128).optional() }).strict();
+export const helloSchema = z.object({ version: z.literal(2), resume: z.string().min(32).max(128).optional() }).strict();
 export const readySchema = z.object({
-  version: z.literal(1), hostId: id, peerId: id, sessionId: id,
+  version: z.literal(2), hostId: id, peerId: id, sessionId: id,
   resume: z.string().min(32).max(128), expiresAt: z.number().int().positive(),
   principal: publicPrincipalSchema,
   gateway: z.object({ peerId: id, principal: publicPrincipalSchema }).strict()

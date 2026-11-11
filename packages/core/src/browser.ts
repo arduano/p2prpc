@@ -17,3 +17,5 @@ export type { P2PErrorCode } from './errors.js';
 export type {
   SessionPrincipal, AuthorizationContext, AuthorizationAction, AuthorizationResult
 } from './security/types.js';
+
+export { RpcMessageBudget } from './rpc/messages.js';

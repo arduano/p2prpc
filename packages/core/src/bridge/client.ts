@@ -53,17 +53,19 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
       try {
         return await admission(async admissionSignal => {
           const control = controlChannel(channel);
-          await control.write(62, { version: 1, ...(resume ? { resume } : {}) });
+          await control.write(62, { version: 2, ...(resume ? { resume } : {}) });
           const frame = await control.read();
           if (frame.kind !== 63) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Expected BrowserReady');
           admissionSignal.throwIfAborted();
-          const ready = readySchema.parse(frame.value);
+          const parsed = readySchema.safeParse(frame.value);
+          if (!parsed.success) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Unsupported BrowserReady contract');
+          const ready = parsed.data;
           if (ready.hostId !== options.expectedHostId || ready.principal.id !== ready.hostId || ready.principal.subject !== ready.hostId ||
             (peerId !== undefined && (peerId !== ready.peerId || resume !== ready.resume))) {
             throw new P2PError('UNAUTHORIZED', 'Unexpected Bridge Host or resumption identity');
           }
           if (closed) throw new P2PError('DISCONNECTED', 'Browser Bridge closed');
-          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId });
+          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId, limits: { maxStreams: options.limits?.maxStreams ?? 64 } });
           engine ??= createBridgePeer<R, L, M>({ ...options,
             localId: ready.peerId, remoteId: ready.hostId, connection,
             authorize: options.authorize ?? (context => context.action.kind === 'file.pull' ||

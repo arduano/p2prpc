@@ -3,7 +3,7 @@ import { Packr } from 'msgpackr';
 import { P2PError } from './errors.js';
 import type { QuicRecvStream, QuicSendStream } from './transport/types.js';
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** Every consumer must require this contract before creating a node. */
 export const SESSION_RENEWAL_CONTRACT = 1 as const;
@@ -100,18 +100,29 @@ export async function writeFrame(
   limits: FrameLimits = DEFAULT_FRAME_LIMITS
 ): Promise<void> {
   if (!Number.isSafeInteger(kind) || kind < 0 || kind > 255) throw new P2PError('INVALID_FRAME', 'Invalid frame kind');
+  const body = encodeFrameBody(value, limits);
+  await writeFrameBody(send, kind, body);
+}
+
+/** Conservative count before any encoded body is allocated. */
+export function measureFrameValue(value: unknown, limits: FrameLimits): number {
+  return validateOutboundValue(value, limits.maxControlFrameBytes, validateFrameLimits(limits));
+}
+
+export function encodeFrameBody(value: unknown, limits: FrameLimits): Uint8Array {
   const shapeLimits = validateFrameLimits(limits);
   validateOutboundValue(value, limits.maxControlFrameBytes, shapeLimits);
   let body: Uint8Array;
-  try {
-    body = frameCodec.pack(value);
-  } catch (cause) {
-    throw new P2PError('INVALID_FRAME', 'Outbound frame is not serializable plain data', { cause });
-  }
+  try { body = frameCodec.pack(value); }
+  catch (cause) { throw new P2PError('INVALID_FRAME', 'Outbound frame is not serializable plain data', { cause }); }
   if (body.byteLength > limits.maxControlFrameBytes) {
     throw new P2PError('RESOURCE_LIMIT', `Outbound frame length ${body.byteLength} exceeds ${limits.maxControlFrameBytes}`);
   }
   validateMessagePack(body, shapeLimits);
+  return body;
+}
+
+export async function writeFrameBody(send: QuicSendStream, kind: number, body: Uint8Array): Promise<void> {
   const length = encodeVarint(body.byteLength);
   const header = new Uint8Array(1 + length.byteLength);
   header[0] = kind;
@@ -120,27 +131,38 @@ export async function writeFrame(
   await send.writeAll(body);
 }
 
-export async function readFrame<T = unknown>(
-  recv: QuicRecvStream,
-  limits: FrameLimits = DEFAULT_FRAME_LIMITS
-): Promise<Frame<T>> {
-  const shapeLimits = validateFrameLimits(limits);
+export async function readFrameHeader(recv: QuicRecvStream, limits: FrameLimits): Promise<{ kind: number; length: number }> {
+  validateFrameLimits(limits);
   const kind = (await recv.readExact(1))[0];
   if (kind === undefined) throw new P2PError('INVALID_FRAME', 'Missing frame kind');
   const length = await readVarint(recv);
   if (length > limits.maxControlFrameBytes) {
     throw new P2PError('RESOURCE_LIMIT', `Frame length ${length} exceeds ${limits.maxControlFrameBytes}`);
   }
-  let value: T;
+  return { kind, length };
+}
+
+export async function readFrameBody<T>(recv: QuicRecvStream, length: number, limits: FrameLimits): Promise<T> {
   try {
-    const body = await recv.readExact(length);
-    validateMessagePack(body, shapeLimits);
-    value = frameCodec.unpack(body) as T;
+    // The caller admits this body first. Carrier reads remain small, so the
+    // logical transport's window does not need a second whole-body allocation.
+    const body = new Uint8Array(length);
+    for (let offset = 0; offset < length;) {
+      const chunk = await recv.readExact(Math.min(16 * 1024, length - offset));
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    validateMessagePack(body, validateFrameLimits(limits));
+    return frameCodec.unpack(body) as T;
   } catch (cause) {
     if (cause instanceof P2PError) throw cause;
     throw new P2PError('INVALID_FRAME', 'Invalid MessagePack frame', { cause });
   }
-  return { kind, value };
+}
+
+export async function readFrame<T = unknown>(recv: QuicRecvStream, limits: FrameLimits = DEFAULT_FRAME_LIMITS): Promise<Frame<T>> {
+  const { kind, length } = await readFrameHeader(recv, limits);
+  return { kind, value: await readFrameBody<T>(recv, length, limits) };
 }
 
 interface MessagePackShapeLimits {
@@ -166,7 +188,7 @@ function validateFrameLimits(limits: FrameLimits): MessagePackShapeLimits {
   if (
     !Number.isSafeInteger(limits.maxControlFrameBytes) ||
     limits.maxControlFrameBytes < 0 ||
-    limits.maxControlFrameBytes > 16 * 1024 * 1024
+    limits.maxControlFrameBytes > 64 * 1024 * 1024
   ) {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid control-frame size limit');
   }
@@ -191,7 +213,7 @@ function validateOutboundValue(
   value: unknown,
   maxBytes: number,
   limits: MessagePackShapeLimits
-): void {
+): number {
   const state: OutboundShapeState = {
     ...limits,
     maxBytes,
@@ -200,6 +222,7 @@ function validateOutboundValue(
     estimatedBytes: 0
   };
   visitOutboundValue(value, 0, state);
+  return state.estimatedBytes;
 }
 
 function visitOutboundValue(value: unknown, depth: number, state: OutboundShapeState): void {

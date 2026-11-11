@@ -5,3 +5,5 @@ export { relayBridge } from './bridge/gateway.js';
 export type { NativeBridgeOffer, OpenBridgeOptions } from './bridge/native.js';
 export type { BridgeContext, BridgePeerDiagnostics } from './bridge/contracts.js';
 export type { BinaryWebSocket } from './bridge/transport/contracts.js';
+
+export { RpcMessageBudget } from './rpc/messages.js';

@@ -6,28 +6,26 @@ import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
 import { P2PError, asP2PError } from '../errors.js';
 import { containsUnsafeDisplayCharacters, sanitizeBoundedDisplayText } from '../text.js';
 import {
-  DEFAULT_FRAME_LIMITS,
   RpcFrameKind,
-  readFrame,
-  writeFrame,
   type FrameLimits
 } from '../protocol.js';
 import type { QuicBiStream } from '../transport/types.js';
 import { exactRecord } from '../wire-schema.js';
 import { portableRpcHeaders, type RpcHeaderPolicy, type RpcHeaderLimits, type RpcHeaders } from './portable-headers.js';
 import {
-  deserializeValue,
   isAsyncIterable,
-  serializeValue,
   type RpcFailure,
   type RpcRequest
 } from './wire.js';
+
+import { DEFAULT_RPC_FRAME_LIMITS, RpcMessageBudget, readRpcFrame, writeRpcFrame } from './messages.js';
 
 export interface RpcServerOptions<TRouter extends AnyTRPCRouter> {
   readonly router: TRouter;
   readonly createContext: (request: RpcServerRequest) => Promise<inferRouterContext<TRouter>> | inferRouterContext<TRouter>;
   readonly authorize: (request: RpcRequest, signal: AbortSignal) => Promise<void> | void;
   readonly frameLimits?: FrameLimits;
+  readonly rpcMessages?: RpcMessageBudget;
   readonly headerLimits: RpcHeaderLimits;
   readonly maxPathBytes: number;
   readonly setupTimeoutMs: number;
@@ -57,11 +55,15 @@ export type RpcWorkTracker = (work: Promise<unknown>) => void;
 
 export class RpcServer<TRouter extends AnyTRPCRouter> {
   private readonly ioTimeoutMs: number;
+  private readonly messages: RpcMessageBudget;
+  private readonly frameLimits: FrameLimits;
 
   constructor(
     private readonly options: RpcServerOptions<TRouter>,
     private readonly headerPolicy: RpcHeaderPolicy = portableRpcHeaders
   ) {
+    this.messages = options.rpcMessages ?? new RpcMessageBudget();
+    this.frameLimits = options.frameLimits ?? DEFAULT_RPC_FRAME_LIMITS;
     validateTimeout(options.setupTimeoutMs, 'RPC setup timeout');
     this.ioTimeoutMs = options.ioTimeoutMs ?? options.setupTimeoutMs;
     validateTimeout(this.ioTimeoutMs, 'RPC I/O timeout');
@@ -92,7 +94,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
         trackWork
       );
       const first = await this.ioOperation(
-        readFrame<RpcRequest>(stream.recv, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS),
+        readRpcFrame<RpcRequest>(stream.recv, this.messages, this.frameLimits, requestSignal),
         'RPC request frame timed out',
         controller,
         requestSignal,
@@ -104,7 +106,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
       const currentRequest = request;
       cancelTask = (async () => {
         try {
-          const frame = await readFrame(stream.recv, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS);
+          const frame = await readRpcFrame(stream.recv, this.messages, this.frameLimits, requestSignal);
           if (terminal) return;
           if (frame.kind !== RpcFrameKind.Cancel || !hasRequestId(frame.value, currentRequest.id)) {
             throw new P2PError('INVALID_FRAME', 'Invalid RPC cancellation frame');
@@ -153,10 +155,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
           ctx: context!,
           batchIndex: 0,
           signal: requestSignal,
-          getRawInput: async () => deserializeValue(
-            currentRequest.input,
-            this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
-          )
+          getRawInput: async () => currentRequest.input
         }), trackWork);
       const result = await withAbort(procedure, requestSignal);
 
@@ -172,10 +171,10 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
               break;
             }
             this.options.assertActive?.();
-            await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
+            await this.ioOperation(writeRpcFrame(stream.send, RpcFrameKind.Data, {
               id: currentRequest.id,
-              data: serializeValue(item.value, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
-            }, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+              data: item.value
+            }, this.messages, this.frameLimits, requestSignal), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
           }
         } finally {
           // Serialization, transport writes, and local teardown can all end a
@@ -189,20 +188,20 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
       } else {
         requestSignal.throwIfAborted();
         this.options.assertActive?.();
-        await this.ioOperation(writeFrame(stream.send, RpcFrameKind.Data, {
+        await this.ioOperation(writeRpcFrame(stream.send, RpcFrameKind.Data, {
           id: currentRequest.id,
-          data: serializeValue(result, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS)
-        }, this.options.frameLimits ?? DEFAULT_FRAME_LIMITS), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
+          data: result
+        }, this.messages, this.frameLimits, requestSignal), 'RPC response write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
       }
 
       requestSignal.throwIfAborted();
       this.options.assertActive?.();
       terminal = true;
-      await this.ioOperation(writeFrame(
+      await this.ioOperation(writeRpcFrame(
         stream.send,
         RpcFrameKind.Complete,
         { id: currentRequest.id },
-        this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
+        this.messages, this.frameLimits, requestSignal
       ), 'RPC completion write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
       await this.ioOperation(stream.send.finish(), 'RPC response finish timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
       sendFinished = true;
@@ -223,11 +222,11 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
         if (request && !requestSignal.aborted) {
           const failure: RpcFailure = { id: request.id, shape };
           try {
-            await this.ioOperation(writeFrame(
+            await this.ioOperation(writeRpcFrame(
               stream.send,
               RpcFrameKind.Error,
-              failure,
-              this.options.frameLimits ?? DEFAULT_FRAME_LIMITS
+              { ...failure },
+              this.messages, this.frameLimits, requestSignal
             ), 'RPC error write timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
             await this.ioOperation(stream.send.finish(), 'RPC error finish timed out', controller, requestSignal, this.ioTimeoutMs, trackWork);
             sendFinished = true;

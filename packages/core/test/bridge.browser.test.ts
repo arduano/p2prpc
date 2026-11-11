@@ -30,6 +30,7 @@ function deferred() {
 function makeRouter(state: { calls: number; subscriptions: number; released: ReturnType<typeof deferred>; entered: ReturnType<typeof deferred> }) {
   const t = initTRPC.context<BridgeContext>().create();
   return t.router({
+    large: t.procedure.input(z.object({ bytes: z.number().int().min(1).max(32 * 1024 * 1024), count: z.number().int().min(1).max(20) })).query(({ input }) => ({ turn: { items: Array.from({ length: input.count }, (_, id) => ({ id, type: 'agentMessage', text: 'x'.repeat(input.bytes) })) } })),
     inspect: t.procedure.query(({ ctx }) => ({ principal: ctx.bridge.principal.id, peer: ctx.bridge.peerId,
       gateway: ctx.bridge.via.peerId, calls: state.calls })),
     once: t.procedure.input(z.object({ originalId: z.literal('observation-loss') })).mutation(async ({ input }) => {
@@ -54,6 +55,7 @@ function makeRouter(state: { calls: number; subscriptions: number; released: Ret
 }
 type Router = ReturnType<typeof makeRouter>;
 interface BrowserHarness {
+  large(bytes: number, count: number): Promise<{ count: number; lengths: number[]; intact: boolean }>;
   inspect(): Promise<{ principal: string; peer: string; gateway: string; calls: number }>;
   subscribe(): void;
   snapshot(): { watch: string[]; watchErrors: number; lost: string; connected: boolean; expiresAt: number };
@@ -100,6 +102,10 @@ async function browserMain(
   let shared: Awaited<ReturnType<typeof peer.rpc.file.query>> | undefined;
   let push: Promise<{ id: string; resumed: boolean; size: number }> | undefined;
   const harness: BrowserHarness = {
+    async large(bytes, count) {
+      const result = await peer.rpc.large.query({ bytes, count });
+      return { count: result.turn.items.length, lengths: result.turn.items.map(item => item.text.length), intact: result.turn.items.every(item => item.text === "x".repeat(bytes)) };
+    },
     inspect: () => peer.rpc.inspect.query(),
     subscribe() {
       subscription?.unsubscribe();
@@ -136,7 +142,7 @@ async function browserMain(
         const channel = duplex(new WebSocket(url));
         try {
           const handshake = control(channel);
-          await handshake.write(62, { version: 1, ...(resume ? { resume } : {}) });
+          await handshake.write(62, { version: 2, ...(resume ? { resume } : {}) });
           const frame = await handshake.read();
           if (frame.kind !== 63) throw new Error('No BrowserReady');
           return ready.parse(frame.value);
@@ -276,6 +282,13 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.subscribe());
     await expect.poll(() => page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watch)).toEqual(['watch-ready']);
     proven.push('browser-subscription');
+    for (const [bytes, count] of [[1_200_000, 1], [60_000, 20], [32 * 1024 * 1024 - 1024, 1]] as const) {
+      expect(await page.evaluate(([size, items]) => (globalThis as BrowserGlobal).bridgeHarness.large(size!, items!), [bytes, count]))
+        .toEqual({ count, lengths: Array.from({ length: count }, () => bytes), intact: true });
+      expect(await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watchErrors)).toBe(0);
+      expect(await outer.rpc.health.query()).toBe('outer-peer-alive');
+    }
+    proven.push('near-native-limit-RPC-envelopes-through-browser-WSS-Iroh-with-unrelated-watch-retained');
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.rememberShare());
     await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.startLost());
     await state.entered.promise;

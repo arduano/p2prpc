@@ -35,3 +35,5 @@ export type {
   QuicSendStream,
   StreamOpenOptions
 } from './transport/types.js';
+
+export { RpcMessageBudget } from './rpc/messages.js';

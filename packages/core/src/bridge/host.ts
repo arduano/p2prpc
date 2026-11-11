@@ -1,3 +1,4 @@
+import { RpcMessageBudget } from '../rpc/messages.js';
 import type { AnyTRPCRouter } from '@trpc/server';
 import { P2PError } from '../errors.js';
 import { randomToken, randomUuid, sha256Hex, unrefTimer } from '../platform.js';
@@ -11,6 +12,7 @@ import { createBridgePeer } from './peer.js';
 import { fromByteDuplex } from './transport/index.js';
 
 export interface BridgeHostOptions<R extends AnyTRPCRouter, M = unknown> {
+  readonly rpcMessages?: RpcMessageBudget;
   readonly router: R;
   readonly createContext: NonNullable<BridgePeerOptions<R, M>['local']>['createContext'];
   readonly authorizeDelegation: (offer: NativeBridgeOffer) => SessionPrincipal | Promise<SessionPrincipal>;
@@ -50,6 +52,7 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
   if (!Number.isSafeInteger(maxPeers) || maxPeers < 1 || maxPeers > 4096) throw new P2PError('RESOURCE_LIMIT', 'Invalid Bridge Host capacity');
   const entries = new Map<string, Entry<M>>();
   const tasks = new TaskGroup('Bridge Host');
+  const messages = options.rpcMessages ?? new RpcMessageBudget();
   const channels = new Set<NativeBridgeOffer['channel']>();
   let closed = false;
   let admitting = 0;
@@ -90,7 +93,9 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
           const frame = await control.read();
           if (frame.kind !== 62) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Expected BrowserHello');
           admissionSignal.throwIfAborted();
-          const hello = helloSchema.parse(frame.value);
+          const parsed = helloSchema.safeParse(frame.value);
+          if (!parsed.success) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Unsupported BrowserHello contract');
+          const hello = parsed.data;
           const resume = hello.resume ?? randomToken();
           const key = sha256Hex(resume);
           let entry = entries.get(key);
@@ -119,6 +124,7 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
                 }
                 return entry!.waiting.promise;
               },
+              rpcMessages: messages,
               authorize: options.authorizeOperation, local: { router: options.router, createContext: options.createContext },
               ...(options.onIncomingFile ? { incoming: options.onIncomingFile } : {}),
               ...(options.fileMetadataSchema ? { fileMetadataSchema: options.fileMetadataSchema } : {}), limits });
@@ -133,11 +139,11 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
           admissionSignal.throwIfAborted();
           if (closed || entry.retiring) throw new P2PError('DISCONNECTED', 'Bridge Host closed');
           const sessionId = randomUuid();
-          await control.write(63, { version: 1, hostId: offer.localPeerId, peerId: entry.peerId, sessionId, resume, expiresAt,
+          await control.write(63, { version: 2, hostId: offer.localPeerId, peerId: entry.peerId, sessionId, resume, expiresAt,
             principal: { id: offer.localPeerId, subject: offer.localPeerId, expiresAt },
             gateway: { peerId: offer.peer.id, principal: publicPrincipal(offer.auth.principal) } });
           admissionSignal.throwIfAborted();
-          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId });
+          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId, limits: { maxStreams: limits.maxStreams ?? 64 } });
           entry.engine.attach(raw, { id: sessionId, principal: user, expiresAt, via: { peerId: offer.peer.id, principal: offer.auth.principal } });
           entry.connection = raw;
           entry.expiresAt = expiresAt;
@@ -157,8 +163,10 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
     async close(): Promise<void> {
       closed = true;
       const reason = new P2PError('DISCONNECTED', 'Bridge Host closed');
+      if (!options.rpcMessages) messages.close();
       const cleanup = [...entries].map(([key, entry]) => retire(key, entry)).concat([...channels].map(channel => Promise.resolve().then(() => channel.close(reason)).then(() => channel.closed)));
       for (const work of cleanup) tasks.track(work);
+      if (!options.rpcMessages) tasks.track(messages.whenIdle());
       await tasks.close(reason, { timeoutMs: limits.shutdownTimeoutMs ?? 5_000 });
       const results = await Promise.allSettled(cleanup);
       const failures = results.filter((value): value is PromiseRejectedResult => value.status === 'rejected');

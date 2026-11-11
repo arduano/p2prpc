@@ -1,3 +1,4 @@
+import { RpcMessageBudget } from '../rpc/messages.js';
 import { createTRPCProxyClient, type CreateTRPCClient } from '@trpc/client';
 import { initTRPC, type AnyTRPCRouter } from '@trpc/server';
 import { P2PError, asP2PError } from '../errors.js';
@@ -49,11 +50,13 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
   private readonly receiver: ReceiverOperationLedger;
   private readonly transfers: TransferManager<M>;
   private readonly resources: ResourceScheduler;
+  private readonly messages: RpcMessageBudget;
   private readonly limits: BridgePeerLimits;
   private epoch: Epoch | undefined;
   private closed = false;
 
   constructor(private readonly options: BridgePeerOptions<L, M>) {
+    this.messages = options.rpcMessages ?? new RpcMessageBudget();
     validId(options.localId); validId(options.remoteId);
     if (typeof options.connection !== 'function' || typeof options.authorize !== 'function') {
       throw new P2PError('INVALID_FRAME', 'Bridge connection and authorization are required');
@@ -92,7 +95,7 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
     });
     this.rpc = createTRPCProxyClient<R>({ links: [irohLink({
       connection: async () => (await this.connection()).connection,
-      frameLimits: options.frameLimits ?? DEFAULT_FRAME_LIMITS,
+      rpcMessages: this.messages,
       headerLimits: options.headerLimits ?? DEFAULT_RPC_HEADER_LIMITS,
       ioTimeoutMs: this.limits.ioTimeoutMs,
       ...(options.getRequestHeaders ? { getRequestHeaders: async (request) => this.callback(await this.connection(), request.signal, () => options.getRequestHeaders!(request)) } : {})
@@ -152,7 +155,7 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
   diagnostics() {
     return Object.freeze({ connected: this.epoch !== undefined && !this.epoch.controller.signal.aborted && !this.closed,
       closed: this.closed, sessionId: this.epoch?.session.id ?? null, tasks: this.tasks.size,
-      resources: this.resources.snapshot(), shares: this.shares.diagnostics(), files: this.transfers.diagnostics() });
+      resources: this.resources.snapshot(), messages: this.messages.diagnostics(), shares: this.shares.diagnostics(), files: this.transfers.diagnostics() });
   }
 
   async close(reason = 'Bridge Peer closed'): Promise<void> {
@@ -161,6 +164,7 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
     this.transfers.close(failure); this.shares.close(failure); this.resources.close(failure);
     if (this.epoch && !this.epoch.closed) this.quarantine(this.epoch, failure.message);
     this.tasks.track(this.resources.whenIdle());
+    if (!this.options.rpcMessages) { this.messages.close(); this.tasks.track(this.messages.whenIdle()); }
     await this.tasks.close(failure, { timeoutMs: this.limits.shutdownTimeoutMs });
     this.receiver.close();
   }
@@ -242,7 +246,7 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
       createContext: (request) => this.context(epoch, request),
       authorize: (request, signal) => this.authorize(epoch, { kind: 'rpc', path: request.path, type: request.type, headers: request.headers }, signal),
       headerLimits: this.options.headerLimits ?? DEFAULT_RPC_HEADER_LIMITS, maxPathBytes: this.options.maxPathBytes ?? 1024,
-      frameLimits: this.options.frameLimits ?? DEFAULT_FRAME_LIMITS, setupTimeoutMs: this.limits.setupTimeoutMs,
+      rpcMessages: this.messages, setupTimeoutMs: this.limits.setupTimeoutMs,
       ioTimeoutMs: this.limits.ioTimeoutMs, sessionSignal: epoch.controller.signal, assertActive: () => this.active(epoch),
       onError: (error) => this.report(error) });
     while (!epoch.controller.signal.aborted && !this.closed) {
@@ -253,7 +257,7 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
         this.active(epoch);
         if (kind !== StreamKind.Rpc && kind !== StreamKind.TransferControl) throw new P2PError('INVALID_FRAME', 'Invalid logical bidirectional stream kind');
         const lease = this.resources.tryAcquire(this.owner(epoch), { streams: 1,
-          bufferedBytes: (this.options.frameLimits ?? DEFAULT_FRAME_LIMITS).maxControlFrameBytes,
+          bufferedBytes: kind === StreamKind.TransferControl ? (this.options.frameLimits ?? DEFAULT_FRAME_LIMITS).maxControlFrameBytes : 0,
           ...(kind === StreamKind.TransferControl ? { fileControl: 'inbound' as const } : {}) });
         if (!lease) throw new P2PError('RESOURCE_LIMIT', 'Bridge stream capacity unavailable');
         const owned = stream; stream = undefined;

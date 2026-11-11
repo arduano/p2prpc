@@ -1,3 +1,4 @@
+import type { RpcMessageBudget } from '../rpc/messages.js';
 import type { CreateTRPCClient } from '@trpc/client';
 import type { AnyTRPCRouter, inferRouterContext } from '@trpc/server';
 import type { FileTransferDiagnostics } from '../files/manager.js';
@@ -59,7 +60,10 @@ export interface BridgePeerOptions<LocalRouter extends AnyTRPCRouter, M = unknow
   readonly getRequestHeaders?: (request: {
     readonly path: string; readonly type: 'query' | 'mutation' | 'subscription'; readonly signal: AbortSignal;
   }) => RpcHeaderInput | undefined | Promise<RpcHeaderInput | undefined>;
+  /** Small file-control frames, independent of RPC envelopes. */
   readonly frameLimits?: FrameLimits;
+  /** Shared across all peers belonging to the same application runtime. */
+  readonly rpcMessages?: RpcMessageBudget;
   readonly headerLimits?: RpcHeaderLimits;
   readonly maxPathBytes?: number;
   readonly fileLimits?: Partial<FileTransferLimits>;
@@ -74,6 +78,7 @@ export interface BridgePeerDiagnostics {
   readonly sessionId: string | null;
   readonly tasks: number;
   readonly resources: ResourceSnapshot;
+  readonly messages: ReturnType<RpcMessageBudget['diagnostics']>;
   readonly shares: ShareRegistryDiagnostics;
   readonly files: FileTransferDiagnostics;
 }
