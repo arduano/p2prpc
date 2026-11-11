@@ -15,6 +15,7 @@ import type { controlChannel, readySchema } from '../src/bridge/control.js';
 import type { BridgeContext } from '../src/bridge/contracts.js';
 import { relayBridge } from '../src/bridge/gateway.js';
 import { createBridgeHost } from '../src/bridge/host.js';
+import { P2PError } from '../src/errors.js';
 import type { webSocketDuplex } from '../src/bridge/transport/index.js';
 import type { BinaryWebSocket } from '../src/bridge/transport/contracts.js';
 import { blobSource, memoryDestination } from '../src/files/browser.js';
@@ -175,6 +176,7 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
   const firstChunk = deferred(), releaseChunk = deferred();
   const received = memoryDestination({ maxBytes: 1024 * 1024 });
   const offers: FileManifest[] = [];
+  const bridgeErrors: string[] = [];
   const deniedResumptions: string[] = [];
   const delegatedPrincipals: string[] = [];
   let paused = false;
@@ -193,6 +195,7 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
       return { id, subject: id, expiresAt: Math.min(Date.now() + 120_000, offer.auth.expiresAt), scopes: new Set(['bridge:lab']), claims: {} };
     },
     authorizeOperation: () => true,
+    onError: error => { bridgeErrors.push(`${error instanceof P2PError ? error.code : error.name}: ${error.message}`); },
     onIncomingFile(offer): IncomingFileDecision {
       offers.push(offer.manifest);
       return { accept: {
@@ -341,7 +344,7 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     proven.push('host-close-proved-and-borrowed-outer-peer-alive');
     cleaned = true;
   } catch (cause) {
-    console.info(JSON.stringify({ phase, nativeErrors, host: hostService.diagnostics() }));
+    console.info(JSON.stringify({ phase, nativeErrors, bridgeErrors, host: hostService.diagnostics() }));
     failures.push(cause);
   }
   finally {

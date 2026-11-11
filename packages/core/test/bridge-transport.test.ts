@@ -84,6 +84,26 @@ describe.skipIf(!yamuxAvailable)('logical Yamux carrier', () => {
     } finally { server.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
   });
 
+  it('treats incomplete exact reads as transport loss while retaining trailing-byte validation', async () => {
+    const [client, server] = connections();
+    try {
+      const send = await client.openUni();
+      const receive = await server.acceptUni();
+      await send.writeAll(Uint8Array.of(1));
+      await send.finish();
+      await expect(receive.readExact(2)).rejects.toMatchObject({ code: 'DISCONNECTED', message: 'Unexpected end of stream' });
+      // A caller explicitly expecting FIN still rejects real trailing bytes;
+      // the EOF correction does not weaken framing or close unrelated streams.
+      const next = await client.openUni();
+      const trailing = await server.acceptUni();
+      await next.writeAll(Uint8Array.of(2));
+      await next.finish();
+      await expect(trailing.expectEnd()).rejects.toMatchObject({ code: 'INVALID_FRAME', message: 'Trailing stream bytes' });
+      expect(await trailing.readExact(1)).toEqual(Uint8Array.of(2));
+      await trailing.expectEnd();
+    } finally { server.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
+  });
+
   it('pairs a full concurrent opening burst without an extra header or accept-queue ceiling', async () => {
     const [a, b] = connections();
     try {

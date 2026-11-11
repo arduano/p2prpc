@@ -151,7 +151,10 @@ class Direction implements QuicSendStream, QuicRecvStream {
         await this.available();
         if (this.error) throw this.error;
         const chunk = this.chunks[0];
-        if (!chunk) throw new P2PError('INVALID_FRAME', 'Unexpected end of stream');
+        // EOF cannot satisfy an exact read. Report transport loss, as the
+        // native stream does, rather than permanently rejecting a file whose
+        // carrier can end before its connection-close cause is observed.
+        if (!chunk) throw new P2PError('DISCONNECTED', 'Unexpected end of stream');
         const count = Math.min(size - done, chunk.length - this.offset);
         result.set(chunk.subarray(this.offset, this.offset + count), done);
         this.offset += count; this.queued -= count; done += count;
