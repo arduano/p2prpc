@@ -17,6 +17,7 @@ import type {
 const t = initTRPC.create();
 const router = t.router({
   ping: t.procedure.query(() => 'unused'),
+  change: t.procedure.mutation(() => 'unused'),
   stream: t.procedure.subscription(async function* () {
     yield 'unused';
   })
@@ -274,7 +275,7 @@ describe('RPC link flow-control boundaries', () => {
     });
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toMatchObject({
+    await expect(client.change.mutate()).rejects.toMatchObject({
       cause: {
         code: 'OUTCOME_UNKNOWN',
         cause: { message: 'RPC request write timed out' }
@@ -373,7 +374,7 @@ describe('RPC link flow-control boundaries', () => {
     await waitUntil(() => stream.send.writeCalls === 3);
     await new Promise((resolve) => setTimeout(resolve, 30));
     controller.abort();
-    await expect(result).rejects.toMatchObject({ cause: { code: 'OUTCOME_UNKNOWN' } });
+    await expect(result).rejects.toMatchObject({ cause: { code: 'CANCELLED' } });
     expect(stream.send.writeCalls).toBe(5);
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
@@ -407,7 +408,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: expect.stringContaining('Trailing bytes') } }
+      cause: { code: 'DISCONNECTED', cause: { message: expect.stringContaining('Trailing bytes') } }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.expectEndCalls).toBe(1);
@@ -424,7 +425,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: 'Unary RPC completed without a result' } }
+      cause: { code: 'INVALID_FRAME', message: 'Unary RPC completed without a result' }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
@@ -485,7 +486,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { code: 'INVALID_FRAME' } }
+      cause: { code: 'INVALID_FRAME' }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);

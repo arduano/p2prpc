@@ -267,7 +267,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
         removeAbortListener();
         const error = op.type === 'mutation' && requestWriteStarted
           ? new P2PError('OUTCOME_UNKNOWN', 'RPC was cancelled after dispatch; the remote outcome is unknown')
-          : new P2PError('CANCELLED', 'RPC cancelled before dispatch');
+          : new P2PError('CANCELLED', 'RPC observation cancelled');
         controller.abort(error);
         const closing = stream
           ? cleanup(stream, requestSent ? 'cancel' : 'failure')
