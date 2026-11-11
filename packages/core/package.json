@@ -101,7 +101,7 @@
     "@trpc/server": "11.18.0"
   },
   "devDependencies": {
-    "tsup": "^8.5.1"
+    "tsup": "^9.0.0"
   },
   "engines": {
     "node": ">=20.3.0"
