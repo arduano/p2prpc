@@ -88,10 +88,12 @@ export interface EndpointDiscoveryOptions {
 export interface QuicConnection {
   readonly remoteId: string;
   readonly side: 'client' | 'server';
-  /** Open options are consumed by the managed runtime; raw adapters MUST ignore them. */
+  /** Raw adapters ignore options. RESOURCE_LIMIT/REJECTED/CANCELLED rejection
+   * certifies this opening owns no remaining resources; other failures may
+   * require carrier quarantine. Managed runtime owns admission and cancellation. */
   openBi(options?: StreamOpenOptions): Promise<QuicBiStream>;
   acceptBi(): Promise<QuicBiStream>;
-  /** Open options are consumed by the managed runtime; raw adapters MUST ignore them. */
+  /** Same ownership and per-opening refusal contract as openBi. */
   openUni(options?: StreamOpenOptions): Promise<QuicSendStream>;
   acceptUni(): Promise<QuicRecvStream>;
   /**
@@ -107,7 +109,7 @@ export interface QuicConnection {
 }
 
 export interface StreamOpenOptions {
-  /** Cancels managed admission or quarantines the connection once native opening has begun. */
+  /** Cancels admission or retires a late allocated stream; unrelated work stays owned. */
   readonly signal?: AbortSignal;
   readonly fileControl?: 'outbound';
   readonly fileData?: 'outbound';

@@ -799,12 +799,12 @@ describe('structured runtime ownership', () => {
 
     const opening = managed.openBi({ signal: controller.signal });
     await nativeOpenStarted.promise;
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
     controller.abort(new Error('cancel hung BI open'));
 
     await expect(opening).rejects.toThrow('cancel hung BI open');
     expect(closeRequests).toBe(0);
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     managed.close(0n, new Uint8Array());
     expect(closeRequests).toBe(1);
@@ -953,7 +953,7 @@ describe('structured runtime ownership', () => {
     const openingBi = managed.openBi({ signal: biController.signal });
     const openingUni = managed.openUni({ fileData: 'outbound', signal: uniController.signal });
     await Promise.all([biStarted.promise, uniStarted.promise]);
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 2, bufferedBytes: 32 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 2, bufferedBytes: 16 });
 
     biController.abort(new Error('cancel late opens'));
     await expect(openingBi).rejects.toThrow('cancel late opens');
@@ -961,7 +961,7 @@ describe('structured runtime ownership', () => {
     uniController.abort(new Error('cancel other open'));
     await expect(openingUni).rejects.toThrow('cancel other open');
     expect(closeRequests).toBe(0);
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 2, bufferedBytes: 32 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 2, bufferedBytes: 16 });
 
     biOpened.resolve(biStream);
     uniOpened.resolve(uniStream);
@@ -998,7 +998,7 @@ describe('structured runtime ownership', () => {
         await expect.poll(() => closeRequests).toBe(1);
       }
       await expect(managed.openBi()).rejects.toMatchObject({ code: 'DISCONNECTED' });
-      expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+      expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
       closed.resolve('closed');
       await scheduler.whenIdle();
       expect(scheduler.snapshot().active.streams).toBe(0);
@@ -1108,12 +1108,12 @@ describe('structured runtime ownership', () => {
     const opening = managed.openBi();
     const rejectedOpening = expect(opening).rejects.toMatchObject({ code: 'DISCONNECTED' });
     await nativeOpenStarted.promise;
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 1 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     managed.close(0n, new Uint8Array());
     await Promise.resolve();
     expect(closeRequests).toBe(1);
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 1 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     physicallyClosed.resolve('closed');
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
@@ -1148,7 +1148,7 @@ describe('structured runtime ownership', () => {
 
     await expect(managed.openBi()).rejects.toThrow('poisoned native stream');
     expect(closeRequests).toBe(1);
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     physicallyClosed.resolve('closed');
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
@@ -1176,7 +1176,7 @@ describe('structured runtime ownership', () => {
     );
 
     await expect(managed.openBi()).rejects.toThrow('primary adoption failure');
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     physicallyClosed.resolve('closed');
     await expect.poll(() => scheduler.snapshot().active).toMatchObject({ streams: 0, bufferedBytes: 0 });
@@ -1198,7 +1198,7 @@ describe('structured runtime ownership', () => {
     await managed.openBi();
     await Promise.resolve();
     await Promise.resolve();
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
   });
 
   it('retains a bidirectional stream lease until both halves terminate', async () => {
@@ -1214,7 +1214,7 @@ describe('structured runtime ownership', () => {
     );
 
     const opened = await managed.openBi();
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
     await opened.send.finish();
     expect(scheduler.snapshot().active.streams).toBe(1);
     await opened.recv.expectEnd();
@@ -1241,7 +1241,7 @@ describe('structured runtime ownership', () => {
     await opened.recv.expectEnd();
     await opened.recv.stop(1n);
     await opened.recv.expectEnd();
-    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 16 });
+    expect(scheduler.snapshot().active).toMatchObject({ streams: 1, bufferedBytes: 0 });
 
     await opened.send.finish();
     expect(scheduler.snapshot()).toMatchObject({

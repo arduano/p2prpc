@@ -43,7 +43,7 @@ export class ManagedConnection implements QuicConnection {
   async openBi(options: StreamOpenOptions = {}): Promise<QuicBiStream> {
     validateBiOptions(options);
     const signal = this.openSignal(options.signal);
-    const lease = await this.acquire(this.biBufferedBytes, options, signal);
+    const lease = await this.acquire(options.fileControl ? this.biBufferedBytes : 0, options, signal);
     if (this.closedForOpens) {
       lease.release();
       throw new P2PError('DISCONNECTED', 'Connection closed while admitting a stream open');
@@ -87,12 +87,9 @@ export class ManagedConnection implements QuicConnection {
       } else if (!stream) {
         this.opening.delete(lease);
         lease.release();
-        // A raw transport that cannot open a stream is no longer a usable
-        // connection, even if its separate closed() notification has not
-        // arrived yet. Quarantine it so retained Peer proxies can move to the
-        // disconnected state and redial instead of retrying one stale native
-        // session handle forever.
-        this.quarantine('Bidirectional stream opening failed');
+        // Definite per-opening refusals leave the carrier usable. Unknown raw
+        // failures (including stale native handles) still require quarantine.
+        if (!refusedOpening(cause)) this.quarantine('Bidirectional stream opening failed');
       } else if (!this.closedForOpens) {
         // This is only reachable if wrapping the native stream itself throws.
         // Quarantine it: no caller owns its terminal halves. Admission remains
@@ -143,7 +140,7 @@ export class ManagedConnection implements QuicConnection {
       } else if (!stream) {
         this.opening.delete(lease);
         lease.release();
-        this.quarantine('Unidirectional stream opening failed');
+        if (!refusedOpening(cause)) this.quarantine('Unidirectional stream opening failed');
       } else if (!this.closedForOpens) {
         this.quarantine('Stream adoption failed');
         this.settleLateUni(Promise.resolve(stream), lease);
@@ -403,4 +400,10 @@ function requestClose(connection: QuicConnection, code: bigint, reason: string):
   } catch {
     // Admission deliberately remains owned until fulfilled closed() proof.
   }
+}
+
+/** Raw adapters use these codes only after refusing/retiring this opening's
+ * resources. They do not certify that an arbitrary native failure is harmless. */
+function refusedOpening(cause: unknown): boolean {
+  return cause instanceof P2PError && ['RESOURCE_LIMIT', 'REJECTED', 'CANCELLED'].includes(cause.code);
 }

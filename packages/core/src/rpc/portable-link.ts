@@ -128,29 +128,16 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           const connection = await io(options.connection, 'RPC connection acquisition timed out');
           physicalConnection = connection;
           ensureActive();
-          let openingSettled = false;
           const opening = Promise.resolve().then(() => {
             ensureActive();
             return connection.openBi({ signal: controller.signal });
-          }).then(
-            (opened) => {
-              openingSettled = true;
-              return opened;
-            },
-            (cause: unknown) => {
-              openingSettled = true;
-              throw cause;
-            }
-          );
+          });
           try {
             stream = await withDeadline(opening, ioTimeoutMs, 'RPC stream opening timed out', controller);
           } catch (cause) {
-            // Observer cancellation does not retire a shared carrier. Keep the
-            // pending acquisition owned and clean any late stream below. A real
-            // I/O timeout still fences a transport which cannot finish opening.
-            if (!openingSettled && cause instanceof P2PError && cause.code === 'TIMEOUT') {
-              requestConnectionClose(connection, 'RPC stream opening timed out');
-            }
+            // The connection owner distinguishes queued admission from actual
+            // transport failure. This wait cannot prove a broken shared carrier.
+            // Retain and retire a late stream even after the caller has left.
             void opening.then(
               async (lateStream) => {
                 const cleaned = await cleanupRpcStream(

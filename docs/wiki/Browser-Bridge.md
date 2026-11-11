@@ -180,11 +180,15 @@ idempotency/history remains authoritative across either process boundary.
 - Host defaults to 32 retained logical peers. Each uses the existing bounded
   scheduler/TaskGroup; callbacks that ignore abort stay charged. Application
   policies should bound aggregate tenant work above these per-peer limits.
-- Yamux defaults to 64 logical streams, 16 pending incoming pairs, 1 MiB maximum
+- Yamux defaults to 64 logical streams, 1 MiB maximum
   read, 8 MiB buffered/read reservation and 15-second pairing/header timeout.
   Two Yamux directions implement one logical bidirectional stream so send reset
   and receive stop remain independent. Numeric QUIC reset codes are not carried;
   stream priority is advisory because standard Yamux has no matching scheduler.
+  The logical stream limit also bounds accepted queues. Excess openings reset
+  only that request; a cancelled/refused pair cannot retire unrelated streams.
+  A queued RPC deadline cancels its admission. Actual transport-open timeouts
+  and unproved late-stream cleanup still quarantine the carrier.
 - Binary WebSocket queues, messages and native carrier packets are bounded.
   Write promises provide backpressure. The Gateway does not retain whole files.
 - `memoryDestination` requires an explicit quota, at most 64 MiB; publication can
