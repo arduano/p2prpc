@@ -93,3 +93,5 @@ export type {
 } from './transport/types.js';
 
 export type { NativeBridgeOffer, OpenBridgeOptions } from './bridge/native.js';
+
+export { RpcMessageBudget } from './rpc/messages.js';

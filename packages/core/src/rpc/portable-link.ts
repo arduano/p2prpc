@@ -6,11 +6,8 @@ import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
 import { P2PError, asP2PError } from '../errors.js';
 import { sanitizeBoundedDisplayText } from '../text.js';
 import {
-  DEFAULT_FRAME_LIMITS,
   RpcFrameKind,
   StreamKind,
-  readFrame,
-  writeFrame,
   writeStreamKind,
   type FrameLimits
 } from '../protocol.js';
@@ -23,9 +20,12 @@ import {
   type RpcHeaderInput,
   type RpcHeaderLimits
 } from './portable-headers.js';
-import { deserializeValue, serializeValue, type RpcData, type RpcFailure, type RpcRequest } from './wire.js';
+import { type RpcData, type RpcFailure } from './wire.js';
+
+import { DEFAULT_RPC_FRAME_LIMITS, RpcMessageBudget, readRpcFrame, writeRpcFrame } from './messages.js';
 
 export interface IrohLinkOptions {
+  readonly rpcMessages?: RpcMessageBudget;
   readonly connection: () => Promise<QuicConnection>;
   readonly frameLimits?: FrameLimits;
   readonly headerLimits?: RpcHeaderLimits;
@@ -56,6 +56,8 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
   policy: RpcHeaderPolicy = portableRpcHeaders
 ): TRPCLink<TRouter> {
   const ioTimeoutMs = resolveIoTimeout(options.ioTimeoutMs);
+  const messages = options.rpcMessages ?? new RpcMessageBudget();
+  const frameLimits = options.frameLimits ?? DEFAULT_RPC_FRAME_LIMITS;
   const cleanupTimeoutMs = Math.min(ioTimeoutMs, 1_000);
   return () => ({ op }) =>
     observable((observer) => {
@@ -82,7 +84,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           current,
           mode,
           requestSent ? op.id : undefined,
-          options.frameLimits ?? DEFAULT_FRAME_LIMITS,
+          messages,
           cleanupTimeoutMs
         ).then((cleaned) => {
           if (!cleaned) {
@@ -126,36 +128,23 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           const connection = await io(options.connection, 'RPC connection acquisition timed out');
           physicalConnection = connection;
           ensureActive();
-          let openingSettled = false;
           const opening = Promise.resolve().then(() => {
             ensureActive();
             return connection.openBi({ signal: controller.signal });
-          }).then(
-            (opened) => {
-              openingSettled = true;
-              return opened;
-            },
-            (cause: unknown) => {
-              openingSettled = true;
-              throw cause;
-            }
-          );
+          });
           try {
             stream = await withDeadline(opening, ioTimeoutMs, 'RPC stream opening timed out', controller);
           } catch (cause) {
-            // Observer cancellation does not retire a shared carrier. Keep the
-            // pending acquisition owned and clean any late stream below. A real
-            // I/O timeout still fences a transport which cannot finish opening.
-            if (!openingSettled && cause instanceof P2PError && cause.code === 'TIMEOUT') {
-              requestConnectionClose(connection, 'RPC stream opening timed out');
-            }
+            // The connection owner distinguishes queued admission from actual
+            // transport failure. This wait cannot prove a broken shared carrier.
+            // Retain and retire a late stream even after the caller has left.
             void opening.then(
               async (lateStream) => {
                 const cleaned = await cleanupRpcStream(
                   lateStream,
                   'failure',
                   undefined,
-                  options.frameLimits ?? DEFAULT_FRAME_LIMITS,
+                  messages,
                   cleanupTimeoutMs
                 );
                 if (!cleaned) {
@@ -167,14 +156,11 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
             throw cause;
           }
           ensureActive();
-          // The admitted stream owns the potentially frame-sized serialized
-          // input, so concurrent local calls cannot allocate those buffers
-          // outside maxBufferedBytes accounting.
-          const input = serializeValue(op.input, options.frameLimits ?? DEFAULT_FRAME_LIMITS);
-          ensureActive();
+          let writingRequest = false;
           const guardedSend = {
             writeAll: async (data: Uint8Array): Promise<void> => {
               ensureActive();
+              if (writingRequest) requestWriteStarted = true;
               await stream!.send.writeAll(data);
               ensureActive();
             },
@@ -186,16 +172,16 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           ensureActive();
           await io(() => writeStreamKind(guardedSend, StreamKind.Rpc), 'RPC stream kind write timed out');
           ensureActive();
-          const request: RpcRequest = {
+          const request = {
             id: op.id,
             path: op.path,
             type: op.type,
             headers,
-            input
+            input: op.input
           };
-          requestWriteStarted = true;
+          writingRequest = true;
           await io(
-            () => writeFrame(guardedSend, RpcFrameKind.Request, request, options.frameLimits ?? DEFAULT_FRAME_LIMITS),
+            () => writeRpcFrame(guardedSend, RpcFrameKind.Request, request, messages, frameLimits, controller.signal),
             'RPC request write timed out'
           );
           requestSent = true;
@@ -215,10 +201,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           // subscription fail for reasons unrelated to its API contract.
           while (active) {
             const frame = await withAbortOnly(
-              readFrame<RpcData | RpcFailure>(
-                stream!.recv,
-                options.frameLimits ?? DEFAULT_FRAME_LIMITS
-              ),
+              readRpcFrame<RpcData | RpcFailure>(stream!.recv, messages, frameLimits, controller.signal),
               controller.signal
             );
             ensureActive();
@@ -226,7 +209,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
               exactRecord(frame.value, ['id', 'data'], 'RPC data response');
               const data = frame.value as RpcData;
               if (data.id !== op.id) throw new P2PError('INVALID_FRAME', 'RPC response ID does not match request');
-              const value = deserializeValue(data.data, options.frameLimits ?? DEFAULT_FRAME_LIMITS);
+              const value = data.data;
               if (op.type === 'subscription') observer.next({ result: { data: value } });
               else {
                 if (hasUnaryResult) throw new P2PError('INVALID_FRAME', 'Unary RPC returned multiple data frames');
@@ -267,7 +250,7 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
           active = false;
           removeAbortListener();
           if (stream) await cleanup(stream, 'failure');
-          const error = requestWriteStarted
+          const error = op.type === 'mutation' && requestWriteStarted
             ? new P2PError('OUTCOME_UNKNOWN', 'RPC ended after dispatch without a terminal response', { cause })
             : asP2PError(cause, 'DISCONNECTED');
           if (notify) observer.error(TRPCClientError.from(error));
@@ -282,9 +265,9 @@ export function irohLink<TRouter extends AnyTRPCRouter>(
         if (!active) return;
         active = false;
         removeAbortListener();
-        const error = requestWriteStarted
+        const error = op.type === 'mutation' && requestWriteStarted
           ? new P2PError('OUTCOME_UNKNOWN', 'RPC was cancelled after dispatch; the remote outcome is unknown')
-          : new P2PError('CANCELLED', 'RPC cancelled before dispatch');
+          : new P2PError('CANCELLED', 'RPC observation cancelled');
         controller.abort(error);
         const closing = stream
           ? cleanup(stream, requestSent ? 'cancel' : 'failure')
@@ -432,7 +415,7 @@ async function cleanupRpcStream(
   stream: Awaited<ReturnType<QuicConnection['openBi']>>,
   mode: 'cancel' | 'failure' | 'terminal',
   requestId: number | undefined,
-  frameLimits: FrameLimits,
+  messages: RpcMessageBudget,
   timeoutMs: number
 ): Promise<boolean> {
   const stopTask = cleanupOperation(() => stream.recv.stop(mode === 'terminal' ? 0n : 2n), timeoutMs);
@@ -454,7 +437,7 @@ async function cleanupRpcStream(
         setPriority: (priority: number) => stream.send.setPriority(priority)
       };
       await cleanupOperation(
-        () => writeFrame(guardedSend, RpcFrameKind.Cancel, { id: requestId }, frameLimits),
+        () => writeRpcFrame(guardedSend, RpcFrameKind.Cancel, { id: requestId }, messages),
         timeoutMs
       );
       cancelWritable = false;

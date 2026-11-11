@@ -14,7 +14,6 @@ export interface ByteDuplex {
 
 export interface LogicalConnectionLimits {
   readonly maxStreams: number;
-  readonly maxPendingIncoming: number;
   readonly maxReadBytes: number;
   readonly maxBufferedBytes: number;
   /** Maximum wait for an incoming header or second BI direction. */

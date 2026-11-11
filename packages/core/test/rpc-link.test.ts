@@ -17,6 +17,7 @@ import type {
 const t = initTRPC.create();
 const router = t.router({
   ping: t.procedure.query(() => 'unused'),
+  change: t.procedure.mutation(() => 'unused'),
   stream: t.procedure.subscription(async function* () {
     yield 'unused';
   })
@@ -121,7 +122,8 @@ describe('RPC link flow-control boundaries', () => {
 
     await expect(client.ping.query()).rejects.toThrow('RPC stream opening timed out');
     expect(openingSignal?.aborted).toBe(true);
-    expect(closeCalls).toBe(1);
+    // Only the connection owner knows whether this was queued or actual I/O.
+    expect(closeCalls).toBe(0);
     opened.resolve(stream);
     await waitUntil(() => stream.send.resetCalls === 1 && stream.recv.stopCalls === 1);
   });
@@ -185,6 +187,57 @@ describe('RPC link flow-control boundaries', () => {
     }
   });
 
+  it('times out only a queued RPC opening while its admitted subscription and carrier stay usable', async () => {
+    const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+    const owner = { peerId: 'remote', principalId: 'viewer' };
+    const watched = testStream();
+    const reply = testStream();
+    respondWithPong(reply);
+    let request: RpcRequest;
+    watched.send.afterWrite = async (index, bytes) => {
+      if (index !== 3) return;
+      request = (await readFrame<RpcRequest>(new BufferedRecv(bytes.slice(1)))).value;
+      await writeFrame(watched.recv, RpcFrameKind.Data, { id: request.id, data: serializeValue('before') });
+    };
+    let opens = 0;
+    let closes = 0;
+    const raw = testConnection(async () => ++opens === 1 ? watched : reply);
+    raw.close = () => { closes++; };
+    const connection = new ManagedConnection(raw, scheduler, owner, new AbortController().signal, 1024, 1024);
+    const client = testClient({ connection: async () => connection });
+    const values: string[] = [];
+    const errors: unknown[] = [];
+    const subscription = client.stream.subscribe(undefined, {
+      onData: value => values.push(value), onError: error => errors.push(error)
+    });
+    const reserves = DEFAULT_RESOURCE_LIMITS;
+    const generalStreams = reserves.perPeer.streams - reserves.fileControlReserve.perPeer.inbound.streams -
+      reserves.fileControlReserve.perPeer.outbound.streams - reserves.fileDataReserve.perPeer.inbound.streams -
+      reserves.fileDataReserve.perPeer.outbound.streams;
+    let held: ReturnType<ResourceScheduler['tryAcquire']>;
+    try {
+      await waitUntil(() => values.length === 1);
+      held = scheduler.tryAcquire(owner, { streams: generalStreams - 1 });
+      expect(held).toBeDefined();
+      await expect(client.ping.query()).rejects.toThrow('RPC stream opening timed out');
+      expect(opens).toBe(1);
+      expect(closes).toBe(0);
+      expect(scheduler.snapshot().queued).toBe(0);
+      await writeFrame(watched.recv, RpcFrameKind.Data, { id: request!.id, data: serializeValue('after') });
+      held!.release();
+      await expect(client.ping.query()).resolves.toBe('pong');
+      await waitUntil(() => values.length === 2);
+      expect(values).toEqual(['before', 'after']);
+      expect(errors).toEqual([]);
+      expect(closes).toBe(0);
+    } finally {
+      held?.release();
+      subscription.unsubscribe();
+      await waitUntil(() => watched.send.resetCalls === 1 && watched.recv.stopCalls === 1);
+      await scheduler.whenIdle();
+    }
+  });
+
   it('bounds stalled stream-priority setup and closes both stream halves', async () => {
     const stream = testStream({ priority: pending });
     const client = testClient({ connection: async () => testConnection(async () => stream) });
@@ -222,7 +275,7 @@ describe('RPC link flow-control boundaries', () => {
     });
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
-    await expect(client.ping.query()).rejects.toMatchObject({
+    await expect(client.change.mutate()).rejects.toMatchObject({
       cause: {
         code: 'OUTCOME_UNKNOWN',
         cause: { message: 'RPC request write timed out' }
@@ -321,7 +374,7 @@ describe('RPC link flow-control boundaries', () => {
     await waitUntil(() => stream.send.writeCalls === 3);
     await new Promise((resolve) => setTimeout(resolve, 30));
     controller.abort();
-    await expect(result).rejects.toMatchObject({ cause: { code: 'OUTCOME_UNKNOWN' } });
+    await expect(result).rejects.toMatchObject({ cause: { code: 'CANCELLED' } });
     expect(stream.send.writeCalls).toBe(5);
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
@@ -355,7 +408,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: expect.stringContaining('Trailing bytes') } }
+      cause: { code: 'DISCONNECTED', cause: { message: expect.stringContaining('Trailing bytes') } }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.expectEndCalls).toBe(1);
@@ -372,7 +425,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { message: 'Unary RPC completed without a result' } }
+      cause: { code: 'INVALID_FRAME', message: 'Unary RPC completed without a result' }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);
@@ -433,7 +486,7 @@ describe('RPC link flow-control boundaries', () => {
     const client = testClient({ connection: async () => testConnection(async () => stream) });
 
     await expect(client.ping.query()).rejects.toMatchObject({
-      cause: { code: 'OUTCOME_UNKNOWN', cause: { code: 'INVALID_FRAME' } }
+      cause: { code: 'INVALID_FRAME' }
     });
     expect(stream.send.resetCalls).toBe(1);
     expect(stream.recv.stopCalls).toBe(1);

@@ -7,7 +7,7 @@
 
 Type-safe peer-to-peer tRPC, subscriptions, and secure parallel file transfer over one Iroh QUIC connection.
 
-p2prpc separates route discovery, Iroh endpoint identity, application identity, authorization, RPC metadata, and file capabilities. Knowing a node ID or signed ticket is never enough to dispatch work: both peers must finish the bounded mutual session handshake, establish an expiring principal, and authorize each operation. The current QUIC application protocol/ALPN is v5; its credential handshake format is v4.
+p2prpc separates route discovery, Iroh endpoint identity, application identity, authorization, RPC metadata, and file capabilities. Knowing a node ID or signed ticket is never enough to dispatch work: both peers must finish the bounded mutual session handshake, establish an expiring principal, and authorize each operation. The current QUIC application protocol/ALPN is v6; its credential handshake format is v4.
 
 ```text
 authenticated Iroh QUIC connection

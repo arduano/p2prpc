@@ -11,7 +11,7 @@ type Bytes = Parameters<AbstractMessageStream['sendData']>[0];
 const FRAME_BYTES = 16 * 1024;
 const WINDOW_BYTES = 256 * 1024;
 const DEFAULTS: LogicalConnectionLimits = {
-  maxStreams: 64, maxPendingIncoming: 16, maxReadBytes: 1024 * 1024,
+  maxStreams: 64, maxReadBytes: 1024 * 1024,
   maxBufferedBytes: 8 * 1024 * 1024, pairTimeoutMs: 15_000
 };
 const disconnected = () => new P2PError('DISCONNECTED', 'Logical channel closed');
@@ -149,8 +149,12 @@ class Direction implements QuicSendStream, QuicRecvStream {
       let done = 0;
       while (done < size) {
         await this.available();
+        if (this.error) throw this.error;
         const chunk = this.chunks[0];
-        if (!chunk) throw new P2PError('INVALID_FRAME', 'Unexpected end of stream');
+        // EOF cannot satisfy an exact read. Report transport loss, as the
+        // native stream does, rather than permanently rejecting a file whose
+        // carrier can end before its connection-close cause is observed.
+        if (!chunk) throw new P2PError('DISCONNECTED', 'Unexpected end of stream');
         const count = Math.min(size - done, chunk.length - this.offset);
         result.set(chunk.subarray(this.offset, this.offset + count), done);
         this.offset += count; this.queued -= count; done += count;
@@ -163,7 +167,7 @@ class Direction implements QuicSendStream, QuicRecvStream {
   async expectEnd(): Promise<void> {
     if (this.reading) throw new P2PError('REJECTED', 'Concurrent stream read');
     this.reading = true;
-    try { await this.available(); if (this.queued !== 0) throw new P2PError('INVALID_FRAME', 'Trailing stream bytes'); }
+    try { await this.available(); if (this.error) throw this.error; if (this.queued !== 0) throw new P2PError('INVALID_FRAME', 'Trailing stream bytes'); }
     finally { this.reading = false; }
   }
   async writeAll(bytes: Uint8Array): Promise<void> {
@@ -212,24 +216,26 @@ class Direction implements QuicSendStream, QuicRecvStream {
 }
 
 class Incoming<T> {
-  private values: T[] = [];
+  private values: Array<{ value: T; accept(): void }> = [];
   private waiting: ReturnType<typeof deferred<T>> | undefined;
   private error: Error | undefined;
-  constructor(private readonly limit: number) {}
-  push(value: T): void {
+  push(value: T, accept: () => void): void {
     if (this.error) throw this.error;
-    if (this.waiting) { this.waiting.resolve(value); this.waiting = undefined; return; }
-    if (this.values.length >= this.limit) throw resource();
-    this.values.push(value);
+    if (this.waiting) { accept(); this.waiting.resolve(value); this.waiting = undefined; return; }
+    this.values.push({ value, accept });
   }
   take(): Promise<T> {
     if (this.error) return Promise.reject(this.error);
-    const value = this.values.shift();
-    if (value) return Promise.resolve(value);
+    const entry = this.values.shift();
+    if (entry) { entry.accept(); return Promise.resolve(entry.value); }
     if (this.waiting) return Promise.reject(new P2PError('REJECTED', 'Concurrent stream accept'));
     this.waiting = deferred<T>(); return this.waiting.promise;
   }
-  close(error: Error): void { this.error = error; this.values = []; this.waiting?.reject(error); this.waiting = undefined; }
+  close(error: Error): void {
+    this.error = error;
+    for (const entry of this.values) entry.accept();
+    this.values = []; this.waiting?.reject(error); this.waiting = undefined;
+  }
 }
 
 function header(kind: number, pair = 0): Uint8Array {
@@ -243,24 +249,27 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
   }
   const limits = { ...DEFAULTS, ...options.limits };
   for (const value of Object.values(limits)) if (!Number.isSafeInteger(value) || value <= 0) throw resource();
-  if (!options.remoteId || limits.maxBufferedBytes < WINDOW_BYTES || limits.maxPendingIncoming > limits.maxStreams) throw resource();
+  if (!options.remoteId || limits.maxBufferedBytes < WINDOW_BYTES) throw resource();
   const carrier = new Carrier(duplex, options, limits.maxBufferedBytes);
   const mux = yamux({ enableKeepAlive: false, maxMessageSize: FRAME_BYTES,
     maxInboundStreams: limits.maxStreams * 2, maxOutboundStreams: limits.maxStreams * 2,
-    maxEarlyStreams: limits.maxPendingIncoming * 2,
+    maxEarlyStreams: limits.maxStreams * 2,
     streamOptions: { initialStreamWindowSize: WINDOW_BYTES, maxStreamWindowSize: WINDOW_BYTES,
       maxReadBufferLength: WINDOW_BYTES, maxWriteBufferLength: FRAME_BYTES * 2, inactivityTimeout: 0 }
   })().createStreamMuxer(carrier);
-  const bi = new Incoming<QuicBiStream>(limits.maxPendingIncoming);
-  const uni = new Incoming<QuicRecvStream>(limits.maxPendingIncoming);
+  const bi = new Incoming<QuicBiStream>();
+  const uni = new Incoming<QuicRecvStream>();
   const directions = new Map<Stream, Direction>();
-  const pairs = new Map<number, { result: ReturnType<typeof deferred<QuicBiStream>>; send: Direction; timer: ReturnType<typeof setTimeout> }>();
+  const pairs = new Map<number, {
+    send: Direction;
+    resolve(stream: QuicBiStream): void;
+    reject(error: Error): void;
+  }>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const tasks = new Set<Promise<void>>();
   const terminal = deferred<string>();
   let closing: Error | undefined;
   let active = 0;
-  let incomingHeaders = 0;
   const fail = (error: Error): void => {
     if (closing) return;
     closing = error;
@@ -270,7 +279,7 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
     bi.close(error); uni.close(error);
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
-    for (const pair of pairs.values()) { clearTimeout(pair.timer); pair.result.reject(error); }
+    for (const pair of pairs.values()) pair.reject(error);
     pairs.clear();
     // Upstream abort notifications are best effort. Their exceptions cannot
     // veto channel closure or strand pump settlement; duplex.closed is proof.
@@ -298,7 +307,6 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
     if (closing) throw closing;
     const raw = await mux.createStream();
     if (closing) { raw.abort(closing); throw closing; }
-    if (mux.streams.length > limits.maxStreams * 2) { fail(resource()); throw resource(); }
     const direction = wrap(raw);
     // Each physical stream's reverse direction is reserved to carry only FIN.
     raw.addEventListener('message', () => fail(invalid()));
@@ -325,34 +333,62 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
     timers.add(timer);
     let bytes: Uint8Array;
     try { bytes = await receive.readExact(5); }
+    catch (error) {
+      // A peer can retire an opening before its header arrives.
+      if (!closing && (raw.status === 'reset' || raw.status === 'aborted')) return;
+      throw error;
+    }
     finally { clearTimeout(timer); timers.delete(timer); }
     if (closing) throw closing;
     const kind = bytes[0];
     const pairId = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1);
     // The reverse half of this physical stream is intentionally unused.
-    await raw.close();
+    try { await raw.close(); }
+    catch (error) {
+      if (!closing && (raw.status === 'reset' || raw.status === 'aborted')) return;
+      throw error;
+    }
     if (closing) throw closing;
     if (kind === 2) {
       const pair = pairs.get(pairId);
-      if (!pair) throw invalid();
-      pairs.delete(pairId); clearTimeout(pair.timer);
-      pair.result.resolve({ send: pair.send, recv: receive });
+      // A cancelled/timed-out opener can still receive its already-created
+      // reply half. Retire that half, not unrelated logical streams.
+      if (!pair) { receive.retire(new P2PError('REJECTED', 'Logical stream opening ended')); return; }
+      pair.resolve({ send: pair.send, recv: receive });
       return;
     }
     if (kind !== 1 && kind !== 3 || kind === 3 && pairId !== 0 || kind === 1 && pairId !== raw.streamId) throw invalid();
-    const release = reserve();
+    let release: (() => void) | undefined;
+    let send: Direction | undefined;
     try {
-      if (kind === 3) { releaseWhenClosed(release, raw); uni.push(receive); return; }
-      const send = await create();
-      releaseWhenClosed(release, raw, send.raw);
+      release = reserve();
+      const admitted = release;
+      // Queued entries retain admission even if their peer closes first. Only
+      // accept() transfers ownership to physical stream closure.
+      if (kind === 3) { uni.push(receive, () => releaseWhenClosed(admitted, raw)); return; }
+      send = await create();
+      const outgoing = send.raw;
       await send.writeAll(header(2, pairId));
-      bi.push({ send, recv: receive });
-    } catch (error) { release(); throw error; }
+      bi.push({ send, recv: receive }, () => releaseWhenClosed(admitted, raw, outgoing));
+    } catch (error) {
+      // Admission refusal is local to this opening. RST makes the remote pair
+      // settle; any allocated reverse half remains ours until it is retired.
+      const refused = raw.status === 'reset' || raw.status === 'aborted' ||
+        send?.raw.status === 'reset' || send?.raw.status === 'aborted';
+      const reason = error instanceof Error ? error : invalid();
+      receive.retire(reason);
+      send?.retire(reason);
+      release?.();
+      if (!refused && !(error instanceof P2PError && error.code === 'RESOURCE_LIMIT')) throw error;
+    }
   };
   mux.addEventListener('stream', event => {
-    if (closing || incomingHeaders >= limits.maxPendingIncoming || mux.streams.length > limits.maxStreams * 2) { fail(resource()); return; }
-    incomingHeaders++;
-    track(incoming(event.detail).finally(() => { incomingHeaders--; }));
+    if (closing) { event.detail.abort(closing); return; }
+    // Yamux bounds physical directions. A header is five bytes; accepted BI/UNI
+    // queues are bounded by reserve(), and reply halves use an existing pair.
+    // A separate pending-header quota incorrectly rejects a valid burst of SYNs
+    // before those openers have a chance to write their headers.
+    track(incoming(event.detail));
   });
   const pump = carrier.pump(check).then(() => fail(disconnected()), (error: unknown) => fail(error instanceof Error ? error : disconnected()));
   void duplex.closed.then(async () => {
@@ -372,19 +408,56 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
     async openBi() {
       const release = reserve();
       let send: Direction | undefined;
+      let paired: QuicBiStream | undefined;
       try {
         send = await create();
         const result = deferred<QuicBiStream>();
+        const raw = send.raw;
+        const cleanup = () => {
+          pairs.delete(raw.streamId);
+          clearTimeout(timer);
+          raw.removeEventListener('close', rejected);
+        };
+        const rejected = () => {
+          cleanup();
+          result.reject(closing ?? new P2PError('REJECTED', 'Logical stream opening refused'));
+        };
         const timer = setTimeout(() => {
-          pairs.delete(send!.raw.streamId); send!.raw.abort(new P2PError('TIMEOUT', 'Logical stream pair timed out'));
-          result.reject(new P2PError('TIMEOUT', 'Logical stream pair timed out')); release();
+          const error = new P2PError('TIMEOUT', 'Logical stream pair timed out');
+          cleanup();
+          result.reject(error);
+          try { raw.abort(error); } catch { fail(error); }
         }, limits.pairTimeoutMs);
-        pairs.set(send.raw.streamId, { result, send, timer });
+        pairs.set(raw.streamId, {
+          send,
+          resolve(stream) { cleanup(); paired = stream; result.resolve(stream); },
+          reject(error) { cleanup(); result.reject(error); }
+        });
+        raw.addEventListener('close', rejected, { once: true });
+        if (raw.status === 'reset' || raw.status === 'aborted' || raw.status === 'closed') rejected();
         await send.writeAll(header(1, send.raw.streamId));
         const stream = await result.promise;
         releaseWhenClosed(release, send.raw, (stream.recv as Direction).raw);
         return stream;
-      } catch (error) { send?.raw.abort(error instanceof Error ? error : disconnected()); release(); throw error; }
+      } catch (error) {
+        const refused = !closing && !(error instanceof P2PError && error.code === 'TIMEOUT') &&
+          send && (send.raw.status === 'reset' || send.raw.status === 'aborted');
+        const reason = closing ?? (refused
+          ? new P2PError('REJECTED', 'Logical stream opening refused', { cause: error })
+          : error instanceof Error ? error : disconnected());
+        if (send) {
+          pairs.get(send.raw.streamId)?.reject(reason);
+          try {
+            send.retire(reason);
+            if (paired) (paired.recv as Direction).retire(reason);
+          } catch {
+            fail(reason);
+            await terminal.promise;
+          }
+        }
+        release();
+        throw reason;
+      }
     },
     acceptBi: () => bi.take(),
     async openUni() {
@@ -393,7 +466,18 @@ export function fromByteDuplex(duplex: ByteDuplex, options: LogicalConnectionOpt
       try {
         send = await create(); releaseWhenClosed(release, send.raw);
         await send.writeAll(header(3)); return send;
-      } catch (error) { send?.raw.abort(error instanceof Error ? error : disconnected()); release(); throw error; }
+      } catch (error) {
+        const refused = !closing && send && (send.raw.status === 'reset' || send.raw.status === 'aborted');
+        const reason = closing ?? (refused
+          ? new P2PError('REJECTED', 'Logical stream opening refused', { cause: error })
+          : error instanceof Error ? error : disconnected());
+        if (send) {
+          try { send.retire(reason); }
+          catch { fail(reason); await terminal.promise; }
+        }
+        release();
+        throw reason;
+      }
     },
     acceptUni: () => uni.take(),
     closed: () => terminal.promise,

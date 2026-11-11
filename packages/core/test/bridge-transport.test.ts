@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AbstractStreamMuxer } from '@libp2p/utils';
+import { ManagedConnection } from '../src/runtime/managed-connection.js';
+import { DEFAULT_RESOURCE_LIMITS, ResourceScheduler } from '../src/runtime/resources.js';
 import { fromByteDuplex } from '../src/bridge/transport/connection.js';
 import { webSocketDuplex } from '../src/bridge/transport/websocket.js';
 import type { BinaryWebSocket, ByteDuplex } from '../src/bridge/transport/contracts.js';
@@ -66,6 +68,94 @@ describe.skipIf(!yamuxAvailable)('logical Yamux carrier', () => {
       expect(await receive.readExact(11)).toEqual(text.encode('independent'));
       await receive.expectEnd();
     } finally { a.close(0n, new Uint8Array()); await Promise.all([a.closed(), b.closed()]); }
+  });
+
+  it.each(['readExact', 'expectEnd'] as const)('preserves carrier failure between %s readiness and consumption', async method => {
+    const [client, server] = connections();
+    try {
+      const outgoing = await client.openBi();
+      const incoming = await server.acceptBi();
+      await outgoing.send.writeAll(Uint8Array.of(1, 2));
+      expect(await incoming.recv.readExact(1)).toEqual(Uint8Array.of(1));
+      // Readiness is already fulfilled; the continuation has not consumed it.
+      const pending = method === 'readExact' ? incoming.recv.readExact(1) : incoming.recv.expectEnd();
+      server.close(0n, new Uint8Array());
+      await expect(pending).rejects.toMatchObject({ code: 'CANCELLED', message: 'Logical channel closed locally' });
+    } finally { server.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
+  });
+
+  it('treats incomplete exact reads as transport loss while retaining trailing-byte validation', async () => {
+    const [client, server] = connections();
+    try {
+      const send = await client.openUni();
+      const receive = await server.acceptUni();
+      await send.writeAll(Uint8Array.of(1));
+      await send.finish();
+      await expect(receive.readExact(2)).rejects.toMatchObject({ code: 'DISCONNECTED', message: 'Unexpected end of stream' });
+      // A caller explicitly expecting FIN still rejects real trailing bytes;
+      // the EOF correction does not weaken framing or close unrelated streams.
+      const next = await client.openUni();
+      const trailing = await server.acceptUni();
+      await next.writeAll(Uint8Array.of(2));
+      await next.finish();
+      await expect(trailing.expectEnd()).rejects.toMatchObject({ code: 'INVALID_FRAME', message: 'Trailing stream bytes' });
+      expect(await trailing.readExact(1)).toEqual(Uint8Array.of(2));
+      await trailing.expectEnd();
+    } finally { server.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
+  });
+
+  it('pairs a full concurrent opening burst without an extra header or accept-queue ceiling', async () => {
+    const [a, b] = connections();
+    try {
+      const outgoing = await Promise.all(Array.from({ length: 64 }, () => a.openBi()));
+      const incoming = [];
+      for (let index = 0; index < outgoing.length; index++) incoming.push(await b.acceptBi());
+      await expect(a.openBi()).rejects.toMatchObject({ code: 'RESOURCE_LIMIT' });
+      await Promise.all(outgoing.map((stream, index) => stream.send.writeAll(Uint8Array.of(index))));
+      await Promise.all(incoming.map(async stream => stream.send.writeAll(await stream.recv.readExact(1))));
+      expect(await Promise.all(outgoing.map(async stream => (await stream.recv.readExact(1))[0])))
+        .toEqual(Array.from({ length: 64 }, (_, index) => index));
+    } finally { a.close(0n, new Uint8Array()); await Promise.all([a.closed(), b.closed()]); }
+  });
+
+  it('refuses only an excess opening, preserves an established managed stream and reuses the released slot', async () => {
+    const [clientRaw, serverRaw] = carrierPair();
+    const raw = fromByteDuplex(clientRaw, { remoteId: 'server', side: 'client', limits: { maxStreams: 4, pairTimeoutMs: 2000 } });
+    const server = fromByteDuplex(serverRaw, { remoteId: 'client', side: 'server', limits: { maxStreams: 1 } });
+    const scheduler = new ResourceScheduler(DEFAULT_RESOURCE_LIMITS);
+    const client = new ManagedConnection(raw, scheduler, { peerId: 'server' }, new AbortController().signal, 1024, 1024);
+    try {
+      const first = await client.openBi();
+      const accepted = await server.acceptBi();
+      await expect(client.openBi()).rejects.toMatchObject({ code: 'REJECTED' });
+      expect(scheduler.snapshot().active.streams).toBe(1);
+      await first.send.writeAll(text.encode('still open'));
+      expect(await accepted.recv.readExact(10)).toEqual(text.encode('still open'));
+      await first.send.finish(); await accepted.recv.expectEnd();
+      await accepted.send.finish(); await first.recv.expectEnd();
+      await scheduler.whenIdle();
+      const next = await client.openBi();
+      const nextAccepted = await server.acceptBi();
+      await nextAccepted.send.writeAll(text.encode('reused'));
+      expect(await next.recv.readExact(6)).toEqual(text.encode('reused'));
+    } finally { client.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); await scheduler.whenIdle(); }
+  });
+
+  it('keeps closed-but-unconsumed entries charged until accept transfers their ownership', async () => {
+    const [clientRaw, serverRaw] = carrierPair();
+    const client = fromByteDuplex(clientRaw, { remoteId: 'server', side: 'client', limits: { maxStreams: 4 } });
+    const server = fromByteDuplex(serverRaw, { remoteId: 'client', side: 'server', limits: { maxStreams: 1 } });
+    try {
+      const first = await client.openUni();
+      await first.finish();
+      await expect(client.openBi()).rejects.toMatchObject({ code: 'REJECTED' });
+      const queued = await server.acceptUni();
+      await queued.expectEnd();
+      const next = await client.openBi();
+      const incoming = await server.acceptBi();
+      await next.send.writeAll(text.encode('ok'));
+      expect(await incoming.recv.readExact(2)).toEqual(text.encode('ok'));
+    } finally { client.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
   });
 
   it('backpressures an unread bulk direction while a separate stream progresses, then reaps quiet waiters', async () => {
@@ -198,4 +288,47 @@ it('WebSocket binary carrier bounds admission and closes from actual socket evid
   await expect(reader.next()).rejects.toMatchObject({ code: 'INVALID_FRAME' });
   await carrier.closed;
   expect(socket.readyState).toBe(3);
+});
+
+
+it('fills only the bounded WebSocket buffer without polling after every accepted frame', async () => {
+  vi.useFakeTimers();
+  const frameBytes = 16 * 1024;
+  const capacity = 8 * frameBytes;
+  const socket = new Socket();
+  let peak = 0;
+  socket.send = bytes => {
+    socket.bufferedAmount += bytes.length;
+    peak = Math.max(peak, socket.bufferedAmount);
+  };
+  const carrier = webSocketDuplex(socket, { maxBufferedBytes: capacity, maxMessageBytes: frameBytes });
+  let pending: Promise<void> | undefined;
+  try {
+    const start = Date.now();
+    for (let index = 0; index < 8; index++) await carrier.write(new Uint8Array(frameBytes));
+    expect(Date.now()).toBe(start);
+    expect(socket.bufferedAmount).toBe(capacity);
+    let accepted = false;
+    pending = carrier.write(new Uint8Array(frameBytes)).then(() => { accepted = true; });
+    await vi.advanceTimersByTimeAsync(8);
+    expect(accepted).toBe(false);
+    expect(peak).toBe(capacity);
+    socket.bufferedAmount -= frameBytes;
+    await vi.advanceTimersByTimeAsync(8);
+    await pending;
+    expect(accepted).toBe(true);
+    expect(peak).toBe(capacity);
+    pending = carrier.write(new Uint8Array(frameBytes));
+    const cancelled = expect(pending).rejects.toMatchObject({ code: 'DISCONNECTED' });
+    await Promise.resolve();
+    carrier.close();
+    await vi.advanceTimersByTimeAsync(8);
+    await cancelled;
+    await carrier.closed;
+  } finally {
+    carrier.close();
+    await vi.runAllTimersAsync();
+    await pending?.catch(() => {});
+    vi.useRealTimers();
+  }
 });

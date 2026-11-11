@@ -103,17 +103,23 @@ interface WirePathBudget {
 
 const ROOT_WIRE_PATH: WirePathBudget = { segments: 0, bytes: 0 };
 
+/** Conservative SuperJSON envelope size, without serializing caller-owned data. */
+export function measureValue(value: unknown, limits: FrameLimits): number {
+  const state = validationState(limits);
+  reserve(state, 0, 5);
+  reserveFixedBytes(state, 32);
+  validateSerializableValue(value, 0, state, ROOT_WIRE_PATH);
+  return state.bytes;
+}
+
 export function serializeValue(
   value: unknown,
   limits: FrameLimits = DEFAULT_FRAME_LIMITS
 ): unknown {
-  const state = validationState(limits);
   try {
     // Bound traversal before SuperJSON walks caller-owned input. writeFrame()
     // subsequently enforces the exact encoded envelope size and shape.
-    reserve(state, 0, 5);
-    reserveFixedBytes(state, 32);
-    validateSerializableValue(value, 0, state, ROOT_WIRE_PATH);
+    measureValue(value, limits);
     const envelope = wireCodec.serialize(value as SuperJSONValue);
     validateEnvelope(envelope, validationState(limits));
     return envelope;
@@ -144,7 +150,7 @@ function validationState(limits: FrameLimits): ValidationState {
   const maxBytes = limits.maxControlFrameBytes;
   const maxItems = limits.maxControlFrameItems ?? DEFAULT_FRAME_LIMITS.maxControlFrameItems!;
   const maxDepth = limits.maxControlFrameDepth ?? DEFAULT_FRAME_LIMITS.maxControlFrameDepth!;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 16 * 1024 * 1024) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) {
     throw new P2PError('RESOURCE_LIMIT', 'Invalid RPC wire byte limit');
   }
   if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 1_000_000) {

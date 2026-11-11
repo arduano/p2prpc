@@ -10,7 +10,7 @@ Before the first registry release, only `main` is supported. After releases begi
 
 p2prpc treats the network, locators, DNS/PKARR and mDNS results, remote endpoint, request metadata/input, file manifest/metadata/content, and capability presenter as hostile.
 
-An Iroh endpoint ID proves possession of a transport key. A signed ticket proves which endpoint signed route hints. Neither authorizes application work. The current QUIC application protocol/ALPN is v5; the credential-handshake format is v4. p2prpc dispatches RPC or file streams only after:
+An Iroh endpoint ID proves possession of a transport key. A signed ticket proves which endpoint signed route hints. Neither authorizes application work. The current QUIC application protocol/ALPN is v6; the credential-handshake format is v4. p2prpc dispatches RPC or file streams only after:
 
 1. the connected endpoint matches an independently trusted expectation for outbound calls;
 2. optional endpoint-key admission succeeds;
@@ -76,7 +76,7 @@ p2prpc is a resource server, not an authorization server: applications own brows
 - Shutdown is bounded by `shutdownTimeoutMs`; a non-cooperative owner makes `close()` reject with `TIMEOUT` while accounting remains active and transport teardown still proceeds.
 - Slow file progress consumers are independently conflated and cannot backpressure a transfer.
 - File receive timeouts measure lack of progress rather than total duration; lane/chunk/64 KiB segment/write/FIN progress refreshes the watchdog while each stalled operation remains bounded.
-- Failed native stream cleanup quarantines/closes the physical connection. Cancelling an observer during stream acquisition retires only that request; its bounded admission remains charged until native settlement, late-stream cleanup or proven physical closure. Real I/O timeout and owner shutdown still retire the connection.
+- Failed native stream cleanup quarantines/closes the physical connection. Cancelling an observer during stream acquisition retires only that request; its bounded admission remains charged until native settlement, late-stream cleanup or proven physical closure. A queued admission deadline or a definite per-opening refusal does not close unrelated streams. Real transport I/O timeout and owner shutdown still retire the connection.
 - Initial install, replacement, duplicate arbitration, runtime revival, and reconnect share one final admission-success gate after synchronous callbacks. Public promise continuations recheck it after their last `await`, and queued `onPeer` delivery is conditional on the exact selection remaining current. A peer is returned only while its node, registry slot, live-map entry, epoch, and session remain current; callback-triggered closure rejects acquisition instead of returning a stale handle.
 - Receiver reconciliation expiry uses a deadline index and removes only due records, rather than scanning all retained peer/principal state on each operation. Node close first rejects new ledger admission; it clears retained state only after all ledger-owning work settles, even when the public close deadline expires first.
 
@@ -98,6 +98,9 @@ Log neither secrets nor delegated credential assertions. Positive prior-carrier
 closure is required before replacement. Revocation/expiry close only the logical
 Peer. Failed cleanup or noncooperative callbacks retain accounting rather than
 producing false quiescence; RPCs are never replayed on reconnect.
+Failed browser shutdown and Host revocation waits can be retried on the same
+retired owner; neither a timeout nor retry authorizes another active carrier.
+Opening browser admission remains owned within that bounded shutdown wait.
 
 The browser entry has no native/Node filesystem runtime dependency. Its Blob
 source uses the existing verified file protocol; its memory destination requires
@@ -147,3 +150,13 @@ module contracts, lifecycle ownership and compatibility limits.
 ## Release status
 
 Public CI and package gates establish a releasable pre-1.0 artifact, not formal production approval. The stronger qualification additionally exercises ticket/default, ticket/custom, ticket/disabled, DNS/default, mDNS/default, mDNS/custom, and mDNS/disabled two-host cases; a 100-peer mixed workload; and 5,000 pushes plus 5,000 pulls over one authenticated physical connection with stream/task/share/reconciliation/memory/native-handle return-to-baseline. No qualifying external evidence is claimed until those artifacts exist. See [Production Validation](./docs/wiki/Production-Validation.md).
+
+
+RPC encoded-message admission is shared by the runtime, independently of file
+and authentication controls. Directional bulk pools (64 MiB each) and small
+reserves (1 MiB each, messages at most 64 KiB) bound active encoded spans. Inputs
+are revalidated after waiting, and declared inbound lengths are validated before
+body allocation. An abort does not release bytes while underlying work still
+owns them. This does not bound codec backing arenas or decoded/application heap;
+msgpackr may retain a larger arena than its returned encoded span. Browser
+admission version 2/native protocol 6 deliberately reject older peers.

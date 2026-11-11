@@ -1,3 +1,4 @@
+import { RpcMessageBudget } from './rpc/messages.js';
 export type { PeerFiles, PeerFileShareOptions } from './files/types.js';
 import { openNativeBridge, readBridgeRequest, acceptNativeBridge, type OpenBridgeOptions, type NativeBridgeOffer } from './bridge/native.js';
 import { isDeepStrictEqual } from 'node:util';
@@ -255,6 +256,7 @@ export interface P2PNodeLimits {
 }
 
 export interface AdvancedP2PNodeOptions<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
+  readonly rpcMessages?: RpcMessageBudget;
   readonly router: TRouter;
   readonly protocol: ProtocolIdentity;
   readonly createContext: (context: PeerContext<TFileMetadata>) => Promise<inferRouterContext<TRouter>> | inferRouterContext<TRouter>;
@@ -334,7 +336,7 @@ export class Peer<TRemoteRouter extends AnyTRPCRouter, TFileMetadata = unknown> 
     this.rpc = createTRPCProxyClient<TRemoteRouter>({
       links: [irohLink({
         connection: () => runtime.connection(),
-        frameLimits: runtime.frameLimits,
+        rpcMessages: runtime.messages,
         headerLimits: runtime.headerLimits,
         ...(runtime.getRequestHeaders ? {
           getRequestHeaders: (request) => runtime.getRequestHeaders?.(request)
@@ -484,7 +486,7 @@ interface PeerRuntime<TFileMetadata> {
   share(source: FileSource<TFileMetadata>, policy?: PeerFileShareOptions): SharedFileHandle;
   revoke(handle: SharedFileHandle): boolean;
   readonly headerLimits: { readonly maxCount: number; readonly maxBytes: number };
-  readonly frameLimits: FrameLimits;
+  readonly messages: RpcMessageBudget;
   readonly getRequestHeaders?: (request: {
     readonly path: string;
     readonly type: 'query' | 'mutation' | 'subscription';
@@ -566,6 +568,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
   private readonly limits: P2PNodeLimits;
   private readonly protocolName: string;
   private readonly resources: ResourceScheduler;
+  private readonly messages: RpcMessageBudget;
   private readonly handshakeRate: HandshakeRateLimiter;
   private readonly tasks = new TaskGroup('p2prpc node');
   private readonly shutdownController = new AbortController();
@@ -600,6 +603,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       operationRecordTtlMs: limits.fileReconciliationTtlMs
     });
     this.resources = new ResourceScheduler(resourceLimits(limits));
+    this.messages = options.rpcMessages ?? new RpcMessageBudget();
     this.handshakeRate = new HandshakeRateLimiter({
       globalBurst: limits.handshakeGlobalBurst,
       globalRatePerSecond: limits.handshakeGlobalRatePerSecond,
@@ -754,6 +758,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
       startCleanup(() => this.shares.close(reason)),
       startCleanup(() => this.receiverOperations.close()),
       startCleanup(() => this.resources.close(reason)),
+      startCleanup(() => { if (!this.options.rpcMessages) this.messages.close(); }),
       startCleanup(() => this.tasks.abort(reason))
     ];
     this.peers.clear();
@@ -777,6 +782,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         endpointClosure,
         this.tasks.join(),
         this.resources.whenIdle(),
+        ...(!this.options.rpcMessages ? [this.messages.whenIdle()] : []),
         this.runtimes.whenEmpty()
       ]).then((outcomes) => {
         this.receiverOperations.clear();
@@ -1000,7 +1006,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         },
         revoke: (handle) => this.shares.revoke(handle),
         headerLimits: { maxCount: this.limits.maxRpcHeaders, maxBytes: this.limits.maxRpcHeaderBytes },
-        frameLimits: controlFrameLimits(this.limits),
+        messages: this.messages,
         ...(this.options.getRequestHeaders ? {
           getRequestHeaders: (request) => this.withCallback(
             runtime.identity.id,
@@ -1586,7 +1592,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
         type: request.type,
         headers: request.headers
       }, signal),
-      frameLimits: controlFrameLimits(this.limits),
+      rpcMessages: this.messages,
       headerLimits: { maxCount: this.limits.maxRpcHeaders, maxBytes: this.limits.maxRpcHeaderBytes },
       maxPathBytes: this.limits.maxRpcPathBytes,
       setupTimeoutMs: this.limits.streamHeaderTimeoutMs,
@@ -1639,7 +1645,7 @@ export class P2PNode<TRouter extends AnyTRPCRouter, TFileMetadata = unknown> {
           streamLease = kind === StreamKind.Rpc || kind === StreamKind.Bridge
             ? this.resources.tryAcquire(owner, {
               streams: 1,
-              bufferedBytes: this.limits.maxControlFrameBytes
+              bufferedBytes: kind === StreamKind.Rpc ? 0 : this.limits.maxControlFrameBytes
             })
             : this.resources.tryAcquire(owner, {
               streams: 1,
@@ -2837,6 +2843,7 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
     'fileMetadataSchema',
     'onPeer',
     'onError',
+    'rpcMessages',
     'onTransferProgress',
     'onSecurityEvent',
     'iroh',

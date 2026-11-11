@@ -2,6 +2,7 @@ import type { AnyTRPCRouter } from '@trpc/server';
 import type { z } from 'zod';
 import { P2PError } from '../errors.js';
 import { freezePrincipal } from '../security/types.js';
+import { TaskGroup } from '../runtime/task-group.js';
 import type { QuicConnection } from '../transport/types.js';
 import type { BridgePeer, BridgePeerOptions } from './contracts.js';
 import { admission, controlChannel, readySchema, type publicPrincipalSchema } from './control.js';
@@ -36,6 +37,8 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
   let opening: ByteDuplex | undefined;
   let pending: Promise<QuicConnection> | undefined;
   let closing: Promise<void> | undefined;
+  const retirement = new TaskGroup('Browser Bridge');
+  let openingClosed: Promise<void> | undefined;
   let resume: string | undefined;
   let peerId: string | undefined;
   let expiresAt = 0;
@@ -53,17 +56,19 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
       try {
         return await admission(async admissionSignal => {
           const control = controlChannel(channel);
-          await control.write(62, { version: 1, ...(resume ? { resume } : {}) });
+          await control.write(62, { version: 2, ...(resume ? { resume } : {}) });
           const frame = await control.read();
           if (frame.kind !== 63) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Expected BrowserReady');
           admissionSignal.throwIfAborted();
-          const ready = readySchema.parse(frame.value);
+          const parsed = readySchema.safeParse(frame.value);
+          if (!parsed.success) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Unsupported BrowserReady contract');
+          const ready = parsed.data;
           if (ready.hostId !== options.expectedHostId || ready.principal.id !== ready.hostId || ready.principal.subject !== ready.hostId ||
             (peerId !== undefined && (peerId !== ready.peerId || resume !== ready.resume))) {
             throw new P2PError('UNAUTHORIZED', 'Unexpected Bridge Host or resumption identity');
           }
           if (closed) throw new P2PError('DISCONNECTED', 'Browser Bridge closed');
-          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId });
+          const raw = fromByteDuplex(control.remaining, { side: 'client', remoteId: ready.hostId, limits: { maxStreams: options.limits?.maxStreams ?? 64 } });
           engine ??= createBridgePeer<R, L, M>({ ...options,
             localId: ready.peerId, remoteId: ready.hostId, connection,
             authorize: options.authorize ?? (context => context.action.kind === 'file.pull' ||
@@ -92,17 +97,28 @@ export async function connectBridge<R extends AnyTRPCRouter, L extends AnyTRPCRo
     reconnect: async (): Promise<void> => { await connection(); },
     close(): Promise<void> {
       if (closing) return closing;
-      closed = true;
-      closing = (async () => {
+      if (!closed) {
+        closed = true;
+        if (opening) {
+          const channel = opening;
+          openingClosed = retirement.track(Promise.resolve().then(() => channel.close()).then(() => channel.closed));
+        }
+        if (pending) retirement.track(pending.then(() => undefined, () => undefined));
+      }
+      const attempt = (async () => {
         const results = await Promise.allSettled([
           admitted.close('Browser Bridge closed'),
-          ...(opening ? [((channel: ByteDuplex) => Promise.resolve(channel.close()).then(() => channel.closed))(opening)] : []),
-          ...(pending ? [pending.then(() => undefined, () => undefined)] : [])
+          retirement.join({ timeoutMs: options.limits?.shutdownTimeoutMs ?? 5_000 })
         ]);
         const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
         if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Browser Bridge cleanup failed');
+        // Task ownership is drained even on rejection; physical closure still
+        // needs the original opening carrier's positive result.
+        await openingClosed;
       })();
-      return closing;
+      closing = attempt;
+      void attempt.catch(() => { if (closing === attempt) closing = undefined; });
+      return attempt;
     }
   };
 }

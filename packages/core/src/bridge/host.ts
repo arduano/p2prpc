@@ -1,3 +1,4 @@
+import { RpcMessageBudget } from '../rpc/messages.js';
 import type { AnyTRPCRouter } from '@trpc/server';
 import { P2PError } from '../errors.js';
 import { randomToken, randomUuid, sha256Hex, unrefTimer } from '../platform.js';
@@ -11,10 +12,12 @@ import { createBridgePeer } from './peer.js';
 import { fromByteDuplex } from './transport/index.js';
 
 export interface BridgeHostOptions<R extends AnyTRPCRouter, M = unknown> {
+  readonly rpcMessages?: RpcMessageBudget;
   readonly router: R;
   readonly createContext: NonNullable<BridgePeerOptions<R, M>['local']>['createContext'];
   readonly authorizeDelegation: (offer: NativeBridgeOffer) => SessionPrincipal | Promise<SessionPrincipal>;
   readonly authorizeOperation: BridgePeerOptions<R, M>['authorize'];
+  readonly onError?: BridgePeerOptions<R, M>['onError'];
   readonly onIncomingFile?: BridgePeerOptions<R, M>['incoming'];
   readonly fileMetadataSchema?: BridgePeerOptions<R, M>['fileMetadataSchema'];
   readonly limits?: BridgePeerOptions<R, M>['limits'] & { readonly maxPeers?: number };
@@ -50,7 +53,9 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
   if (!Number.isSafeInteger(maxPeers) || maxPeers < 1 || maxPeers > 4096) throw new P2PError('RESOURCE_LIMIT', 'Invalid Bridge Host capacity');
   const entries = new Map<string, Entry<M>>();
   const tasks = new TaskGroup('Bridge Host');
+  const messages = options.rpcMessages ?? new RpcMessageBudget();
   const channels = new Set<NativeBridgeOffer['channel']>();
+  let channelRetirement: readonly Promise<void>[] = [];
   let closed = false;
   let admitting = 0;
   const retire = (key: string, entry: Entry<M>): Promise<void> => {
@@ -58,9 +63,12 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
     if (entry.timer) clearTimeout(entry.timer);
     entry.waiting?.reject(new P2PError('DISCONNECTED', 'Bridge lifetime ended'));
     delete entry.waiting;
-    entry.retiring = entry.engine.close('Bridge lifetime ended').then(() => { if (entries.get(key) === entry) entries.delete(key); });
-    void entry.retiring.catch(() => {}); // Failed custody stays in the bounded map.
-    return entry.retiring;
+    const retiring = entry.engine.close('Bridge lifetime ended').then(() => { if (entries.get(key) === entry) entries.delete(key); });
+    entry.retiring = retiring;
+    // Keep the closed engine and entry after a failed wait. A later call can
+    // observe its physical closure without readmitting the logical lifetime.
+    void retiring.catch(() => { if (entry.retiring === retiring) delete entry.retiring; });
+    return retiring;
   };
   const expire = (key: string, entry: Entry<M>): void => {
     if (entry.timer) clearTimeout(entry.timer);
@@ -90,7 +98,9 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
           const frame = await control.read();
           if (frame.kind !== 62) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Expected BrowserHello');
           admissionSignal.throwIfAborted();
-          const hello = helloSchema.parse(frame.value);
+          const parsed = helloSchema.safeParse(frame.value);
+          if (!parsed.success) throw new P2PError('INCOMPATIBLE_PROTOCOL', 'Unsupported BrowserHello contract');
+          const hello = parsed.data;
           const resume = hello.resume ?? randomToken();
           const key = sha256Hex(resume);
           let entry = entries.get(key);
@@ -101,7 +111,7 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
             const peerId = randomUuid();
             const engine = createBridgePeer<AnyTRPCRouter, R, M>({ localId: offer.localPeerId, remoteId: peerId,
               connection: async () => {
-                if (closed || entry!.retiring || entry!.expiresAt <= Date.now()) throw new P2PError('DISCONNECTED', 'Bridge lifetime ended');
+                if (closed || entry!.engine.diagnostics().closed || entry!.expiresAt <= Date.now()) throw new P2PError('DISCONNECTED', 'Bridge lifetime ended');
                 if (entry!.connection) return entry!.connection;
                 if (!entry!.waiting) {
                   let resolve!: (value: QuicConnection) => void, reject!: (error: Error) => void;
@@ -119,25 +129,27 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
                 }
                 return entry!.waiting.promise;
               },
+              rpcMessages: messages,
               authorize: options.authorizeOperation, local: { router: options.router, createContext: options.createContext },
+              ...(options.onError ? { onError: options.onError } : {}),
               ...(options.onIncomingFile ? { incoming: options.onIncomingFile } : {}),
               ...(options.fileMetadataSchema ? { fileMetadataSchema: options.fileMetadataSchema } : {}), limits });
             entry = { peerId, identity: identity(user), engine, expiresAt, attaching: false };
             entries.set(key, entry);
             expire(key, entry);
           }
-          if (entry.retiring || entry.attaching || entry.expiresAt <= Date.now()) throw new P2PError('REJECTED', 'Bridge lifetime unavailable');
+          if (entry.engine.diagnostics().closed || entry.attaching || entry.expiresAt <= Date.now()) throw new P2PError('REJECTED', 'Bridge lifetime unavailable');
           selected = entry;
           entry.attaching = true;
           if (entry.connection) { entry.connection.close(0n, new Uint8Array()); await entry.connection.closed(); }
           admissionSignal.throwIfAborted();
-          if (closed || entry.retiring) throw new P2PError('DISCONNECTED', 'Bridge Host closed');
+          if (closed || entry.engine.diagnostics().closed) throw new P2PError('DISCONNECTED', 'Bridge Host closed');
           const sessionId = randomUuid();
-          await control.write(63, { version: 1, hostId: offer.localPeerId, peerId: entry.peerId, sessionId, resume, expiresAt,
+          await control.write(63, { version: 2, hostId: offer.localPeerId, peerId: entry.peerId, sessionId, resume, expiresAt,
             principal: { id: offer.localPeerId, subject: offer.localPeerId, expiresAt },
             gateway: { peerId: offer.peer.id, principal: publicPrincipal(offer.auth.principal) } });
           admissionSignal.throwIfAborted();
-          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId });
+          const raw = fromByteDuplex(control.remaining, { side: 'server', remoteId: entry.peerId, limits: { maxStreams: limits.maxStreams ?? 64 } });
           entry.engine.attach(raw, { id: sessionId, principal: user, expiresAt, via: { peerId: offer.peer.id, principal: offer.auth.principal } });
           entry.connection = raw;
           entry.expiresAt = expiresAt;
@@ -155,15 +167,25 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
     })()); },
     revoke(peerId: string): Promise<void> { const found = [...entries].find(([, entry]) => entry.peerId === peerId); return found ? retire(...found) : Promise.resolve(); },
     async close(): Promise<void> {
-      closed = true;
       const reason = new P2PError('DISCONNECTED', 'Bridge Host closed');
-      const cleanup = [...entries].map(([key, entry]) => retire(key, entry)).concat([...channels].map(channel => Promise.resolve().then(() => channel.close(reason)).then(() => channel.closed)));
-      for (const work of cleanup) tasks.track(work);
+      if (!closed) {
+        closed = true;
+        if (!options.rpcMessages) {
+          messages.close();
+          tasks.track(messages.whenIdle());
+        }
+        // Initiate each physical retirement once; later close calls wait on
+        // these original proofs, including any original rejection.
+        channelRetirement = [...channels].map(channel => tasks.track(
+          Promise.resolve().then(() => channel.close(reason)).then(() => channel.closed)
+        ));
+      }
+      const cleanup = [...entries].map(([key, entry]) => tasks.track(retire(key, entry)));
       await tasks.close(reason, { timeoutMs: limits.shutdownTimeoutMs ?? 5_000 });
-      const results = await Promise.allSettled(cleanup);
+      const results = await Promise.allSettled([...channelRetirement, ...cleanup]);
       const failures = results.filter((value): value is PromiseRejectedResult => value.status === 'rejected');
       if (failures.length) throw new AggregateError(failures.map(value => value.reason), 'Bridge Host cleanup failed');
     },
-    diagnostics: () => ({ closed, admitting, tasks: tasks.size, channels: channels.size, peers: entries.size, entries: [...entries.values()].map(entry => ({ peerId: entry.peerId, expiresAt: entry.expiresAt, retiring: !!entry.retiring, ...entry.engine.diagnostics() })) })
+    diagnostics: () => ({ closed, admitting, tasks: tasks.size, channels: channels.size, peers: entries.size, entries: [...entries.values()].map(entry => ({ peerId: entry.peerId, expiresAt: entry.expiresAt, retiring: entry.engine.diagnostics().closed, ...entry.engine.diagnostics() })) })
   };
 }

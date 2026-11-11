@@ -2,8 +2,9 @@
 
 The Host owns its actual tRPC router. A browser infers its caller from that router;
 the Gateway does not copy procedures, unpack RPC envelopes, or spool files.
-The bridge is an opt-in stream service. Existing native RPC/file formats, native
-pins, authentication handshakes, and direct Peer use remain unchanged.
+The bridge is an opt-in stream service. RPC and file engines are shared with
+direct Peers; native pins and authentication handshakes are unchanged. The
+current wire and admission versions are specified below.
 
 ```text
 browser /browser entry             Gateway /bridge entry               Host
@@ -157,6 +158,19 @@ p2prpc wire codec. This bridge does not claim tRPC HTTP JSONL transport parity.
    Host retains disconnected entries until expiry/revocation, within `maxPeers`.
    Browser close is transport close, not immediate remote-registry deletion.
 
+Browser `close()` and Host `revoke()` can be called again after a failed shutdown
+wait. They keep the same retired logical owner and its physical closure proof;
+they never reopen it. Concurrent browser close calls share one attempt, successful
+closure is retained, and a failed attempt does not permanently poison later waits.
+The browser shutdown deadline (default 5 seconds) also covers an opening carrier
+and its unfinished admission. A timeout leaves that cleanup owned. Task-group
+waiters expire independently of the single underlying drain, without accumulating
+new cleanup work on every retry. Replacement still requires positive closure.
+
+`BridgeHostOptions.onError` forwards logical-peer errors to the application, as
+the browser option already does. Record bounded diagnostic codes and context;
+never log resume secrets, delegated headers or RPC/file content.
+
 `peer.expiresAt` exposes the latest verified `BrowserReady` admission deadline in
 Unix milliseconds. Successful carrier reattachment updates it; disconnection or
 close does not invent a later deadline. Once it expires, close the retained
@@ -180,11 +194,15 @@ idempotency/history remains authoritative across either process boundary.
 - Host defaults to 32 retained logical peers. Each uses the existing bounded
   scheduler/TaskGroup; callbacks that ignore abort stay charged. Application
   policies should bound aggregate tenant work above these per-peer limits.
-- Yamux defaults to 64 logical streams, 16 pending incoming pairs, 1 MiB maximum
+- Yamux defaults to 64 logical streams, 1 MiB maximum
   read, 8 MiB buffered/read reservation and 15-second pairing/header timeout.
   Two Yamux directions implement one logical bidirectional stream so send reset
   and receive stop remain independent. Numeric QUIC reset codes are not carried;
   stream priority is advisory because standard Yamux has no matching scheduler.
+  The logical stream limit also bounds accepted queues. Excess openings reset
+  only that request; a cancelled/refused pair cannot retire unrelated streams.
+  A queued RPC deadline cancels its admission. Actual transport-open timeouts
+  and unproved late-stream cleanup still quarantine the carrier.
 - Binary WebSocket queues, messages and native carrier packets are bounded.
   Write promises provide backpressure. The Gateway does not retain whole files.
 - `memoryDestination` requires an explicit quota, at most 64 MiB; publication can
@@ -195,6 +213,40 @@ idempotency/history remains authoritative across either process boundary.
 - Stream kind 5 is opt-in Bridge v1, with a bounded versioned request/accept and
   bounded browser hello/ready exchange. Old Hosts reject it; there is no automatic
   fallback to application RPC or old Host compatibility claim for Bridge calls.
-- Native Iroh/ALPN/auth/file pins remain unchanged. Release qualification of
-  relay reachability, proxies, mobile browsers or cross-machine loads is separate
+- Native Iroh binaries and credential-handshake format remain unchanged;
+  the application ALPN advances to v6 and browser admission to version 2.
+  Qualification of relay reachability, proxies, mobile browsers or cross-machine loads is separate
   from local real-browser/Iroh integration evidence.
+
+## RPC message ownership
+
+Browser admission version 2 and native wire version 6 require matching peers;
+there is no old/new transport fallback. RPC envelopes admit up to 64 MiB encoded
+and 262,144 values (including map keys), with depth 64. File/authentication controls
+retain their independent small limits. RPC stream admission reserves a stream
+slot; an idle watch reserves no maximum-sized message buffer.
+
+`RpcMessageBudget` owns four bounded existing scheduler pools: 64 MiB inbound and
+outbound bulk, plus 1 MiB inbound and outbound small messages (at most 64 KiB each).
+One Bridge Host shares this owner across all admitted browser peers. An application
+with multiple logical clients/native endpoints can pass the same `rpcMessages`
+owner to all of them and close it after their own retirement. Never allocate
+one budget per subscription. Directional separation prevents symmetric large
+writes from blocking their own incoming reads; small controls cannot sit behind
+bulk admission.
+
+Outbound data is measured before encoding, admitted, and measured again after
+waiting. Growth beyond the acquired allowance fails locally without encoding or
+retry. Incoming declared lengths are checked before allocation; bodies read
+incrementally through bounded carrier windows. Leases survive caller timeout
+until the underlying write/read actually settles. Query/subscription interruption
+is observation loss; only an interrupted dispatched mutation reports
+`OUTCOME_UNKNOWN`.
+
+These 130 MiB bound **active encoded body spans**, not JavaScript heap, decoded
+DTOs, carrier windows or codec backing arenas. In particular msgpackr retains
+and overallocates its reusable arena; a 32 MiB ASCII body may use a substantially
+larger backing allocation. Process/container memory limits remain necessary.
+The SDK fixture proves a near 32 MiB native-shaped reply through real Chromium,
+WSS and Iroh while an unrelated watch stays live; it does not establish mobile
+heap or public-relay performance.

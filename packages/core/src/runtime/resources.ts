@@ -633,16 +633,16 @@ function validateLimits(limits: ResourceLimits): void {
   ] as const) {
     for (const [kind, reserve] of [['file-data', dataReserve], ['file-control', controlReserve]] as const) {
       for (const [direction, capacity] of Object.entries(reserve)) {
-        if (!Number.isSafeInteger(capacity.streams) || capacity.streams < 1) {
+        if (!Number.isSafeInteger(capacity.streams) || capacity.streams < 0) {
           throw new P2PError('RESOURCE_LIMIT', `Invalid ${name} ${direction} ${kind} stream reserve`);
         }
-        if (!Number.isSafeInteger(capacity.bufferedBytes) || capacity.bufferedBytes < 1) {
+        if (!Number.isSafeInteger(capacity.bufferedBytes) || capacity.bufferedBytes < 0) {
           throw new P2PError('RESOURCE_LIMIT', `Invalid ${name} ${direction} ${kind} buffer reserve`);
         }
       }
     }
     for (const [field, value] of Object.entries(generalReserve)) {
-      if (!Number.isSafeInteger(value) || value < 1) {
+      if (!Number.isSafeInteger(value) || value < 0) {
         throw new P2PError('RESOURCE_LIMIT', `Invalid ${name} general ${field} reserve`);
       }
     }
