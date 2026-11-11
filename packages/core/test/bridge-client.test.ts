@@ -72,7 +72,8 @@ async function serve(sockets: ReturnType<typeof pair>, hello: ReturnType<typeof 
   await raw.closed();
 }
 
-describe('Browser Bridge close custody', () => {
+// The optional Yamux bridge requires Node 22+, independently of native RPC.
+describe.skipIf(typeof Reflect.get(Promise, 'withResolvers') !== 'function')('Browser Bridge close custody', () => {
   it('repeated Host close waits retain one physical retirement until late closure', async () => {
     const sockets = pair();
     const expiresAt = Date.now() + 60_000;
