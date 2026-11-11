@@ -55,6 +55,7 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
   const tasks = new TaskGroup('Bridge Host');
   const messages = options.rpcMessages ?? new RpcMessageBudget();
   const channels = new Set<NativeBridgeOffer['channel']>();
+  let channelRetirement: readonly Promise<void>[] = [];
   let closed = false;
   let admitting = 0;
   const retire = (key: string, entry: Entry<M>): Promise<void> => {
@@ -166,14 +167,22 @@ export function createBridgeHost<R extends AnyTRPCRouter, M = unknown>(options: 
     })()); },
     revoke(peerId: string): Promise<void> { const found = [...entries].find(([, entry]) => entry.peerId === peerId); return found ? retire(...found) : Promise.resolve(); },
     async close(): Promise<void> {
-      closed = true;
       const reason = new P2PError('DISCONNECTED', 'Bridge Host closed');
-      if (!options.rpcMessages) messages.close();
-      const cleanup = [...entries].map(([key, entry]) => retire(key, entry)).concat([...channels].map(channel => Promise.resolve().then(() => channel.close(reason)).then(() => channel.closed)));
-      for (const work of cleanup) tasks.track(work);
-      if (!options.rpcMessages) tasks.track(messages.whenIdle());
+      if (!closed) {
+        closed = true;
+        if (!options.rpcMessages) {
+          messages.close();
+          tasks.track(messages.whenIdle());
+        }
+        // Initiate each physical retirement once; later close calls wait on
+        // these original proofs, including any original rejection.
+        channelRetirement = [...channels].map(channel => tasks.track(
+          Promise.resolve().then(() => channel.close(reason)).then(() => channel.closed)
+        ));
+      }
+      const cleanup = [...entries].map(([key, entry]) => tasks.track(retire(key, entry)));
       await tasks.close(reason, { timeoutMs: limits.shutdownTimeoutMs ?? 5_000 });
-      const results = await Promise.allSettled(cleanup);
+      const results = await Promise.allSettled([...channelRetirement, ...cleanup]);
       const failures = results.filter((value): value is PromiseRejectedResult => value.status === 'rejected');
       if (failures.length) throw new AggregateError(failures.map(value => value.reason), 'Bridge Host cleanup failed');
     },

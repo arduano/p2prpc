@@ -73,6 +73,39 @@ async function serve(sockets: ReturnType<typeof pair>, hello: ReturnType<typeof 
 }
 
 describe('Browser Bridge close custody', () => {
+  it('repeated Host close waits retain one physical retirement until late closure', async () => {
+    const sockets = pair();
+    const expiresAt = Date.now() + 60_000;
+    const principal = (id: string) => ({ id, subject: id, expiresAt, scopes: new Set<string>(), claims: {} });
+    const host = createBridgeHost({ router, createContext: () => ({}),
+      authorizeDelegation: () => principal('user'), authorizeOperation: () => true,
+      limits: { shutdownTimeoutMs: 15 } });
+    const accepted = host.accept({ localPeerId: 'host', peer: { id: 'gateway', direction: 'inbound' },
+      auth: { id: 'test-session', generation: 0, establishedAt: Date.now(), expiresAt, principal: principal('gateway') },
+      headers: {}, signal: new AbortController().signal, channel: webSocketDuplex(sockets.server) });
+    const peer = await connectBridge<typeof router>({ url: 'wss://test', expectedHostId: 'host', socket: () => sockets.client });
+    try {
+      await expect(host.close()).rejects.toMatchObject({ code: 'TIMEOUT' });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const retained = host.diagnostics().tasks;
+      expect(retained).toBeGreaterThan(0);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await expect(host.close()).rejects.toMatchObject({ code: 'TIMEOUT' });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(host.diagnostics().tasks).toBe(retained);
+      }
+      expect(host.diagnostics()).toMatchObject({ closed: true, peers: 1, channels: 1 });
+      expect(sockets.server.closeCalls).toBe(1);
+      sockets.finish();
+      await accepted;
+      await host.close();
+      expect(host.diagnostics()).toMatchObject({ closed: true, peers: 0, channels: 0, tasks: 0 });
+    } finally {
+      sockets.finish();
+      await Promise.allSettled([accepted, peer.close(), host.close()]);
+    }
+  });
+
   it('forwards Host errors and retries retirement without readmitting a failed-close lifetime', async () => {
     const sockets = pair();
     const error = deferred<unknown>();
