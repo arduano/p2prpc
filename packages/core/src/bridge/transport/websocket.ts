@@ -92,8 +92,11 @@ export function webSocketDuplex(socket: BinaryWebSocket, options: WebSocketCarri
         };
         await wait(() => socket.readyState === 1 && socket.bufferedAmount + copy.length <= maxBufferedBytes);
         if (closing) throw error ?? new P2PError('DISCONNECTED', 'WebSocket closed');
+        // send() transfers these bytes to the socket. Its synchronous
+        // bufferedAmount is the remaining transport custody; wait only before
+        // the next write would exceed the bound, not for every frame to drain.
+        // write() acknowledges bounded acceptance, not remote delivery.
         socket.send(copy);
-        await wait(() => socket.bufferedAmount === 0);
       }).catch((reason: unknown) => {
         const failure = reason instanceof Error ? reason : new P2PError('DISCONNECTED', 'WebSocket write failed');
         close(failure); throw failure;

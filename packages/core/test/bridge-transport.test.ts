@@ -255,3 +255,46 @@ it('WebSocket binary carrier bounds admission and closes from actual socket evid
   await carrier.closed;
   expect(socket.readyState).toBe(3);
 });
+
+
+it('fills only the bounded WebSocket buffer without polling after every accepted frame', async () => {
+  vi.useFakeTimers();
+  const frameBytes = 16 * 1024;
+  const capacity = 8 * frameBytes;
+  const socket = new Socket();
+  let peak = 0;
+  socket.send = bytes => {
+    socket.bufferedAmount += bytes.length;
+    peak = Math.max(peak, socket.bufferedAmount);
+  };
+  const carrier = webSocketDuplex(socket, { maxBufferedBytes: capacity, maxMessageBytes: frameBytes });
+  let pending: Promise<void> | undefined;
+  try {
+    const start = Date.now();
+    for (let index = 0; index < 8; index++) await carrier.write(new Uint8Array(frameBytes));
+    expect(Date.now()).toBe(start);
+    expect(socket.bufferedAmount).toBe(capacity);
+    let accepted = false;
+    pending = carrier.write(new Uint8Array(frameBytes)).then(() => { accepted = true; });
+    await vi.advanceTimersByTimeAsync(8);
+    expect(accepted).toBe(false);
+    expect(peak).toBe(capacity);
+    socket.bufferedAmount -= frameBytes;
+    await vi.advanceTimersByTimeAsync(8);
+    await pending;
+    expect(accepted).toBe(true);
+    expect(peak).toBe(capacity);
+    pending = carrier.write(new Uint8Array(frameBytes));
+    const cancelled = expect(pending).rejects.toMatchObject({ code: 'DISCONNECTED' });
+    await Promise.resolve();
+    carrier.close();
+    await vi.advanceTimersByTimeAsync(8);
+    await cancelled;
+    await carrier.closed;
+  } finally {
+    carrier.close();
+    await vi.runAllTimersAsync();
+    await pending?.catch(() => {});
+    vi.useRealTimers();
+  }
+});
