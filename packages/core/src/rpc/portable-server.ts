@@ -214,7 +214,7 @@ export class RpcServer<TRouter extends AnyTRPCRouter> {
         // callbacks must not be able to mutate an error or request into a leak.
         const shape = request ? safeErrorShape(error, request.path) : undefined;
         try {
-          const delivered = this.options.onError?.(error, request);
+          const delivered = this.options.onError?.(asP2PError(cause), request);
           void Promise.resolve(delivered).catch(() => undefined);
         } catch {
           // Observability failures cannot affect protocol state.

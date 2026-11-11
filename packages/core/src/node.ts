@@ -2843,6 +2843,7 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
     'fileMetadataSchema',
     'onPeer',
     'onError',
+    'rpcMessages',
     'onTransferProgress',
     'onSecurityEvent',
     'iroh',
@@ -2860,6 +2861,7 @@ function validateNodeConfiguration<TRouter extends AnyTRPCRouter, TFileMetadata>
     'onBridge',
     'onPeer',
     'onError',
+    'rpcMessages',
     'onTransferProgress',
     'onSecurityEvent',
     'endpointFactory'

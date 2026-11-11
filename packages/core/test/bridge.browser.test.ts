@@ -283,8 +283,11 @@ it('runs browser/WSS/Iroh RPC and files with honest observation loss, retained i
     await expect.poll(() => page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watch)).toEqual(['watch-ready']);
     proven.push('browser-subscription');
     for (const [bytes, count] of [[1_200_000, 1], [60_000, 20], [32 * 1024 * 1024 - 1024, 1]] as const) {
+      phase = `rpc-${bytes}x${count}`;
+      const started = Date.now();
       expect(await page.evaluate(([size, items]) => (globalThis as BrowserGlobal).bridgeHarness.large(size!, items!), [bytes, count]))
         .toEqual({ count, lengths: Array.from({ length: count }, () => bytes), intact: true });
+      console.log(JSON.stringify({ phase, elapsedMs: Date.now() - started }));
       expect(await page.evaluate(() => (globalThis as BrowserGlobal).bridgeHarness.snapshot().watchErrors)).toBe(0);
       expect(await outer.rpc.health.query()).toBe('outer-peer-alive');
     }
