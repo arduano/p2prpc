@@ -1,5 +1,29 @@
 # @arduano/p2prpc-core
 
+## 0.4.0
+
+### Minor Changes
+
+- 32df23b: Move RPC buffer admission from idle streams to shared directional message budgets.
+  Permit 64 MiB RPC envelopes, preserve small control progress, reject queued input
+  growth before encoding, and stream bodies through bounded carrier reads. Browser
+  admission 2/native protocol 6 require upgrading both ends. Preserve initiating
+  RPC error diagnostics and distinguish observation loss from mutation uncertainty.
+  Remove per-frame empty-buffer polling from WebSocket writes; capacity remains
+  bounded. Encoded-span quotas do not claim a JavaScript heap/codec arena bound.
+
+### Patch Changes
+
+- 32df23b: Allow browser bridge shutdown and Host revocation to observe late cleanup after
+  a timed-out close, without replaying work, replacing an unclosed owner, or
+  accumulating cleanup waiters. Bound browser shutdown during unfinished admission
+  and forward logical-peer errors through the Host's optional onError callback.
+- 32df23b: Keep concurrent logical stream admission and RPC queue deadlines isolated to each opening. Remove the conflicting pending-header/accept-queue limit, promptly retire rejected pairs, and preserve established streams when another opening is refused or expires before transport I/O begins. RPC streams now reserve their stream slot separately from message buffers; file control and data progress reservations remain intact.
+  
+  WebSocket writes wait for bounded capacity instead of an empty socket buffer after every frame, avoiding artificial per-frame polling latency while retaining finite queued-byte ownership.
+  
+  Preserve the carrier failure when teardown occurs between read readiness and consumption, preventing interrupted file transfers from becoming permanently rejected as malformed input.
+
 ## 0.3.3
 
 ### Patch Changes
