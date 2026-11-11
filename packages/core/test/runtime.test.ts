@@ -175,6 +175,24 @@ describe('structured runtime ownership', () => {
     }
   });
 
+  it('retains work discovered when an earlier drain is resolving', async () => {
+    const group = new TaskGroup('test');
+    const first = group.join();
+    await Promise.resolve();
+    await Promise.resolve();
+    let release!: () => void;
+    group.track(new Promise<void>(resolve => { release = resolve; }));
+    let joined = false;
+    const later = group.join().then(() => { joined = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(joined).toBe(false);
+    expect(group.size).toBe(1);
+    release();
+    await Promise.all([first, later]);
+    expect(group.size).toBe(0);
+  });
+
   it('bounds and fairly drains peer queues with exact-once leases', async () => {
     const scheduler = new ResourceScheduler({
       global: { handshakes: 1, streams: 5, outboundTransfers: 1, inboundTransfers: 1, bufferedBytes: 10, callbacks: 1, queued: 4 },

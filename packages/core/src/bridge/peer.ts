@@ -159,12 +159,14 @@ class LogicalPeer<R extends AnyTRPCRouter, L extends AnyTRPCRouter, M> implement
   }
 
   async close(reason = 'Bridge Peer closed'): Promise<void> {
-    this.closed = true;
     const failure = new P2PError('DISCONNECTED', sanitizeBoundedDisplayText(reason, 256, 'Bridge Peer closed'));
-    this.transfers.close(failure); this.shares.close(failure); this.resources.close(failure);
-    if (this.epoch && !this.epoch.closed) this.quarantine(this.epoch, failure.message);
-    this.tasks.track(this.resources.whenIdle());
-    if (!this.options.rpcMessages) { this.messages.close(); this.tasks.track(this.messages.whenIdle()); }
+    if (!this.closed) {
+      this.closed = true;
+      this.transfers.close(failure); this.shares.close(failure); this.resources.close(failure);
+      if (this.epoch && !this.epoch.closed) this.quarantine(this.epoch, failure.message);
+      this.tasks.track(this.resources.whenIdle());
+      if (!this.options.rpcMessages) { this.messages.close(); this.tasks.track(this.messages.whenIdle()); }
+    }
     await this.tasks.close(failure, { timeoutMs: this.limits.shutdownTimeoutMs });
     this.receiver.close();
   }

@@ -157,6 +157,19 @@ p2prpc wire codec. This bridge does not claim tRPC HTTP JSONL transport parity.
    Host retains disconnected entries until expiry/revocation, within `maxPeers`.
    Browser close is transport close, not immediate remote-registry deletion.
 
+Browser `close()` and Host `revoke()` can be called again after a failed shutdown
+wait. They keep the same retired logical owner and its physical closure proof;
+they never reopen it. Concurrent browser close calls share one attempt, successful
+closure is retained, and a failed attempt does not permanently poison later waits.
+The browser shutdown deadline (default 5 seconds) also covers an opening carrier
+and its unfinished admission. A timeout leaves that cleanup owned. Task-group
+waiters expire independently of the single underlying drain, without accumulating
+new cleanup work on every retry. Replacement still requires positive closure.
+
+`BridgeHostOptions.onError` forwards logical-peer errors to the application, as
+the browser option already does. Record bounded diagnostic codes and context;
+never log resume secrets, delegated headers or RPC/file content.
+
 `peer.expiresAt` exposes the latest verified `BrowserReady` admission deadline in
 Unix milliseconds. Successful carrier reattachment updates it; disconnection or
 close does not invent a later deadline. Once it expires, close the retained

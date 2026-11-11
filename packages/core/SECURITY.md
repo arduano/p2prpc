@@ -38,3 +38,6 @@ user identity. Log neither secrets nor delegated assertions. Carrier loss never
 replays RPCs or closes the shared outer Peer. Unfinished callbacks and unproved
 cleanup retain custody. Browser memory destinations require an explicit quota,
 verify complete BLAKE3 before publication and have no durable disk/crash promise.
+Browser close and Host revoke may retry a failed bounded wait on the same retired
+owner; late physical closure is required before success or replacement. Browser
+shutdown also retains and bounds unfinished carrier admission.

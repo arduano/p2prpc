@@ -98,6 +98,9 @@ Log neither secrets nor delegated credential assertions. Positive prior-carrier
 closure is required before replacement. Revocation/expiry close only the logical
 Peer. Failed cleanup or noncooperative callbacks retain accounting rather than
 producing false quiescence; RPCs are never replayed on reconnect.
+Failed browser shutdown and Host revocation waits can be retried on the same
+retired owner; neither a timeout nor retry authorizes another active carrier.
+Opening browser admission remains owned within that bounded shutdown wait.
 
 The browser entry has no native/Node filesystem runtime dependency. Its Blob
 source uses the existing verified file protocol; its memory destination requires

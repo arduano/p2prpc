@@ -8,6 +8,8 @@ export class TaskGroup {
   private readonly tasks = new Set<Promise<unknown>>();
   private generation = 0;
   private closing = false;
+  private draining = false;
+  private readonly joins = new Set<(error?: unknown) => void>();
 
   constructor(readonly name: string) {}
 
@@ -58,7 +60,37 @@ export class TaskGroup {
   join(options: TaskGroupJoinOptions = {}): Promise<void> {
     this.closing = true;
     validateJoinOptions(options);
-    return boundedJoin(this.drain(), this.name, options);
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (error?: unknown): void => {
+        this.joins.delete(finish);
+        if (timer) clearTimeout(timer);
+        options.signal?.removeEventListener('abort', cancel);
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      const cancel = (): void => finish(
+        options.signal?.reason ?? new P2PError('CANCELLED', `${this.name} join was cancelled`)
+      );
+      if (options.signal?.aborted) { cancel(); return; }
+      this.joins.add(finish);
+      options.signal?.addEventListener('abort', cancel, { once: true });
+      if (options.timeoutMs !== undefined) {
+        timer = setTimeout(() => finish(
+          new P2PError('TIMEOUT', `${this.name} did not settle during shutdown`)
+        ), options.timeoutMs);
+        unrefTimer(timer);
+      }
+      if (!this.draining) {
+        this.draining = true;
+        void this.drain().catch(error => this.finishJoins(error));
+      }
+    });
+  }
+
+  private finishJoins(error?: unknown): void {
+    this.draining = false;
+    for (const join of [...this.joins]) join(error);
   }
 
   private async drain(): Promise<void> {
@@ -69,7 +101,12 @@ export class TaskGroup {
     while (true) {
       await Promise.resolve();
       if (this.tasks.size === 0) {
-        if (emptyGeneration === this.generation) return;
+        if (emptyGeneration === this.generation) {
+          // Linearize all current joins in this same empty observation. A later
+          // join starts a new drain, even if promise observers have not run yet.
+          this.finishJoins();
+          return;
+        }
         emptyGeneration = this.generation;
         continue;
       }
@@ -102,39 +139,5 @@ function validateJoinOptions(options: TaskGroupJoinOptions): void {
   }
   if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
     throw new P2PError('INVALID_FRAME', 'Task-group join signal is invalid');
-  }
-}
-
-async function boundedJoin(
-  drain: Promise<void>,
-  name: string,
-  options: TaskGroupJoinOptions
-): Promise<void> {
-  options.signal?.throwIfAborted();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let detachAbort: (() => void) | undefined;
-  const views: Array<Promise<void>> = [drain];
-  if (options.timeoutMs !== undefined) {
-    views.push(new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(
-        new P2PError('TIMEOUT', `${name} did not settle during shutdown`)
-      ), options.timeoutMs);
-      unrefTimer(timer);
-    }));
-  }
-  if (options.signal) {
-    views.push(new Promise<never>((_, reject) => {
-      const onAbort = (): void => reject(
-        options.signal!.reason ?? new P2PError('CANCELLED', `${name} join was cancelled`)
-      );
-      options.signal!.addEventListener('abort', onAbort, { once: true });
-      detachAbort = () => options.signal!.removeEventListener('abort', onAbort);
-    }));
-  }
-  try {
-    await Promise.race(views);
-  } finally {
-    if (timer) clearTimeout(timer);
-    detachAbort?.();
   }
 }
