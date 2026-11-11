@@ -1,6 +1,6 @@
 # System model
 
-p2prpc is a TypeScript library for typed tRPC calls and parallel file transfer over one authenticated Iroh QUIC connection. This wiki describes wire protocol v5 and is intentionally written for architecture and security review. The application credential handshake is format v4; on-disk file resume state remains format v3. These version numbers are independent.
+p2prpc is a TypeScript library for typed tRPC calls and parallel file transfer over one authenticated Iroh QUIC connection. This wiki describes wire protocol v6 and is intentionally written for architecture and security review. The application credential handshake is format v4; on-disk file resume state remains format v3. These version numbers are independent.
 
 ## Five-minute model
 

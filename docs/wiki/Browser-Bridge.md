@@ -212,6 +212,41 @@ idempotency/history remains authoritative across either process boundary.
 - Stream kind 5 is opt-in Bridge v1, with a bounded versioned request/accept and
   bounded browser hello/ready exchange. Old Hosts reject it; there is no automatic
   fallback to application RPC or old Host compatibility claim for Bridge calls.
-- Native Iroh/ALPN/auth/file pins remain unchanged. Release qualification of
+- Native Iroh binaries and credential-handshake format remain unchanged;
+  the application ALPN advances to v6 and browser admission to version 2. Release qualification of
   relay reachability, proxies, mobile browsers or cross-machine loads is separate
   from local real-browser/Iroh integration evidence.
+
+
+## RPC message ownership
+
+Browser admission version 2 and native wire version 6 require matching peers;
+there is no old/new transport fallback. RPC envelopes admit up to 64 MiB encoded
+and 262,144 values (including map keys), with depth 64. File/authentication controls
+retain their independent small limits. RPC stream admission reserves a stream
+slot; an idle watch reserves no maximum-sized message buffer.
+
+`RpcMessageBudget` owns four bounded existing scheduler pools: 64 MiB inbound and
+outbound bulk, plus 1 MiB inbound and outbound small messages (at most 64 KiB each).
+One Bridge Host shares this owner across all admitted browser peers. An application
+with multiple logical clients/native endpoints can pass the same `rpcMessages`
+owner to all of them and close it after their own retirement. Never allocate
+one budget per subscription. Directional separation prevents symmetric large
+writes from blocking their own incoming reads; small controls cannot sit behind
+bulk admission.
+
+Outbound data is measured before encoding, admitted, and measured again after
+waiting. Growth beyond the acquired allowance fails locally without encoding or
+retry. Incoming declared lengths are checked before allocation; bodies read
+incrementally through bounded carrier windows. Leases survive caller timeout
+until the underlying write/read actually settles. Query/subscription interruption
+is observation loss; only an interrupted dispatched mutation reports
+`OUTCOME_UNKNOWN`.
+
+These 130 MiB bound **active encoded body spans**, not JavaScript heap, decoded
+DTOs, carrier windows or codec backing arenas. In particular msgpackr retains
+and overallocates its reusable arena; a 32 MiB ASCII body may use a substantially
+larger backing allocation. Process/container memory limits remain necessary.
+The SDK fixture proves a near 32 MiB native-shaped reply through real Chromium,
+WSS and Iroh while an unrelated watch stays live; it does not establish mobile
+heap or public-relay performance.

@@ -15,7 +15,7 @@ locator resolution (reachability only)
   -> tRPC middleware/procedure or file capability/destination policy
 ```
 
-The QUIC application protocol and ALPN are v5. The six-message credential handshake is format v4; all consumers must upgrade together.
+The QUIC application protocol and ALPN are v6. The six-message credential handshake is format v4; all consumers must upgrade together.
 
 Inbound peers do not have an outbound expected-target record, so endpoint admission, credential authentication, and operation authorization are their trust boundaries.
 
