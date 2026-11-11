@@ -85,20 +85,20 @@
     "@chainsafe/libp2p-yamux": "8.0.1",
     "@libp2p/logger": "6.2.16",
     "@libp2p/utils": "7.4.5",
-    "@momics/iroh-http-node": "0.6.2",
-    "@momics/iroh-http-shared": "0.6.2",
+    "@momics/iroh-http-node": "0.7.0",
+    "@momics/iroh-http-shared": "0.7.0",
     "@napi-rs/blake-hash": "1.3.6",
-    "@noble/hashes": "1.8.0",
-    "@trpc/client": "11.18.0",
-    "@trpc/server": "11.18.0",
-    "jose": "6.2.10",
-    "msgpackr": "2.0.5",
+    "@noble/hashes": "2.4.0",
+    "@trpc/client": "11.25.0",
+    "@trpc/server": "11.25.0",
+    "jose": "6.2.15",
+    "msgpackr": "2.1.4",
     "superjson": "2.2.6",
-    "zod": "4.6.6"
+    "zod": "4.6.7"
   },
   "peerDependencies": {
-    "@trpc/client": "11.18.0",
-    "@trpc/server": "11.18.0"
+    "@trpc/client": "11.25.0",
+    "@trpc/server": "11.25.0"
   },
   "devDependencies": {
     "tsup": "^8.5.1"
