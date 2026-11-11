@@ -2,8 +2,9 @@
 
 The Host owns its actual tRPC router. A browser infers its caller from that router;
 the Gateway does not copy procedures, unpack RPC envelopes, or spool files.
-The bridge is an opt-in stream service. Existing native RPC/file formats, native
-pins, authentication handshakes, and direct Peer use remain unchanged.
+The bridge is an opt-in stream service. RPC and file engines are shared with
+direct Peers; native pins and authentication handshakes are unchanged. The
+current wire and admission versions are specified below.
 
 ```text
 browser /browser entry             Gateway /bridge entry               Host
@@ -213,10 +214,9 @@ idempotency/history remains authoritative across either process boundary.
   bounded browser hello/ready exchange. Old Hosts reject it; there is no automatic
   fallback to application RPC or old Host compatibility claim for Bridge calls.
 - Native Iroh binaries and credential-handshake format remain unchanged;
-  the application ALPN advances to v6 and browser admission to version 2. Release qualification of
-  relay reachability, proxies, mobile browsers or cross-machine loads is separate
+  the application ALPN advances to v6 and browser admission to version 2.
+  Qualification of relay reachability, proxies, mobile browsers or cross-machine loads is separate
   from local real-browser/Iroh integration evidence.
-
 
 ## RPC message ownership
 
