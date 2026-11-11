@@ -149,6 +149,7 @@ class Direction implements QuicSendStream, QuicRecvStream {
       let done = 0;
       while (done < size) {
         await this.available();
+        if (this.error) throw this.error;
         const chunk = this.chunks[0];
         if (!chunk) throw new P2PError('INVALID_FRAME', 'Unexpected end of stream');
         const count = Math.min(size - done, chunk.length - this.offset);
@@ -163,7 +164,7 @@ class Direction implements QuicSendStream, QuicRecvStream {
   async expectEnd(): Promise<void> {
     if (this.reading) throw new P2PError('REJECTED', 'Concurrent stream read');
     this.reading = true;
-    try { await this.available(); if (this.queued !== 0) throw new P2PError('INVALID_FRAME', 'Trailing stream bytes'); }
+    try { await this.available(); if (this.error) throw this.error; if (this.queued !== 0) throw new P2PError('INVALID_FRAME', 'Trailing stream bytes'); }
     finally { this.reading = false; }
   }
   async writeAll(bytes: Uint8Array): Promise<void> {

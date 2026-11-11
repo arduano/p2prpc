@@ -70,6 +70,20 @@ describe.skipIf(!yamuxAvailable)('logical Yamux carrier', () => {
     } finally { a.close(0n, new Uint8Array()); await Promise.all([a.closed(), b.closed()]); }
   });
 
+  it.each(['readExact', 'expectEnd'] as const)('preserves carrier failure between %s readiness and consumption', async method => {
+    const [client, server] = connections();
+    try {
+      const outgoing = await client.openBi();
+      const incoming = await server.acceptBi();
+      await outgoing.send.writeAll(Uint8Array.of(1, 2));
+      expect(await incoming.recv.readExact(1)).toEqual(Uint8Array.of(1));
+      // Readiness is already fulfilled; the continuation has not consumed it.
+      const pending = method === 'readExact' ? incoming.recv.readExact(1) : incoming.recv.expectEnd();
+      server.close(0n, new Uint8Array());
+      await expect(pending).rejects.toMatchObject({ code: 'CANCELLED', message: 'Logical channel closed locally' });
+    } finally { server.close(0n, new Uint8Array()); await Promise.all([client.closed(), server.closed()]); }
+  });
+
   it('pairs a full concurrent opening burst without an extra header or accept-queue ceiling', async () => {
     const [a, b] = connections();
     try {
